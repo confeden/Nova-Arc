@@ -1,0 +1,22 @@
+{
+  "name": "nova-arc-ui",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2",
+    "@tauri-apps/plugin-dialog": "^2",
+    "@tauri-apps/plugin-opener": "^2"
+  },
+  "devDependencies": {
+    "typescript": "^5",
+    "vite": "^7",
+    "@tauri-apps/cli": "^2"
+  }
+}

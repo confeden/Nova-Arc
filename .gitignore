@@ -2,3 +2,6 @@
 /test/
 *.bak
 *.narc
+/ui/node_modules
+/ui/dist
+/crates/narc-gui/gen

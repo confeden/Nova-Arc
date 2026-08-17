@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Nova Arc</title>
+    <link rel="stylesheet" href="/src/styles.css" />
+  </head>
+  <body>
+    <header class="bar">
+      <div class="brand">Nova&nbsp;Arc</div>
+      <button id="btn-open" class="btn">Открыть архив…</button>
+      <button id="btn-new" class="btn primary">Создать архив…</button>
+      <span class="sep"></span>
+      <button id="btn-extract" class="btn" disabled>Распаковать…</button>
+      <button id="btn-add" class="btn" disabled>Добавить…</button>
+      <button id="btn-remove" class="btn" disabled>Удалить</button>
+      <button id="btn-compact" class="btn" disabled>Уплотнить</button>
+      <span class="spacer"></span>
+      <label class="field">
+        Сжатие
+        <select id="level">
+          <option value="fast">быстро</option>
+          <option value="normal" selected>обычно</option>
+          <option value="max">максимум</option>
+        </select>
+      </label>
+      <label class="field">
+        Память
+        <select id="memory">
+          <option value="0" selected>авто</option>
+          <option value="256">256 МБ</option>
+          <option value="512">512 МБ</option>
+          <option value="1024">1 ГБ</option>
+          <option value="4096">4 ГБ</option>
+        </select>
+      </label>
+    </header>
+
+    <section id="summary" class="summary hidden"></section>
+
+    <main>
+      <table id="table">
+        <thead>
+          <tr>
+            <th class="col-check"><input type="checkbox" id="check-all" /></th>
+            <th class="col-name" data-sort="path">Имя</th>
+            <th class="col-size" data-sort="size">Размер</th>
+            <th class="col-size" data-sort="stored">В архиве</th>
+            <th class="col-date" data-sort="mtime">Изменён</th>
+          </tr>
+        </thead>
+        <tbody id="rows"></tbody>
+      </table>
+      <div id="empty" class="empty">
+        <p>Откройте архив <b>.narc</b> или создайте новый.</p>
+        <p class="dim">Файлы и папки можно перетащить прямо в это окно.</p>
+      </div>
+    </main>
+
+    <footer class="status">
+      <div id="progress-wrap" class="progress hidden"><div id="progress"></div></div>
+      <span id="status">Готово</span>
+      <span class="spacer"></span>
+      <span id="machine" class="dim"></span>
+    </footer>
+
+    <div id="menu" class="menu hidden">
+      <button data-act="open">Открыть файл</button>
+      <button data-act="extract-one">Распаковать в папку…</button>
+      <button data-act="remove-one">Удалить из архива</button>
+    </div>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

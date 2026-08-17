@@ -68,6 +68,20 @@ pub struct Archive {
     writable: bool,
 }
 
+/// Progress of a long operation, for a UI that must stay alive while the max
+/// tier grinds through a large archive.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Progress {
+    pub files_done: u64,
+    pub files_total: u64,
+    pub bytes_done: u64,
+    pub bytes_total: u64,
+}
+
+/// Callback invoked as work completes. Called from the thread driving the
+/// operation, so it must be cheap and must not block.
+pub type ProgressFn<'a> = &'a (dyn Fn(Progress) + Send + Sync);
+
 #[derive(Debug, Default)]
 pub struct AddStats {
     pub files: usize,
@@ -202,6 +216,16 @@ impl Archive {
     /// and writing on a dedicated thread, all inside a fixed memory budget
     /// (see [`crate::pipeline`]).
     pub fn add_paths(&mut self, inputs: &[PathBuf], opts: &PackOptions) -> Result<AddStats> {
+        self.add_paths_with(inputs, opts, None)
+    }
+
+    /// As [`Self::add_paths`], reporting progress as files are consumed.
+    pub fn add_paths_with(
+        &mut self,
+        inputs: &[PathBuf],
+        opts: &PackOptions,
+        progress: Option<ProgressFn>,
+    ) -> Result<AddStats> {
         if !self.writable {
             bail!("archive opened read-only");
         }
@@ -301,14 +325,33 @@ impl Archive {
             solid: SolidBuilder::default(),
         };
 
+        let files_total = (big.len() + small.len()) as u64;
+        let bytes_total: u64 = big
+            .iter()
+            .chain(small.iter())
+            .map(|(_, _, len)| *len)
+            .sum();
         let out = pipeline::pack_with(&mut self.file, opts, |sub| {
+            let mut report = |stats: &AddStats| {
+                if let Some(cb) = progress {
+                    cb(Progress {
+                        files_done: stats.files as u64,
+                        files_total,
+                        bytes_done: stats.bytes_in,
+                        bytes_total,
+                    });
+                }
+            };
             for (disk, rel, _) in &big {
                 ctx.add_file(sub, disk, rel.clone(), &mut stats)?;
+                report(&stats);
             }
             for (disk, rel, _) in &small {
                 ctx.add_small_file(sub, disk, rel.clone(), &mut stats)?;
+                report(&stats);
             }
             ctx.flush_solid(sub, &mut stats)?;
+            report(&stats);
             Ok(())
         })?;
 
@@ -360,6 +403,18 @@ impl Archive {
         select: Option<&[String]>,
         overwrite: Overwrite,
         opts: &PackOptions,
+    ) -> Result<ExtractStats> {
+        self.extract_reporting(dest, select, overwrite, opts, None)
+    }
+
+    /// As [`Self::extract_with`], reporting progress as files are written.
+    pub fn extract_reporting(
+        &self,
+        dest: &Path,
+        select: Option<&[String]>,
+        overwrite: Overwrite,
+        opts: &PackOptions,
+        progress: Option<ProgressFn>,
     ) -> Result<ExtractStats> {
         let mut stats = ExtractStats::default();
         let selectors: Option<Vec<String>> = select.map(|s| {
@@ -436,6 +491,9 @@ impl Archive {
             .iter()
             .any(|c| matches!(c.codec, 2 | 3));
         let workers = opts.extract_workers(slow_codecs).min(work.len().max(1));
+        let bytes_total: u64 = work.iter().map(|(e, _)| e.size).sum();
+        let done_files = AtomicUsize::new(0);
+        let done_bytes = std::sync::atomic::AtomicU64::new(0);
         let counters = Mutex::new((0usize, 0u64, 0usize)); // files, bytes, skipped
         let failure: Mutex<Option<anyhow::Error>> = Mutex::new(None);
         let stop = AtomicBool::new(false);
@@ -477,6 +535,16 @@ impl Archive {
                             Ok(Some(bytes)) => {
                                 local.0 += 1;
                                 local.1 += bytes;
+                                if let Some(cb) = progress {
+                                    let done = done_files.fetch_add(1, Ordering::Relaxed) + 1;
+                                    let b = done_bytes.fetch_add(bytes, Ordering::Relaxed) + bytes;
+                                    cb(Progress {
+                                        files_done: done as u64,
+                                        files_total: work.len() as u64,
+                                        bytes_done: b,
+                                        bytes_total,
+                                    });
+                                }
                             }
                             Ok(None) => local.2 += 1,
                             Err(e) => {

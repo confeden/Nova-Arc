@@ -24,7 +24,7 @@ pub mod paths;
 pub mod pipeline;
 
 pub use analyze::{Plan, Tier};
-pub use archive::{AddStats, Archive, ExtractStats, InfoStats, Overwrite};
+pub use archive::{AddStats, Archive, ExtractStats, InfoStats, Overwrite, Progress};
 pub use codec::Codec;
 pub use filters::Filter;
 pub use pipeline::PackOptions;

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/narc-core", "crates/narc-cli", "crates/narc-platform"]
+members = ["crates/narc-core", "crates/narc-cli", "crates/narc-platform", "crates/narc-gui"]
 
 [workspace.package]
 version = "0.1.0"

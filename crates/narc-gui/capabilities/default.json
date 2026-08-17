@@ -1,0 +1,13 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Nova Arc needs to pick files, open extracted previews, and receive drops. Nothing network-related is granted.",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "core:event:default",
+    "core:webview:allow-webview-close",
+    "dialog:default",
+    "opener:default"
+  ]
+}
