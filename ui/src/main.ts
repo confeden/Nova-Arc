@@ -380,4 +380,8 @@ void (async () => {
   const m = await invoke<{ cores: number; memory_total: number | null; budget: number }>("machine_info");
   el.machine.textContent = `${m.cores} потоков · бюджет памяти ${human(m.budget)}`;
   refreshButtons();
+  // Opened with a path argument (double-click a .narc, or the shell
+  // association)? Pull it now that listeners and state are ready.
+  const startup = await invoke<string | null>("startup_archive");
+  if (startup) await loadArchive(startup);
 })();

@@ -342,6 +342,14 @@ fn remove_entries(app: AppHandle, archive: String, paths: Vec<String>) {
     });
 }
 
+/// Archive path passed on the command line, if any.
+struct StartupArchive(Option<String>);
+
+#[tauri::command]
+fn startup_archive(startup: State<'_, StartupArchive>) -> Option<String> {
+    startup.0.clone()
+}
+
 #[tauri::command]
 fn machine_info() -> serde_json::Value {
     let mem = narc_platform::memory_status();
@@ -361,10 +369,19 @@ fn main() {
     let temps = Arc::new(TempDirs::default());
     let cleanup = temps.clone();
 
+    // A path on the command line (double-clicking a .narc, or the shell
+    // association) opens that archive on startup. The frontend pulls it once
+    // it is ready, rather than us pushing an event that could arrive before
+    // its listeners exist.
+    let open_arg = std::env::args()
+        .nth(1)
+        .filter(|a| a.to_lowercase().ends_with(".narc"));
+
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .manage(temps)
+        .manage(StartupArchive(open_arg))
         .invoke_handler(tauri::generate_handler![
             open_archive,
             create_archive,
@@ -373,6 +390,7 @@ fn main() {
             compact_archive,
             remove_entries,
             machine_info,
+            startup_archive,
         ])
         .build(tauri::generate_context!())
         .expect("failed to start Nova Arc")
