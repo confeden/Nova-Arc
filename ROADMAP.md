@@ -5,6 +5,7 @@
 - Cargo workspace, Rust 1.95, edition 2021: `narc-core` (format,
   `#![forbid(unsafe_code)]`), `narc-cli` (binary `narc`), `narc-platform`
   (all OS/unsafe code: priorities, I/O hints, memory status, file lock).
+- Format v0.2 = v0.1 + solid blocks + per-chunk filter byte + LZMA2/PPMd7.
 - NARC v0 container implemented and VERIFIED: append-only chunk log, FastCDC
   256K/1M/4M, blake3-128 dedup+integrity, MessagePack(named)+zstd manifest,
   80-byte offset-bound footer, generation counter, resumable crash recovery,
@@ -17,16 +18,23 @@
   prints peak RAM.
 - CLI: create/add/extract/list/remove/compact/info (+aliases c/a/x/l/rm),
   extract has `--force` / `--skip-existing` (default: refuse to clobber).
-- 22 tests green (`cargo test`), clippy clean. Covers roundtrip,
+- 52 tests green (`cargo test`), clippy clean. Covers roundtrip,
   append-without-rewrite, dedup, replace, remove+compact, selective extract,
   crash recovery, torn-manifest fallback, embedded-footer confusion, forged
   footer, writer lock, selector normalization, pre-1970 mtime, overwrite
   policy, compact-detects-corruption.
-- Measured (8 logical cores, this machine, `bash test/bench.sh`):
-  · 106 MiB / 4 big files: normal 1.8 s (‑j1: 5.5 s → 2.9× scaling), max 6.0 s
-  · 114 MiB / 5751 small files: fast 6.5 s, normal 6.7 s, max 8.0 s
-    (reader-bound: small files never reach the worker pool; solid grouping
-    is the fix, planned in v0.5)
+- Compression v2 DONE: analyzer picks codec+filter per content class
+  (analyze.rs), solid blocks for files < 256 KiB grouped by extension
+  (8 MiB blocks), LZMA2 + PPMd7 codecs, BCJ x86 + delta filters
+  (filters.rs, BCJ verified byte-identical against liblzma).
+- Measured (8 logical cores, this machine, `bash test/bench.sh`), v1 → v2:
+  · 114 MiB / 5751 source files: fast 6.5 s/28 MiB → 0.7 s/23 MiB;
+    normal 6.7/25 → 1.1/20; max 8.0/23 → 2.6/16. Chunk count 5751 → 165.
+  · 106 MiB / 4 big text files: max 6.0 s/25 MiB → 2.4 s/18 MiB (PPMd);
+    normal 1.7 s vs ‑j1 5.3 s = 3.1× thread scaling.
+  · BCJ on real .exe: +4.4-5.7 % vs unfiltered, every codec/level.
+  · PPMd7 vs zstd-19 on 4 MiB prose: -24 %. LZMA2 vs zstd-19 on prose: ±2 %
+    only (its edge needs big dictionaries; chunks cap it at 4 MiB).
   · peak RAM tracks `--memory`: 128M→~100 MiB, 256M→~196 MiB, default→~340 MiB
   · extraction 113 MiB in ~1-2 s at ~10 MiB peak RAM
   · 46 MiB tree, edit 1 file → re-save 0.14 s, archive grows ~98 KiB
@@ -54,10 +62,22 @@
   `Tier::worker_memory()` (fast 4, normal 40, max 56 MiB).
 - Chunk hash = blake3(uncompressed)[..16]; serves dedup AND extract integrity.
   Dead (unreferenced) chunk records stay in manifest as dedup sources until compact.
-- Codec ids: 0=store, 1=zstd. Per-chunk raw fallback if compression doesn't pay.
-- Two-phase pipeline: phase 1 analysis (`analyze.rs`: magic list + 64 KiB
-  trial compress), phase 2 per-chunk compression. Tiers: fast=zstd3,
-  normal=zstd12, max=zstd19.
+- Codec ids: 0=store, 1=zstd, 2=LZMA2, 3=PPMd7. Filter ids: 0=none,
+  1=BCJ x86, 2..=33=delta(id-1). Per-chunk raw fallback if the result is not
+  smaller — and then the filter byte MUST be cleared too.
+- Fixed order: pack = filter → compress; unpack = decompress → unfilter.
+  Chunk hash covers the ORIGINAL bytes, so dedup and integrity are
+  filter-independent (and the hash check also proves the filter round-tripped).
+- BCJ always runs with start_offset 0, never the chunk's file position:
+  position-dependent output would break dedup. Cost: one unconverted
+  instruction per chunk boundary.
+- Solid blocks: files < SOLID_MAX_FILE (256 KiB) are sorted by extension,
+  concatenated into <= SOLID_BLOCK (8 MiB) streams, chunked as one unit. A
+  FileEntry then has `block: Some((idx, offset))` and no chunks of its own.
+  Block size is small ON PURPOSE: editing one member rewrites one block.
+- Two-phase pipeline: phase 1 `analyze::plan()` (format magic → content class
+  → trial compress) returns codec+filter; phase 2 per-chunk compression.
+  Tiers: fast=zstd3, normal=zstd12, max=LZMA2/PPMd7 by class.
 - Memory invariant: all ops bounded by a few MAX_CHUNK (4 MiB) buffers +
   manifest in RAM. Keep it that way — weak-PC extraction is a hard requirement.
 - Archive paths: relative, UTF-8, '/'-separated; `paths::sanitize` on extract
@@ -127,6 +147,12 @@
 - libzstd internal MT (`ZSTD_c_nbWorkers`) — breaks memory estimation and
   duplicates our chunk parallelism. zstd `--long`/window ≥128 MiB — pointless
   under 4 MiB CDC chunks and breaks bounded extraction.
+- LZMA2 as the universal max-tier codec — on 4 MiB chunks it is only ±2 % vs
+  zstd-19 on text (its edge comes from >4 MiB dictionaries, which chunking
+  removes) while being much slower. It stays only for binary/generic data;
+  text goes to PPMd7 (-24 %).
+- Capping zstd WindowLog for 4 MiB chunks — no effect, zstd already shrinks
+  the window to the source size.
 - Parallel EXTRACTION with zstd — measured slower, not faster: 5751 small
   files take 1.0 s on 1 thread, 1.2 s on 4, 2.5 s on 8 (NTFS directory
   metadata contention + seeks); big files show no gain either (~660 MB/s = 
@@ -156,12 +182,13 @@
 
 ## Open issues
 
-- GUI framework decision pending owner confirmation (research report 06).
+- GUI: owner chose Tauri 2 (2026-08-17). Not started.
 - Not preserved yet: empty dirs, symlinks, NTFS attrs/ADS, ACLs.
 - Manifest fully in RAM (fine ≤ ~1 TB archives); paged index only if needed.
 - Long-path (>260 chars) handling on Windows untested.
-- Many-small-files packing is reader-bound (single reader thread): needs
-  parallel file reading and/or solid grouping.
+- Solid-block members are read whole into RAM at pack time (fs::read), so a
+  block costs up to 8 MiB extra outside the pipeline budget.
+- No trained dictionaries yet; no recompression of deflate/JPEG/MP3.
 - `--eco`/`--full`/EcoQoS paths are built but not measured under load; the
   "no lag" claim is unverified (research 09 §10 has the methodology).
 
@@ -173,9 +200,10 @@
    unified `narc` UX over foreign formats.
 3. v0.4: GUI skeleton (framework per owner decision), file list + icons +
    thumbnails, drag&drop, temp-open flow with watcher.
-4. v0.5: compression v2 — filters (delta/BCJ), solid small-file groups,
-   dictionary per file-type group; max tier upgrade per research (07/01).
-5. v0.6: recompression pipeline for deflate/JPEG/MP3 (research 02).
+4. v0.5 DONE (filters, solid groups, LZMA2/PPMd). Remaining from it:
+   trained dictionaries per file-type group.
+5. v0.6: recompression pipeline for deflate/JPEG/MP3 (research 02) — the
+   remaining big ratio win, and the thing 7-Zip/WinRAR cannot do.
 6. Later: GPU acceleration experiments (nvCOMP/GDeflate, research 08),
    encryption (XChaCha20-Poly1305), Explorer shell integration (research 07),
    installers, Linux/macOS/Android ports.

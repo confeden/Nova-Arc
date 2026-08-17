@@ -114,6 +114,8 @@ struct Job {
     hash: [u8; 16],
     /// Codec chosen by the analysis phase for the owning file.
     codec: Codec,
+    /// Reversible transform to apply before compressing (0 = none).
+    filter: u8,
     /// Bytes charged to the memory budget for this chunk.
     charge: u64,
 }
@@ -122,6 +124,7 @@ struct Done {
     seq: u64,
     payload: Vec<u8>,
     codec: Codec,
+    filter: u8,
     unpacked: u64,
     hash: [u8; 16],
     charge: u64,
@@ -249,6 +252,18 @@ pub struct Submitter<'a> {
 impl Submitter<'_> {
     /// Hand a chunk to the pipeline; returns its index within this run.
     pub fn submit(&mut self, data: Vec<u8>, hash: [u8; 16], codec: Codec) -> Result<u32> {
+        self.submit_filtered(data, hash, codec, 0)
+    }
+
+    /// As [`Self::submit`], but applying a reversible filter before
+    /// compression (see `crate::filters`).
+    pub fn submit_filtered(
+        &mut self,
+        data: Vec<u8>,
+        hash: [u8; 16],
+        codec: Codec,
+        filter: u8,
+    ) -> Result<u32> {
         // Input plus a worst-case output buffer of the same size.
         let charge = data.len() as u64 * 2;
         if !self.budget.acquire(charge) {
@@ -260,6 +275,7 @@ impl Submitter<'_> {
             data,
             hash,
             codec,
+            filter,
             charge,
         };
         match self.tx.as_ref().expect("submitter closed").send(job) {
@@ -287,41 +303,54 @@ fn worker_loop(rx: Receiver<Job>, tx: Sender<Result<Done>>, level: i32) {
         ));
     }
     while let Ok(job) = rx.recv() {
-        let out = compress_job(comp.as_mut(), job);
+        let out = compress_job(comp.as_mut(), job, level);
         if tx.send(out).is_err() {
             break; // writer is gone
         }
     }
 }
 
-fn compress_job(comp: Option<&mut zstd::bulk::Compressor<'_>>, job: Job) -> Result<Done> {
+fn compress_job(
+    comp: Option<&mut zstd::bulk::Compressor<'_>>,
+    job: Job,
+    level: i32,
+) -> Result<Done> {
     let Job {
         seq,
-        data,
+        mut data,
         hash,
         codec,
+        filter,
         charge,
     } = job;
     let unpacked = data.len() as u64;
-    let (codec, payload) = match codec {
-        Codec::Store => (Codec::Store, data),
-        Codec::Zstd => {
-            let packed = match comp {
-                Some(c) => c.compress(&data)?,
-                None => codec::compress(Codec::Zstd, 3, &data)?,
-            };
-            // Never let "compression" grow a chunk.
-            if packed.len() >= data.len() {
-                (Codec::Store, data)
-            } else {
-                (Codec::Zstd, packed)
-            }
+    // Filters are reversible transforms that make the data more compressible;
+    // the chunk hash covers the ORIGINAL bytes, so it is computed before this.
+    crate::filters::Filter::from_id(filter)?.apply(&mut data);
+    let packed = match codec {
+        Codec::Store => None,
+        // The per-worker zstd context is reused across chunks; allocating one
+        // per chunk would dominate the cost of small chunks.
+        Codec::Zstd => match comp {
+            Some(c) => Some(c.compress(&data)?),
+            None => Some(codec::compress(Codec::Zstd, level, &data)?),
+        },
+        other => Some(codec::compress(other, level, &data)?),
+    };
+    // Never let "compression" grow a chunk, and drop the filter with it: a
+    // stored chunk is the original bytes, so no transform must be recorded.
+    let (codec, filter, payload) = match packed {
+        Some(p) if p.len() < data.len() => (codec, filter, p),
+        _ => {
+            crate::filters::Filter::from_id(filter)?.unapply(&mut data);
+            (Codec::Store, 0, data)
         }
     };
     Ok(Done {
         seq,
         payload,
         codec,
+        filter,
         unpacked,
         hash,
         charge,
@@ -356,6 +385,7 @@ fn writer_loop(file: &mut File, rx: Receiver<Result<Done>>, budget: &Budget) -> 
                 packed: d.payload.len() as u64,
                 unpacked: d.unpacked,
                 codec: d.codec.id(),
+                filter: d.filter,
                 hash: d.hash,
             });
             offset += d.payload.len() as u64;

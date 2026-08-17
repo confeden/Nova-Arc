@@ -13,6 +13,8 @@ blake3 = "1"
 clap = { version = "4", features = ["derive"] }
 crossbeam-channel = "0.5"
 fastcdc = "3"
+lzma-rust2 = "0.19"
+ppmd-rust = "1.4"
 filetime = "0.2"
 rmp-serde = "1"
 serde = { version = "1", features = ["derive"] }

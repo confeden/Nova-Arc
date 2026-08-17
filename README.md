@@ -19,10 +19,15 @@ reclaimed by an explicit `compact`.
 
 Planned on top of that:
 
-- **Two-phase compression** — analyze files first, then compress each with
-  the best method for its type (filters, solid small-file groups, and
-  recompression of already-compressed data: deflate/JPEG/MP3).
-- **Familiar formats** — pack/unpack zip & 7z, unpack rar.
+- **Two-phase compression** — every file is analyzed first, then compressed
+  with the method that suits it: PPMd for text, LZMA2 for binaries, a BCJ
+  transform for executables, and nothing at all for data that is already
+  compressed. Small files are packed into solid blocks so the compressor can
+  exploit what they have in common. Measured on 5751 source files (114 MiB):
+  16 MiB at the max tier, in 2.6 s.
+  Still to come: recompression of already-compressed data (deflate/JPEG/MP3).
+- **Familiar formats** — pack/unpack zip & 7z, unpack rar (creating RAR
+  archives is not legally possible for anyone but RARLAB).
 - **GUI** with file list, icons and previews; "open from archive in
   Explorer" with automatic temp cleanup and write-back.
 - **Polite resource usage** — packing uses every core at below-normal CPU,

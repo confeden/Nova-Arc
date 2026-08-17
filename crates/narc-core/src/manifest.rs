@@ -21,6 +21,18 @@ pub struct Manifest {
     /// Every chunk ever written to the archive (until `compact`). Entries not
     /// referenced by any file are dead space but remain usable for dedup.
     pub chunks: Vec<ChunkRec>,
+    /// Solid blocks: many small files concatenated into one compressed
+    /// stream, so the compressor can find redundancy *between* them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocks: Vec<Block>,
+}
+
+/// A solid block is just a byte stream, chunked like any file. Files stored
+/// in it reference a byte range instead of owning chunks.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Block {
+    pub chunks: Vec<u32>,
+    pub size: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,8 +42,13 @@ pub struct FileEntry {
     pub size: u64,
     /// Unix seconds, may be negative (pre-1970); 0 = unknown.
     pub mtime: i64,
-    /// Indices into `Manifest::chunks`, in file order.
+    /// Indices into `Manifest::chunks`, in file order. Empty for files that
+    /// live inside a solid block.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub chunks: Vec<u32>,
+    /// `(block index, byte offset in the block)` for solid-stored files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block: Option<(u32, u64)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,10 +58,19 @@ pub struct ChunkRec {
     pub packed: u64,
     pub unpacked: u64,
     pub codec: u8,
+    /// Reversible transform applied before compression (see `filters`).
+    /// 0 = none, which is the common case, so it stays out of the manifest.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub filter: u8,
     /// blake3 of the UNPACKED chunk, truncated to 128 bits. Used for both
-    /// dedup and integrity verification on extract.
+    /// dedup and integrity verification on extract. The hash covers the
+    /// original bytes, before any filter, so dedup is filter-independent.
     #[serde(with = "hash16")]
     pub hash: [u8; 16],
+}
+
+fn is_zero(v: &u8) -> bool {
+    *v == 0
 }
 
 impl Manifest {

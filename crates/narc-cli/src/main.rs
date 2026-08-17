@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use narc_core::{AddStats, Archive, Overwrite, PackOptions, Tier};
 use narc_platform::PriorityMode;
@@ -239,15 +239,7 @@ fn main() -> Result<()> {
             let mut stored = 0u64;
             println!("{:>12}  {:>12}  Path", "Size", "Stored");
             for f in &a.manifest.files {
-                let mut st: u64 = 0;
-                for &i in &f.chunks {
-                    st += a
-                        .manifest
-                        .chunks
-                        .get(i as usize)
-                        .context("corrupt manifest: chunk index out of range")?
-                        .packed;
-                }
+                let st = a.stored_size(f);
                 println!("{:>12}  {:>12}  {}", human(f.size), human(st), f.path);
                 total += f.size;
                 stored += st;

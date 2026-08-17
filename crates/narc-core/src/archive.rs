@@ -21,10 +21,10 @@ use std::sync::Mutex;
 use anyhow::{bail, Context, Result};
 use fastcdc::v2020::StreamCDC;
 
-use crate::analyze::{pick_codec, Tier};
+use crate::analyze::{self, Tier};
 use crate::codec::{self, Codec};
 use crate::footer::{self, Footer, FOOTER_LEN, HEADER_LEN};
-use crate::manifest::{ChunkRec, FileEntry, Manifest};
+use crate::manifest::{Block, ChunkRec, FileEntry, Manifest};
 use crate::paths;
 use crate::pipeline::{self, PackOptions};
 
@@ -202,9 +202,69 @@ impl Archive {
             bail!("archive opened read-only");
         }
         let mut stats = AddStats::default();
+
+        // Collect the work list first: small files are packed last, grouped
+        // by extension, so the compressor sees similar data back to back.
+        let mut work: Vec<(PathBuf, String, u64)> = Vec::new();
+        for input in inputs {
+            let meta = fs::symlink_metadata(input)
+                .with_context(|| format!("cannot access {}", input.display()))?;
+            if meta.file_type().is_symlink() {
+                stats.symlinks_skipped += 1;
+                continue;
+            }
+            if meta.is_file() {
+                let rel = match input.file_name() {
+                    Some(n) => paths::normalize_rel(Path::new(n))?,
+                    None => bail!("cannot determine archive name for {}", input.display()),
+                };
+                work.push((input.clone(), rel, meta.len()));
+            } else {
+                let root_name = input.file_name().map(|n| n.to_owned());
+                for entry in walkdir::WalkDir::new(input)
+                    .sort_by_file_name()
+                    .follow_links(false)
+                {
+                    let entry = entry?;
+                    if entry.file_type().is_symlink() {
+                        stats.symlinks_skipped += 1;
+                        continue;
+                    }
+                    if !entry.file_type().is_file() {
+                        continue;
+                    }
+                    let inner = entry
+                        .path()
+                        .strip_prefix(input)
+                        .expect("walkdir yields children of its root");
+                    let mut relp = PathBuf::new();
+                    if let Some(ref n) = root_name {
+                        relp.push(n);
+                    }
+                    relp.push(inner);
+                    let rel = paths::normalize_rel(&relp)?;
+                    let len = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                    work.push((entry.path().to_path_buf(), rel, len));
+                }
+            }
+        }
+        let (mut small, big): (Vec<_>, Vec<_>) = work
+            .into_iter()
+            .partition(|(_, _, len)| *len < SOLID_MAX_FILE);
+        // Group key = extension: .rs with .rs, .png with .png. Sorting by it
+        // is what makes a solid block compress well.
+        small.sort_by(|a, b| {
+            let ka = solid_group_key(&a.1);
+            let kb = solid_group_key(&b.1);
+            ka.cmp(&kb).then_with(|| a.1.cmp(&b.1))
+        });
+
         let mut ctx = AddCtx {
+            tier: opts.tier,
             base: u32::try_from(self.manifest.chunks.len())
                 .context("archive chunk count exceeds format limit")?,
+            block_base: u32::try_from(self.manifest.blocks.len())
+                .context("archive block count exceeds format limit")?,
             dedup: self
                 .manifest
                 .chunks
@@ -219,50 +279,26 @@ impl Archive {
                 .map(|f| (paths::collision_key(&f.path), f.path.clone()))
                 .collect(),
             files: Vec::new(),
+            blocks: Vec::new(),
+            solid: SolidBuilder::default(),
         };
 
         let out = pipeline::pack_with(&mut self.file, opts, |sub| {
-            for input in inputs {
-                let meta = fs::symlink_metadata(input)
-                    .with_context(|| format!("cannot access {}", input.display()))?;
-                if meta.file_type().is_symlink() {
-                    stats.symlinks_skipped += 1;
-                    continue;
-                }
-                if meta.is_file() {
-                    let rel = match input.file_name() {
-                        Some(n) => paths::normalize_rel(Path::new(n))?,
-                        None => bail!("cannot determine archive name for {}", input.display()),
-                    };
-                    ctx.add_file(sub, input, rel, &mut stats)?;
-                } else {
-                    let root_name = input.file_name().map(|n| n.to_owned());
-                    for entry in walkdir::WalkDir::new(input)
-                        .sort_by_file_name()
-                        .follow_links(false)
-                    {
-                        let entry = entry?;
-                        if entry.file_type().is_symlink() {
-                            stats.symlinks_skipped += 1;
-                            continue;
-                        }
-                        if !entry.file_type().is_file() {
-                            continue;
-                        }
-                        let inner = entry
-                            .path()
-                            .strip_prefix(input)
-                            .expect("walkdir yields children of its root");
-                        let mut relp = PathBuf::new();
-                        if let Some(ref n) = root_name {
-                            relp.push(n);
-                        }
-                        relp.push(inner);
-                        let rel = paths::normalize_rel(&relp)?;
-                        ctx.add_file(sub, entry.path(), rel, &mut stats)?;
-                    }
-                }
+            for (disk, rel, _) in &big {
+                ctx.add_file(sub, disk, rel.clone(), &mut stats)?;
             }
+            let mut group = String::new();
+            for (disk, rel, _) in &small {
+                let key = solid_group_key(rel);
+                // A block holds one file type only; flush when the type
+                // changes so a mixed block never dilutes the model.
+                if key != group {
+                    ctx.flush_solid(sub, &mut stats)?;
+                    group = key;
+                }
+                ctx.add_small_file(sub, disk, rel.clone(), &mut stats)?;
+            }
+            ctx.flush_solid(sub, &mut stats)?;
             Ok(())
         })?;
 
@@ -270,6 +306,7 @@ impl Archive {
         // reader predicted (base + submission index) are now correct.
         stats.bytes_stored = out.bytes_stored;
         self.manifest.chunks.extend(out.chunks);
+        self.manifest.blocks.extend(ctx.blocks);
         let mut by_path: HashMap<String, usize> = self
             .manifest
             .files
@@ -401,6 +438,7 @@ impl Archive {
                         }
                     };
                     narc_platform::lower_io_priority(&reader);
+                    let mut cache = BlockCache::default();
                     let mut local = (0usize, 0u64, 0usize);
                     loop {
                         if stop.load(Ordering::Relaxed) {
@@ -417,6 +455,7 @@ impl Archive {
                             target,
                             overwrite,
                             file_len,
+                            &mut cache,
                         ) {
                             Ok(Some(bytes)) => {
                                 local.0 += 1;
@@ -494,11 +533,43 @@ impl Archive {
         Ok(removed)
     }
 
+    /// Bytes this entry occupies in the archive. For a file inside a solid
+    /// block there is no separate answer — the block is one compressed
+    /// stream — so its share is prorated by size.
+    pub fn stored_size(&self, entry: &FileEntry) -> u64 {
+        if let Some((b, _)) = entry.block {
+            let Some(block) = self.manifest.blocks.get(b as usize) else {
+                return 0;
+            };
+            if block.size == 0 {
+                return 0;
+            }
+            let packed: u64 = block
+                .chunks
+                .iter()
+                .filter_map(|&i| self.manifest.chunks.get(i as usize))
+                .map(|c| c.packed)
+                .sum();
+            return (packed as u128 * entry.size as u128 / block.size as u128) as u64;
+        }
+        entry
+            .chunks
+            .iter()
+            .filter_map(|&i| self.manifest.chunks.get(i as usize))
+            .map(|c| c.packed)
+            .sum()
+    }
+
     pub fn info(&self) -> InfoStats {
         let file_len = self.file.metadata().map(|m| m.len()).unwrap_or(0);
         let mut live: HashSet<u32> = HashSet::new();
         for f in &self.manifest.files {
             live.extend(f.chunks.iter().copied());
+            if let Some((b, _)) = f.block {
+                if let Some(block) = self.manifest.blocks.get(b as usize) {
+                    live.extend(block.chunks.iter().copied());
+                }
+            }
         }
         let live_bytes: u64 = live
             .iter()
@@ -543,35 +614,75 @@ impl Archive {
             generation: old.generation,
             files: Vec::with_capacity(old.files.len()),
             chunks: Vec::new(),
+            blocks: Vec::new(),
         };
         let mut remap: HashMap<u32, u32> = HashMap::new();
+        let mut block_remap: HashMap<u32, u32> = HashMap::new();
         let mut reader = &file;
+        // Copying a chunk verifies it first, so compaction can never bake
+        // corruption into the new archive.
+        let mut copy_chunk = |i: u32,
+                              remap: &mut HashMap<u32, u32>,
+                              new: &mut Manifest,
+                              tmp: &mut tempfile::NamedTempFile,
+                              what: &str|
+         -> Result<u32> {
+            if let Some(&n) = remap.get(&i) {
+                return Ok(n);
+            }
+            let rec = old
+                .chunks
+                .get(i as usize)
+                .context("corrupt manifest: chunk index out of range")?;
+            let buf = read_packed(&mut reader, rec, file_len)?;
+            verify_chunk(rec, &buf).with_context(|| format!("in {what}"))?;
+            let off = tmp.as_file_mut().seek(SeekFrom::End(0))?;
+            tmp.as_file_mut().write_all(&buf)?;
+            let n = new.chunks.len() as u32;
+            new.chunks.push(ChunkRec {
+                offset: off,
+                ..rec.clone()
+            });
+            remap.insert(i, n);
+            Ok(n)
+        };
+
         for f in &old.files {
             let mut ids = Vec::with_capacity(f.chunks.len());
             for &i in &f.chunks {
-                if let Some(&n) = remap.get(&i) {
-                    ids.push(n);
-                    continue;
-                }
-                let rec = old
-                    .chunks
-                    .get(i as usize)
-                    .context("corrupt manifest: chunk index out of range")?;
-                let buf = read_packed(&mut reader, rec, file_len)?;
-                // Never carry corruption into the compacted archive.
-                verify_chunk(rec, &buf).with_context(|| format!("in {}", f.path))?;
-                let off = tmp.as_file_mut().seek(SeekFrom::End(0))?;
-                tmp.as_file_mut().write_all(&buf)?;
-                let n = new.chunks.len() as u32;
-                new.chunks.push(ChunkRec {
-                    offset: off,
-                    ..rec.clone()
-                });
-                remap.insert(i, n);
-                ids.push(n);
+                ids.push(copy_chunk(i, &mut remap, &mut new, &mut tmp, &f.path)?);
             }
+            // A solid block is copied once, when its first surviving member
+            // is reached; blocks whose members were all removed are dropped.
+            let block = match f.block {
+                Some((b, off)) => {
+                    let nb = match block_remap.get(&b) {
+                        Some(&nb) => nb,
+                        None => {
+                            let src = old
+                                .blocks
+                                .get(b as usize)
+                                .context("corrupt manifest: block index out of range")?;
+                            let mut bids = Vec::with_capacity(src.chunks.len());
+                            for &i in &src.chunks {
+                                bids.push(copy_chunk(i, &mut remap, &mut new, &mut tmp, &f.path)?);
+                            }
+                            let nb = new.blocks.len() as u32;
+                            new.blocks.push(Block {
+                                chunks: bids,
+                                size: src.size,
+                            });
+                            block_remap.insert(b, nb);
+                            nb
+                        }
+                    };
+                    Some((nb, off))
+                }
+                None => None,
+            };
             new.files.push(FileEntry {
                 chunks: ids,
+                block,
                 ..f.clone()
             });
         }
@@ -591,6 +702,50 @@ impl Archive {
     }
 }
 
+/// Holds the most recently decompressed solid block. Members of a block are
+/// adjacent in the manifest, so a single-entry cache turns "decompress the
+/// block per file" into "decompress it once".
+#[derive(Default)]
+struct BlockCache {
+    idx: Option<u32>,
+    data: Vec<u8>,
+}
+
+impl BlockCache {
+    fn load(
+        &mut self,
+        reader: &mut File,
+        manifest: &Manifest,
+        block_idx: u32,
+        file_len: u64,
+    ) -> Result<&[u8]> {
+        if self.idx != Some(block_idx) {
+            let block = manifest
+                .blocks
+                .get(block_idx as usize)
+                .context("corrupt manifest: block index out of range")?;
+            if block.size > SOLID_BLOCK as u64 * 2 {
+                bail!("corrupt manifest: implausible solid block size");
+            }
+            let mut data = Vec::with_capacity(block.size as usize);
+            for &idx in &block.chunks {
+                let rec = manifest
+                    .chunks
+                    .get(idx as usize)
+                    .context("corrupt manifest: chunk index out of range")?;
+                let packed = read_packed(&mut &*reader, rec, file_len)?;
+                data.extend_from_slice(&verify_chunk(rec, &packed)?);
+            }
+            if data.len() as u64 != block.size {
+                bail!("corrupt archive: solid block size mismatch");
+            }
+            self.data = data;
+            self.idx = Some(block_idx);
+        }
+        Ok(&self.data)
+    }
+}
+
 /// Write one entry to `target`. Returns the number of bytes written, or
 /// `None` when an existing file was kept per the overwrite policy.
 fn extract_one(
@@ -600,6 +755,7 @@ fn extract_one(
     target: &Path,
     overwrite: Overwrite,
     file_len: u64,
+    cache: &mut BlockCache,
 ) -> Result<Option<u64>> {
     if let Some(parent) = target.parent() {
         fs::create_dir_all(parent)?;
@@ -620,15 +776,28 @@ fn extract_one(
     narc_platform::lower_io_priority(&out);
 
     let mut written = 0u64;
-    for &idx in &entry.chunks {
-        let rec = manifest
-            .chunks
-            .get(idx as usize)
-            .context("corrupt manifest: chunk index out of range")?;
-        let packed = read_packed(&mut &*reader, rec, file_len)?;
-        let data = verify_chunk(rec, &packed).with_context(|| format!("in {}", entry.path))?;
-        out.write_all(&data)?;
-        written += data.len() as u64;
+    if let Some((block_idx, offset)) = entry.block {
+        let block = cache
+            .load(reader, manifest, block_idx, file_len)
+            .with_context(|| format!("in {}", entry.path))?;
+        let start = usize::try_from(offset).context("solid offset out of range")?;
+        let end = start
+            .checked_add(usize::try_from(entry.size).context("file size out of range")?)
+            .filter(|e| *e <= block.len())
+            .context("corrupt manifest: file range outside its solid block")?;
+        out.write_all(&block[start..end])?;
+        written = entry.size;
+    } else {
+        for &idx in &entry.chunks {
+            let rec = manifest
+                .chunks
+                .get(idx as usize)
+                .context("corrupt manifest: chunk index out of range")?;
+            let packed = read_packed(&mut &*reader, rec, file_len)?;
+            let data = verify_chunk(rec, &packed).with_context(|| format!("in {}", entry.path))?;
+            out.write_all(&data)?;
+            written += data.len() as u64;
+        }
     }
     if written != entry.size {
         bail!("size mismatch extracting {}", entry.path);
@@ -641,15 +810,152 @@ fn extract_one(
     Ok(Some(written))
 }
 
+/// Files below this size are packed into solid blocks instead of being
+/// chunked individually: on their own they are far too small for a
+/// compressor to learn anything, and each would cost a chunk record.
+pub const SOLID_MAX_FILE: u64 = 256 * 1024;
+
+/// Target size of a solid block. Small enough that replacing one file inside
+/// it rewrites only a few MB (the whole point of NARC), large enough for the
+/// compressor to exploit similarity across files.
+pub const SOLID_BLOCK: usize = 8 * 1024 * 1024;
+
+/// Grouping key for solid blocks: the extension, lowercased. Sorting small
+/// files by it puts .rs next to .rs and .png next to .png.
+fn solid_group_key(rel: &str) -> String {
+    match rel.rsplit_once('.') {
+        Some((_, ext)) if !ext.is_empty() && ext.len() <= 16 && !ext.contains('/') => {
+            ext.to_lowercase()
+        }
+        _ => String::new(),
+    }
+}
+
+/// Accumulates small files into one contiguous buffer that is compressed as
+/// a single stream.
+#[derive(Default)]
+struct SolidBuilder {
+    buf: Vec<u8>,
+    /// Files placed in the current block, with their offsets in `buf`.
+    members: Vec<(FileEntry, u64)>,
+}
+
 /// Reader-side state for one `add_paths` run: dedup index, collision
 /// detection, and the file entries being built. Chunk indices are predicted
 /// as `base + submission index`, which is exact because the pipeline's writer
 /// appends chunks in submission order.
 struct AddCtx {
+    tier: Tier,
     base: u32,
+    block_base: u32,
     dedup: HashMap<[u8; 16], u32>,
     by_ci: HashMap<String, String>,
     files: Vec<FileEntry>,
+    blocks: Vec<Block>,
+    solid: SolidBuilder,
+}
+
+impl AddCtx {
+    /// Append a small file to the pending solid block, flushing first if the
+    /// block is full.
+    fn add_small_file(
+        &mut self,
+        sub: &mut pipeline::Submitter,
+        disk: &Path,
+        rel: String,
+        stats: &mut AddStats,
+    ) -> Result<()> {
+        let data = fs::read(disk).with_context(|| format!("cannot read {}", disk.display()))?;
+        if self.solid.buf.len() + data.len() > SOLID_BLOCK && !self.solid.buf.is_empty() {
+            self.flush_solid(sub, stats)?;
+        }
+        let meta = fs::metadata(disk)?;
+        let entry = FileEntry {
+            path: rel.clone(),
+            size: data.len() as u64,
+            mtime: mtime_of(&meta),
+            chunks: Vec::new(),
+            block: None, // filled in by flush_solid
+        };
+        let offset = self.solid.buf.len() as u64;
+        self.solid.buf.extend_from_slice(&data);
+        self.solid.members.push((entry, offset));
+        self.note_case_collision(&rel, stats);
+        stats.bytes_in += data.len() as u64;
+        stats.files += 1;
+        Ok(())
+    }
+
+    /// Compress the pending solid block and record its members.
+    fn flush_solid(&mut self, sub: &mut pipeline::Submitter, stats: &mut AddStats) -> Result<()> {
+        if self.solid.members.is_empty() {
+            return Ok(());
+        }
+        let buf = std::mem::take(&mut self.solid.buf);
+        let members = std::mem::take(&mut self.solid.members);
+        let plan = analyze::plan(&buf[..buf.len().min(HEAD_SAMPLE)], self.tier);
+        let block_size = buf.len() as u64;
+
+        let mut chunk_ids = Vec::new();
+        for chunk in StreamCDC::new(std::io::Cursor::new(buf), MIN_CHUNK, AVG_CHUNK, MAX_CHUNK) {
+            let data = chunk.context("chunking solid block")?.data;
+            let mut key = [0u8; 16];
+            key.copy_from_slice(&blake3::hash(&data).as_bytes()[..16]);
+            if let Some(&idx) = self.dedup.get(&key) {
+                stats.bytes_deduped += data.len() as u64;
+                chunk_ids.push(idx);
+                continue;
+            }
+            let local = sub.submit_filtered(data, key, plan.codec, plan.filter.id())?;
+            let idx = self
+                .base
+                .checked_add(local)
+                .context("archive chunk count exceeds format limit")?;
+            self.dedup.insert(key, idx);
+            chunk_ids.push(idx);
+        }
+
+        let block_idx = self
+            .block_base
+            .checked_add(u32::try_from(self.blocks.len()).unwrap_or(u32::MAX))
+            .context("archive block count exceeds format limit")?;
+        self.blocks.push(Block {
+            chunks: chunk_ids,
+            size: block_size,
+        });
+        for (mut entry, offset) in members {
+            entry.block = Some((block_idx, offset));
+            self.files.push(entry);
+        }
+        Ok(())
+    }
+
+    /// Warn about entries that differ only in letter case: Windows and macOS
+    /// cannot hold both.
+    fn note_case_collision(&mut self, rel: &str, stats: &mut AddStats) {
+        let ck = paths::collision_key(rel);
+        match self.by_ci.get(&ck) {
+            Some(other) if other != rel => stats.warnings.push(format!(
+                "{rel:?} differs only in letter case from {other:?}; \
+                 they cannot both be extracted on Windows"
+            )),
+            Some(_) => {}
+            None => {
+                self.by_ci.insert(ck, rel.to_string());
+            }
+        }
+    }
+}
+
+fn mtime_of(meta: &fs::Metadata) -> i64 {
+    match meta.modified() {
+        Ok(t) => match t.duration_since(std::time::UNIX_EPOCH) {
+            Ok(d) => d.as_secs() as i64,
+            // Pre-1970 timestamps are representable and worth keeping.
+            Err(e) => -(e.duration().as_secs() as i64),
+        },
+        Err(_) => 0,
+    }
 }
 
 impl AddCtx {
@@ -661,14 +967,7 @@ impl AddCtx {
         stats: &mut AddStats,
     ) -> Result<()> {
         let meta = fs::metadata(disk)?;
-        let mtime = match meta.modified() {
-            Ok(t) => match t.duration_since(std::time::UNIX_EPOCH) {
-                Ok(d) => d.as_secs() as i64,
-                // Pre-1970 timestamps are representable and worth keeping.
-                Err(e) => -(e.duration().as_secs() as i64),
-            },
-            Err(_) => 0,
-        };
+        let mtime = mtime_of(&meta);
 
         let mut chunk_ids: Vec<u32> = Vec::new();
         let mut actual_size = 0u64;
@@ -680,7 +979,7 @@ impl AddCtx {
             let head_len = HEAD_SAMPLE.min(meta.len() as usize);
             let mut head = Vec::with_capacity(head_len);
             (&mut f).take(head_len as u64).read_to_end(&mut head)?;
-            let file_codec = pick_codec(&head);
+            let plan = analyze::plan(&head, self.tier);
             // Phase 2: chunk, hash, dedup, then hand unique chunks to the
             // compression pipeline. Memory stays bounded by the pipeline's
             // budget regardless of file size.
@@ -698,7 +997,7 @@ impl AddCtx {
                     chunk_ids.push(idx);
                     continue;
                 }
-                let local = sub.submit(data, key, file_codec)?;
+                let local = sub.submit_filtered(data, key, plan.codec, plan.filter.id())?;
                 let idx = self
                     .base
                     .checked_add(local)
@@ -713,20 +1012,9 @@ impl AddCtx {
             size: actual_size,
             mtime,
             chunks: chunk_ids,
+            block: None,
         };
-        // Two entries differing only in case cannot both be extracted on
-        // Windows/macOS - warn while the user can still react.
-        let ck = paths::collision_key(&rel);
-        match self.by_ci.get(&ck) {
-            Some(other) if other != &rel => stats.warnings.push(format!(
-                "{rel:?} differs only in letter case from {other:?}; \
-                 they cannot both be extracted on Windows"
-            )),
-            Some(_) => {}
-            None => {
-                self.by_ci.insert(ck, rel);
-            }
-        }
+        self.note_case_collision(&rel, stats);
         self.files.push(entry);
         stats.files += 1;
         Ok(())
@@ -787,7 +1075,11 @@ fn read_packed(reader: &mut &File, rec: &ChunkRec, file_len: u64) -> Result<Vec<
 
 /// Decompress a chunk and check it against the hash recorded in the manifest.
 fn verify_chunk(rec: &ChunkRec, packed: &[u8]) -> Result<Vec<u8>> {
-    let data = codec::decompress(Codec::from_id(rec.codec)?, packed, rec.unpacked as usize)?;
+    let mut data = codec::decompress(Codec::from_id(rec.codec)?, packed, rec.unpacked as usize)?;
+    // Undo the pre-compression transform before checking the hash: the hash
+    // was taken over the original bytes, so it also proves the filter round
+    // -tripped exactly.
+    crate::filters::Filter::from_id(rec.filter)?.unapply(&mut data);
     if blake3::hash(&data).as_bytes()[..16] != rec.hash {
         bail!("chunk checksum mismatch - archive is corrupt");
     }

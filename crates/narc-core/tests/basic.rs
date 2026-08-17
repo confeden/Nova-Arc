@@ -487,3 +487,180 @@ fn compact_detects_corrupted_chunk_instead_of_copying_it() {
     );
     assert!(fx.arc.exists(), "the original archive must survive");
 }
+
+// --- solid blocks (compression v2) ---
+
+/// A tree of many small files of two types, the case solid blocks exist for.
+fn small_tree(root: &Path, n: usize) {
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::create_dir_all(root.join("cfg")).unwrap();
+    for i in 0..n {
+        fs::write(
+            root.join(format!("src/mod_{i}.rs")),
+            format!("pub fn f_{i}(x: u32) -> u32 {{ x + {i} }}\n").repeat(40),
+        )
+        .unwrap();
+        fs::write(
+            root.join(format!("cfg/app_{i}.toml")),
+            format!("[server]\nname = \"node{i}\"\nport = {}\n", 8000 + i).repeat(20),
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+fn solid_blocks_roundtrip_and_shrink_small_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("many");
+    small_tree(&src, 120);
+    let arc = tmp.path().join("s.narc");
+
+    let mut a = Archive::create(&arc).unwrap();
+    let s = a.add_paths(std::slice::from_ref(&src), &PackOptions::new(Tier::Normal))
+        .unwrap();
+    assert_eq!(s.files, 240);
+    // 240 tiny files must not become 240 chunks: they are packed together.
+    assert!(
+        a.manifest.chunks.len() < 20,
+        "expected solid packing, got {} chunks",
+        a.manifest.chunks.len()
+    );
+    assert!(!a.manifest.blocks.is_empty());
+    assert!(
+        a.manifest.files.iter().all(|f| f.block.is_some()),
+        "every small file should live in a block"
+    );
+    // Cross-file redundancy is the point: these files are near-identical.
+    assert!(
+        s.bytes_stored * 40 < s.bytes_in,
+        "solid ratio too weak: {} -> {}",
+        s.bytes_in,
+        s.bytes_stored
+    );
+    drop(a);
+
+    let a = Archive::open_ro(&arc).unwrap();
+    let out = tmp.path().join("out");
+    let xs = a.extract(&out, None, Overwrite::Fail).unwrap();
+    assert_eq!(xs.files, 240);
+    assert_same_tree(&src, &out.join("many"));
+}
+
+#[test]
+fn editing_one_small_file_rewrites_only_its_block() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("many");
+    small_tree(&src, 60);
+    let arc = tmp.path().join("s.narc");
+    let mut a = Archive::create(&arc).unwrap();
+    a.add_paths(std::slice::from_ref(&src), &PackOptions::new(Tier::Normal))
+        .unwrap();
+    drop(a);
+    let before = fs::metadata(&arc).unwrap().len();
+
+    fs::write(src.join("src/mod_7.rs"), "pub fn changed() {}\n").unwrap();
+    let mut a = Archive::open_rw(&arc).unwrap();
+    a.add_paths(std::slice::from_ref(&src), &PackOptions::new(Tier::Normal))
+        .unwrap();
+    drop(a);
+    let after = fs::metadata(&arc).unwrap().len();
+
+    // The whole tree is re-added, but only the changed block's chunks are new.
+    assert!(
+        after - before < before,
+        "one-file edit grew the archive by {} on a {} archive",
+        after - before,
+        before
+    );
+
+    let a = Archive::open_ro(&arc).unwrap();
+    let out = tmp.path().join("out");
+    a.extract(&out, None, Overwrite::Fail).unwrap();
+    assert_same_tree(&src, &out.join("many"));
+}
+
+#[test]
+fn selective_extract_of_a_solid_member() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("many");
+    small_tree(&src, 30);
+    let arc = tmp.path().join("s.narc");
+    let mut a = Archive::create(&arc).unwrap();
+    a.add_paths(std::slice::from_ref(&src), &PackOptions::new(Tier::Fast))
+        .unwrap();
+
+    let out = tmp.path().join("one");
+    let xs = a
+        .extract(
+            &out,
+            Some(&["many/src/mod_3.rs".to_string()]),
+            Overwrite::Fail,
+        )
+        .unwrap();
+    assert_eq!(xs.files, 1);
+    assert_eq!(
+        fs::read(out.join("many/src/mod_3.rs")).unwrap(),
+        fs::read(src.join("src/mod_3.rs")).unwrap()
+    );
+    assert!(!out.join("many/src/mod_4.rs").exists());
+}
+
+#[test]
+fn compact_keeps_solid_blocks_consistent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("many");
+    small_tree(&src, 40);
+    let arc = tmp.path().join("s.narc");
+    let mut a = Archive::create(&arc).unwrap();
+    a.add_paths(std::slice::from_ref(&src), &PackOptions::new(Tier::Fast))
+        .unwrap();
+    a.remove(&["many/cfg".to_string()]).unwrap();
+    let (before, after) = a.compact().unwrap();
+    assert!(after < before);
+
+    let a = Archive::open_ro(&arc).unwrap();
+    assert_eq!(a.manifest.files.len(), 40);
+    let out = tmp.path().join("out");
+    let xs = a.extract(&out, None, Overwrite::Fail).unwrap();
+    assert_eq!(xs.files, 40);
+    for i in 0..40 {
+        assert_eq!(
+            fs::read(out.join(format!("many/src/mod_{i}.rs"))).unwrap(),
+            fs::read(src.join(format!("src/mod_{i}.rs"))).unwrap()
+        );
+    }
+}
+
+#[test]
+fn max_tier_roundtrips_every_codec() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("mixed");
+    fs::create_dir_all(&src).unwrap();
+    // text -> PPMd, executable -> BCJ + LZMA2, random -> Store, big text -> LZMA2/PPMd
+    fs::write(src.join("prose.txt"), text(900_000)).unwrap();
+    let mut exe = b"MZ\x90\x00\x03\x00\x00\x00".to_vec();
+    for i in 0..300_000u32 {
+        exe.push(0xE8);
+        exe.extend_from_slice(&(i % 977).to_le_bytes());
+    }
+    fs::write(src.join("prog.exe"), &exe).unwrap();
+    fs::write(src.join("noise.bin"), rnd(700_000, 42)).unwrap();
+    let arc = tmp.path().join("m.narc");
+
+    let mut a = Archive::create(&arc).unwrap();
+    a.add_paths(std::slice::from_ref(&src), &PackOptions::new(Tier::Max))
+        .unwrap();
+    let codecs: std::collections::HashSet<u8> =
+        a.manifest.chunks.iter().map(|c| c.codec).collect();
+    assert!(codecs.len() > 1, "max tier should pick per-type codecs");
+    assert!(
+        a.manifest.chunks.iter().any(|c| c.filter != 0),
+        "the executable should have been filtered"
+    );
+    drop(a);
+
+    let a = Archive::open_ro(&arc).unwrap();
+    let out = tmp.path().join("out");
+    a.extract(&out, None, Overwrite::Fail).unwrap();
+    assert_same_tree(&src, &out.join("mixed"));
+}
