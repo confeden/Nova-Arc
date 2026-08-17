@@ -277,6 +277,30 @@ fn main() -> Result<()> {
                 "Reclaimable:  {} (run 'narc compact')",
                 human(i.reclaimable)
             );
+            if i.units > 0 {
+                println!(
+                    "Units:        {} (min {}, median {}, max {})",
+                    i.units,
+                    human(i.unit_min),
+                    human(i.unit_median),
+                    human(i.unit_max)
+                );
+            }
+            if !i.by_codec.is_empty() {
+                let name = |c: u8| match c {
+                    0 => "store",
+                    1 => "zstd",
+                    2 => "lzma2",
+                    3 => "ppmd7",
+                    _ => "unknown",
+                };
+                let parts: Vec<String> = i
+                    .by_codec
+                    .iter()
+                    .map(|(c, b)| format!("{} {}", name(*c), human(*b)))
+                    .collect();
+                println!("Stored by:    {}", parts.join(", "));
+            }
         }
     }
     Ok(())

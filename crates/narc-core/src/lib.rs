@@ -20,6 +20,7 @@ pub mod codec;
 pub mod filters;
 pub mod footer;
 pub mod manifest;
+mod pack;
 pub mod paths;
 pub mod pipeline;
 

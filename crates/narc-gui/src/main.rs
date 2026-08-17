@@ -168,7 +168,14 @@ fn open_archive(path: String) -> Result<ArchiveInfo, String> {
             size: f.size,
             stored: a.stored_size(f),
             mtime: f.mtime,
-            solid: f.block.is_some(),
+            // A file that shares its compression unit with other files, or
+            // spans several, is worth flagging: extracting it decompresses
+            // more than the file itself.
+            solid: f.extents.len() != 1
+                || a.manifest
+                    .chunks
+                    .get(f.extents[0].unit as usize)
+                    .is_some_and(|u| u.unpacked != f.size),
         })
         .collect();
     Ok(ArchiveInfo {

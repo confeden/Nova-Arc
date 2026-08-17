@@ -18,22 +18,17 @@ const MAX_MANIFEST_RATIO: u64 = 1000;
 pub struct Manifest {
     pub generation: u64,
     pub files: Vec<FileEntry>,
-    /// Every chunk ever written to the archive (until `compact`). Entries not
-    /// referenced by any file are dead space but remain usable for dedup.
+    /// Compression units. Each is one independently decodable stream; a unit
+    /// may hold many small files, part of one large file, or exactly one file.
     pub chunks: Vec<ChunkRec>,
-    /// Solid blocks: many small files concatenated into one compressed
-    /// stream, so the compressor can find redundancy *between* them.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub blocks: Vec<Block>,
-    /// How this archive cuts data into chunks, fixed when it was created.
+    /// How this archive cuts data into units, fixed when it was created.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub geometry: Option<Geometry>,
 }
 
-/// Chunking geometry — a property of the *archive*, not of a single
-/// operation.
+/// Unit geometry — a property of the *archive*, not of a single operation.
 ///
-/// Deduplication only works when identical data lands on identical chunk
+/// Deduplication only works when identical data lands on identical unit
 /// boundaries, so an archive created at one compression tier and later added
 /// to at another must keep cutting the same way. Otherwise every unchanged
 /// file looks new: measured, re-adding an untouched 28 MiB tree at a
@@ -46,16 +41,14 @@ pub struct Geometry {
     pub chunk_min: u32,
     pub chunk_avg: u32,
     pub chunk_max: u32,
-    pub solid_block: u64,
-    pub solid_max_file: u64,
-}
-
-/// A solid block is just a byte stream, chunked like any file. Files stored
-/// in it reference a byte range instead of owning chunks.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Block {
-    pub chunks: Vec<u32>,
-    pub size: u64,
+    /// Target size of a compression unit. Units group consecutive small files
+    /// and consecutive chunks of a large file, because unit size is the single
+    /// biggest ratio lever: measured on a source tree, 4 MiB units cost 50%
+    /// more than one solid stream while 32 MiB units cost only 5%.
+    pub unit: u64,
+    /// Files at or above this size are chunked before grouping instead of
+    /// being placed whole.
+    pub chunked_from: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,13 +58,20 @@ pub struct FileEntry {
     pub size: u64,
     /// Unix seconds, may be negative (pre-1970); 0 = unknown.
     pub mtime: i64,
-    /// Indices into `Manifest::chunks`, in file order. Empty for files that
-    /// live inside a solid block.
+    /// Where the file's bytes live, in file order. A small file is one extent
+    /// inside a shared unit; a large file is a run of extents across units.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub chunks: Vec<u32>,
-    /// `(block index, byte offset in the block)` for solid-stored files.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub block: Option<(u32, u64)>,
+    pub extents: Vec<Extent>,
+}
+
+/// A byte range of one compression unit.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct Extent {
+    /// Index into `Manifest::chunks`.
+    pub unit: u32,
+    /// Offset of the file's bytes inside the (decompressed) unit.
+    pub off: u64,
+    pub len: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -90,7 +90,7 @@ pub struct ChunkRec {
     /// 0 = none, which is the common case, so it stays out of the manifest.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub filter: u8,
-    /// blake3 of the UNPACKED chunk, truncated to 128 bits. Used for both
+    /// blake3 of the UNPACKED unit, truncated to 128 bits. Used for both
     /// dedup and integrity verification on extract. The hash covers the
     /// original bytes, before any filter, so dedup is filter-independent.
     #[serde(with = "hash16")]

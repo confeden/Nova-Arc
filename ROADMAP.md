@@ -36,8 +36,8 @@
   footer, writer lock, selector normalization, pre-1970 mtime, overwrite
   policy, compact-detects-corruption.
 - Compression v2 DONE: analyzer picks codec+filter per content class
-  (analyze.rs), solid blocks for files < 256 KiB grouped by extension
-  (8 MiB blocks), LZMA2 + PPMd7 codecs, BCJ x86 + delta filters
+  (analyze.rs), solid blocks grouped by extension (geometry per tier, see
+  below), LZMA2 + PPMd7 codecs, BCJ x86 + delta filters
   (filters.rs, BCJ verified byte-identical against liblzma).
 - Measured (8 logical cores, this machine, `bash test/bench.sh`), v1 → v2:
   · 114 MiB / 5751 source files: fast 6.5 s/28 MiB → 0.7 s/23 MiB;
@@ -89,10 +89,13 @@
 - BCJ always runs with start_offset 0, never the chunk's file position:
   position-dependent output would break dedup. Cost: one unconverted
   instruction per chunk boundary.
-- Solid blocks: files < SOLID_MAX_FILE (256 KiB) are sorted by extension,
-  concatenated into <= SOLID_BLOCK (8 MiB) streams, chunked as one unit. A
-  FileEntry then has `block: Some((idx, offset))` and no chunks of its own.
-  Block size is small ON PURPOSE: editing one member rewrites one block.
+- Solid blocks: files < `Tier::solid_max_file` (256 KiB fast/normal, 1 MiB MAX)
+  are sorted by extension, concatenated into `Tier::solid_block` streams
+  (4/16/32 MiB) and compressed as ONE unit. A FileEntry then has
+  `block: Some((idx, offset))` and no chunks of its own. Block size is bounded
+  ON PURPOSE: editing one member rewrites one block. Boundaries are
+  content-defined per file with a hard flush at 2x target, so realized blocks
+  run LARGER than target, not smaller: measured 2 blocks, median 64 MiB.
 - Two-phase pipeline: phase 1 `analyze::plan()` (format magic → content class
   → trial compress) returns codec+filter; phase 2 per-chunk compression.
   Tiers: fast=zstd3, normal=zstd12, max=LZMA2/PPMd7 by class.
@@ -163,7 +166,12 @@
   boundaries. A size-accumulator rule cost 17 MiB growth for a 1-line edit.
 - Measured vs 7-Zip 26.02: Silesia (202 MiB) narc max 47 MiB / 6.8 s ~=
   7z -mx9 47 MiB / 49 s. Source tree (114 MiB) narc max 12 MiB / 22 s vs
-  7z -mx9 8.8 MiB / 19 s - 7z still wins on many-small-files (bigger window).
+  7z -mx9 8.8 MiB / 19 s. ROOT CAUSE MEASURED (research 10 verification): NOT
+  many-small-files. The solid path is 6.62 MiB vs a 6.53 MiB one-stream floor
+  (+1.3%). The whole gap is the 12 files >= 1 MiB: 5.50 MiB compressed one by
+  one vs 2.23 MiB solid (+146%), because 9 of them are near-duplicate .exe
+  builds and CDC dedup misses recompiled binaries. Fix = cross-file solidity
+  for LARGE similar files, which trades against cheap edits.
   narc edit-one-file: 0.4-1 s; 7z u: 14 s. Benchmarks: test/compare-7z.sh,
   test/dict-experiment.py. Corpora: test/Silesia-compression-corpus/raw,
   test/enwik8/enwik8 (100 MB), test/corpus (source tree).

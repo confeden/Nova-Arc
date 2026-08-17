@@ -42,11 +42,13 @@ impl Tier {
         }
     }
 
-    /// Target size of a solid block of small files. The bigger it is, the more
-    /// the compressor can exploit similarity between files: measured on 5707
-    /// source files, 8 MiB blocks give 9.9% and 32 MiB blocks 7.9%. The cost
-    /// is that editing one member rewrites the whole block.
-    pub fn solid_block(self) -> usize {
+    /// Target size of a compression unit — the single biggest ratio lever.
+    /// Measured on a 5739-file source tree with LZMA2 -9e, against one solid
+    /// stream: 1 MiB units cost +74%, 4 MiB +50%, 16 MiB +19%, 32 MiB only
+    /// +4.9%. The cost is edit granularity, since changing a byte rewrites its
+    /// whole unit — so the fast tier keeps units small and only max trades
+    /// edit cost for ratio.
+    pub fn unit(self) -> u64 {
         match self {
             Tier::Fast => 4 * 1024 * 1024,
             Tier::Normal => 16 * 1024 * 1024,
@@ -54,9 +56,10 @@ impl Tier {
         }
     }
 
-    /// Files at or above this size are chunked on their own instead of going
-    /// into a solid block, so extracting one does not decompress a whole block.
-    pub fn solid_max_file(self) -> u64 {
+    /// Files at or above this size are cut into content-defined chunks before
+    /// being grouped, so that editing part of a large file rewrites only the
+    /// units that part touched. Smaller files are placed whole.
+    pub fn chunked_from(self) -> u64 {
         match self {
             Tier::Fast | Tier::Normal => 256 * 1024,
             Tier::Max => 1024 * 1024,
@@ -106,8 +109,8 @@ impl Tier {
             chunk_min,
             chunk_avg,
             chunk_max,
-            solid_block: self.solid_block() as u64,
-            solid_max_file: self.solid_max_file(),
+            unit: self.unit(),
+            chunked_from: self.chunked_from(),
         }
     }
 }

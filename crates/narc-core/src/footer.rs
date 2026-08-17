@@ -16,7 +16,7 @@ pub const HEADER_MAGIC: &[u8; 4] = b"NARC";
 pub const HEADER_LEN: u64 = 16;
 pub const FOOTER_MAGIC: &[u8; 8] = b"NARCEND1";
 pub const FOOTER_LEN: u64 = 80;
-pub const VERSION: (u8, u8) = (0, 2);
+pub const VERSION: (u8, u8) = (0, 3);
 
 #[derive(Debug, Clone)]
 pub struct Footer {
