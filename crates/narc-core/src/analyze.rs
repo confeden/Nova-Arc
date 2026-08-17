@@ -115,23 +115,31 @@ impl Tier {
     }
 }
 
-/// What the analyzer decided for a file (or a solid block).
+/// What the analyzer decided for a file or a unit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Plan {
     pub codec: Codec,
     pub filter: Filter,
+    /// What the data looked like. Used to keep a unit homogeneous: mixing
+    /// unrelated kinds in one stream costs ratio, because a compressor tuned
+    /// by the first megabytes then meets something else entirely.
+    pub kind: Kind,
 }
 
 impl Plan {
     pub const STORE: Plan = Plan {
         codec: Codec::Store,
         filter: Filter::None,
+        kind: Kind::Precompressed,
     };
 }
 
 /// Content classes worth treating differently.
+pub type Kind = Class;
+
+/// Content classes worth treating differently.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Class {
+pub enum Class {
     /// Entropy-coded already: JPEG, MP3, zip, video…
     Precompressed,
     /// Machine code: benefits from the BCJ address transform.
@@ -151,6 +159,7 @@ pub fn plan(head: &[u8], tier: Tier) -> Plan {
         return Plan {
             codec: general_codec(tier),
             filter: Filter::None,
+            kind: Class::Generic,
         };
     }
     match classify(head) {
@@ -160,6 +169,7 @@ pub fn plan(head: &[u8], tier: Tier) -> Plan {
             // Machine code is full of relative call targets; making them
             // absolute turns repeated calls into repeated byte patterns.
             filter: Filter::BcjX86,
+            kind: Class::Executable,
         },
         Class::Text => Plan {
             // PPMd's context modelling beats LZ on natural-language and
@@ -170,15 +180,36 @@ pub fn plan(head: &[u8], tier: Tier) -> Plan {
                 general_codec(tier)
             },
             filter: Filter::None,
+            kind: Class::Text,
         },
         Class::Generic => {
+            // Fixed-width records — database rows, catalogues, audio frames,
+            // arrays of numbers — look like noise to a match finder because
+            // nothing repeats byte for byte, yet each column changes slowly.
+            // Differencing at the record width exposes that, and it is the
+            // one case where data everyone calls incompressible is not.
+            // Data that already compresses is left alone: differencing it is
+            // a gamble that measured *worse* on source trees, and the codec
+            // is already finding those matches. The filter exists to rescue
+            // the other case — data that looks like noise to a match finder
+            // because it is a table of fixed-width records.
             if compresses(head) {
-                Plan {
+                return Plan {
                     codec: general_codec(tier),
                     filter: Filter::None,
-                }
-            } else {
-                Plan::STORE
+                    kind: Class::Generic,
+                };
+            }
+            match crate::filters::detect_delta_stride(head)
+                .and_then(|d| Filter::delta(d).ok())
+                .filter(|f| pays_off(head, *f))
+            {
+                Some(filter) => Plan {
+                    codec: general_codec(tier),
+                    filter,
+                    kind: Class::Generic,
+                },
+                None => Plan::STORE,
             }
         }
     }
@@ -195,6 +226,29 @@ fn general_codec(tier: Tier) -> Codec {
         // and decodes fast enough to stay out of the user's way.
         Tier::Max => Codec::Lzma2,
         _ => Codec::Zstd,
+    }
+}
+
+/// Does this filter actually make the data smaller?
+///
+/// The record-width estimator proposes a transform from entropy alone, which
+/// is a proxy and sometimes wrong: on Silesia's `sao` star catalogue every
+/// differencing width *hurts* (LZMA2 grows 8-60%), because the fields it
+/// separates were already being matched. So the proposal is tried on the
+/// sample with a fast codec and kept only if it wins. Cost is two compressions
+/// of 64 KiB, which is nothing next to compressing the file.
+fn pays_off(head: &[u8], filter: Filter) -> bool {
+    let sample = &head[..head.len().min(TRIAL_SAMPLE)];
+    let Ok(plain) = zstd::bulk::compress(sample, 1) else {
+        return false;
+    };
+    let mut filtered = sample.to_vec();
+    filter.apply(&mut filtered);
+    match zstd::bulk::compress(&filtered, 1) {
+        // Require a clear win: a filter byte and a decode-side pass are not
+        // worth a fraction of a percent.
+        Ok(c) => c.len() * 100 < plain.len() * 98,
+        Err(_) => false,
     }
 }
 

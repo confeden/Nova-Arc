@@ -17,7 +17,7 @@ Timings and peak working set captured by a PowerShell harness that polls
 
 | Axis | Is 7-Zip weak? | Inherent to the format? | Measured gap | narc action |
 |---|---|---|---|---|
-| 1. Solid-archive update cost | **Yes, on first touch** | Yes (folder = one coder stream) | 18–20 s + 1057 MiB RAM for a 29 KB edit vs narc 0.12 s | Keep; but fix `add <dir>` (§1.4) |
+| 1. Solid-archive update cost | **Yes, per newly touched file** | Yes (folder = one coder stream) | 13.8–20.3 s + 1057 MiB RAM for a 29 KB edit vs narc 0.12 s | Keep; but fix `add <dir>` (§1.4) |
 | 2. No deduplication | Yes | **Yes** (substream map is sequential) | Cuts both ways: narc −3.5 % on far-apart dupes, **+30 % worse** on near dupes | Stop selling dedup as ratio |
 | 3. No trained dictionaries | **Yes** | Yes (LZMA2 props = 1 byte) | The whole 36.2 % small-files gap | **Biggest available lever** (§3) — but see §3.4 for its real cost |
 | 4. Extraction parallelism | **Yes** | No — implementation | 1.00× across solid blocks; 3.6× only inside one folder | Free win, already 2.5× |
@@ -31,15 +31,59 @@ Timings and peak working set captured by a PowerShell harness that polls
 
 Two findings you must internalise before writing any marketing copy:
 
-* **The "7-Zip rewrites the whole archive on update" claim is only half true.** Verified below:
-  the *first* edit of a given file costs a full solid-block repack (18–20 s here); every
-  subsequent edit of that same file costs **0.6 s**, because 7-Zip migrates it into a small
-  private folder and leaves the old copy in place. 7-Zip does *not* accumulate dead bytes
-  across repeated edits — it pays CPU once instead of space forever.
+* **The "7-Zip rewrites the whole archive on update" claim needs one qualifier, not a retraction.**
+  Verified below: the first edit of *each* file costs a full solid-block repack (13.8–20.3 s here);
+  further edits of *that same* file cost **0.6 s**, because 7-Zip migrates it into a small private
+  folder. But the ~14 s is paid again for every *new* file touched, and each one adds a block, so a
+  repeatedly-edited archive drifts toward `-ms=off` ratio (§1.3: 2.60× worse). 7-Zip does not
+  accumulate dead bytes; it pays CPU per touched file and ratio forever. Qualify the ROADMAP with
+  **"first touch of each file"** — the premise is weakened, not wrong.
 * **Content-hash dedup is not a ratio story.** On three identical copies of a 126 MiB source
   tree, `7z -mx9` produced **11.4 MiB** and narc produced **16.4 MiB** — 7-Zip won by 30 %,
   because a 256 MiB LZMA window already covers the duplication. Dedup only wins when duplicates
   are farther apart than the dictionary, or when you cannot afford dictionary-sized RAM.
+
+---
+
+## 0.1 CRITICAL — narc data-loss bug found while re-verifying this report
+
+Not a 7-Zip finding. Reproduced on this machine with the release build and `sil.narc`
+(45 219 944 B, the *intact* Silesia archive from §12 — it differs from the deliberately corrupted
+`c-sil.narc` by exactly one byte, so it is not the damaged copy):
+
+```
+$ narc list sil.narc          ->  "0 file(s)",  exit code 0, no error
+$ narc info sil.narc          ->  Files: 0  Chunks: 0  Live data: 0 B
+                                  Reclaimable: 43.1 MiB (run 'narc compact')
+$ cp sil.narc dl.narc && narc add dl.narc sil/xml
+  exit code 0, no warning
+  45 219 944 B  ->  498 724 B      # 44.7 MiB (98.9 %) destroyed
+```
+
+**Mechanism.** `footer::VERSION` is now `(0, 3)`; `sil.narc` was written by the v0.2 build. The
+version gate (`footer.rs:97`) only rejects archives *newer* than the build, so an older archive
+falls through to a manifest parse failure. `Archive::open` (`archive.rs:173`) then walks backwards
+through up to `MAX_FOOTER_CANDIDATES = 64` footer candidates; one of them verifies and yields an
+**empty** manifest. Because `found` is `Some(...)`, no error is raised — and since the open is
+writable, `archive.rs:~202` runs `file.set_len(committed_end)` and truncates everything past the
+bogus footer. `remove` and `compact` take the same path.
+
+**Why it matters more than anything else in this file:** the failure is silent, exit code 0, and
+`info` actively *recommends* the destructive command. It violates the invariant stated four lines
+above it in the same file — `Overwrite::Fail` is documented as "never destroy data silently".
+Triggered by either an older format version *or* damage that makes the real footer unparseable;
+`MAX_FOOTER_CANDIDATES` bounds the scan cost but does nothing to stop a wrong-but-verifying footer
+being accepted.
+
+**Minimum fixes:** (1) reject archives whose format version is older than the build supports with a
+loud error instead of falling through to the scan; (2) a footer must be accepted only if it is at
+EOF or its `committed_end` is corroborated (e.g. the footer records the archive length / a chain
+back-pointer that must match); (3) never truncate on open — only on an explicit, confirmed
+`compact`; (4) an archive whose byte length greatly exceeds `live + reclaimable` derived from a
+scanned footer should be treated as unreadable, not as empty.
+
+This also generalises §6.2's milder observation ("`narc list` printed `0 file(s)` with no loud
+error"): the same silent-empty path is not just bad UX, it is a data-destruction path.
 
 ---
 
@@ -108,9 +152,37 @@ Repeated edits on the same solid `-ms=on` archive, each time via `7z u archive.7
 
 Interpretation: 7-Zip repacks **only the folder containing the changed file**. On a fresh
 `-ms=on` archive that folder is the whole archive → 20 s at 1057 MiB. After the repack the file
-lives in a tiny folder, so further edits are ~0.6 s. Folder count grows by one per newly touched
-file; the archive size stays flat (9.142 MB across ten edits). **7-Zip trades CPU once; narc
-trades space until `compact`.**
+lives in a tiny folder, so further edits are ~0.6 s.
+
+**Re-run (independent, same corpus) — two corrections to the above.** Create `-mx9 -ms=on`
+(20.53 s, 9 121 218 B, 4 blocks), then touch files with `7z u upd.7z <path>`:
+
+| step | time | archive size | distinct blocks |
+|---|---|---|---|
+| edit file A (1st touch) | **14.30 s** | 9 758 315 B (**+637 KB, +7.0 %**) | 4 |
+| edit file A again ×4 | 0.55 / 0.55 / 0.56 / 0.58 s | 9 758 282 → 9 758 340 B (±58 B) | 4 |
+| edit file **B** (1st touch) | **13.82 s** | 9 748 845 B | **5** |
+| edit file **C** (1st touch) | **14.00 s** | 9 752 509 B | **6** |
+| edit file **D** (1st touch) | **13.75 s** | 9 751 137 B | **7** |
+
+1. **The repack cost is per newly-touched file, not once per archive.** Every first touch of a
+   *different* file pays the full ~14 s big-folder repack and adds one block. Only repeat edits of
+   an already-migrated file are cheap. So the ROADMAP qualification is **"first touch of each
+   file"**, not "first touch only" — in any workflow that edits a spread of files (the normal case)
+   7-Zip keeps paying, and the original project premise largely survives. Block count marching
+   4→5→6→7 is the archive fragmenting toward `-ms=off`, whose ratio §1.3 measures at **2.60× worse**.
+2. **`7z u` silently degrades the archive's compression settings**, which contaminates the size
+   deltas above. Method switches are *not* inherited from the archive: after these updates
+   `7z l -slt` reports 5740 members at `LZMA2:25` (32 MiB dict) and one block at `LZMA2:24k`,
+   where a fresh `-mx9` archive is `LZMA2:28` (256 MiB) throughout. That —  not dead bytes — is the
+   +637 KB one-time jump on the first update. Any `7z u` benchmark must repeat the full `-m` switch
+   set or it is measuring `-mx5`, and the 14–20 s figures here are therefore a *lower* bound on a
+   true `-mx9` repack.
+
+**Revised verdict: 7-Zip trades CPU once per distinct file touched, plus a permanent ratio
+degradation, and silently drops to weaker settings unless you re-specify them; narc trades space
+until `compact`.** narc's edit cost does not depend on which file, or on how many were touched
+before.
 
 narc's own weak spot, measured on the same corpus:
 
@@ -289,6 +361,68 @@ Format consequences that must be settled *now* (same class of mistake as zpaq's 
   multiple dictionaries coexisting in one archive, addressed by id;
 * a dictionary must never be *required* to read a unit that did not use one.
 
+### 3.4 The costs §3.3 omits — verified in the crate source
+
+Three costs, all checkable in `lzma-rust2` 0.19.0, that the bullet list above hides:
+
+1. **Encode pays the dictionary on every unit.** `src/lz/lz_encoder.rs:267` ends `set_preset_dict`
+   with `match_finder.skip(self, copy_size)` — the match finder is driven across the *entire*
+   preset dictionary before the unit's first byte is encoded. At narc's max tier that finder is
+   bt4, so this is dictionary-sized work per unit on top of the unit itself. This is the same
+   objection §3.2 uses to reject PPMd priming. It applies to LZMA2 too — just one-sided, because
+   decode only memcpys the preset into the window (`lz_decoder.rs:20-32`).
+2. **Decode allocates the dictionary per worker, not per archive.** `LzDecoder::new` sets
+   `buf_size = dict_size` and every `Lzma2Reader` owns one; `lzma2_reader_mt.rs:405` hands the
+   preset to each worker independently. At `-j8` a 64 MiB dictionary is a 512 MiB floor.
+3. **The preset is silently truncated to `dict_size`, tail-first** — `copy_size =
+   preset_dict.len().min(dict_size)` on both sides (`lz_encoder.rs:263`, `lz_decoder.rs:26`). A
+   64 MiB dictionary is only *used* if `dict_size >= 64 MiB`.
+
+Point 3 collides head-on with narc's own invariant. `narc-core/src/codec.rs:95` derives the window
+purely from the payload:
+
+```rust
+fn lzma2_dict_size(unpacked_len: usize) -> u32 {
+    u32::try_from(unpacked_len).unwrap_or(LZMA2_DICT_MAX)
+        .clamp(lzma_rust2::DICT_SIZE_MIN, LZMA2_DICT_MAX)   // LZMA2_DICT_MAX = 64 MiB
+}
+```
+
+with the documented rationale that this "keeps the decoder's allocation proportional to the
+caller-supplied length instead of a flat 4 MiB per worker". A preset dictionary forces
+`dict_size = max(unpacked_len, preset_len)` — precisely the flat per-worker floor that function
+exists to avoid, and 4–16× larger than the 4 MiB it already rejected. **§5 calls the chunk-bounded
+extraction invariant "sacred"; §3.3 spends it.** Both cannot stand as written.
+
+So the honest framing: preset dictionaries trade narc's most *verifiable* differentiator — a
+306 KiB archive opens in ~10 MiB where 7-Zip needs 1.5 GiB — for ratio. That may still be the right
+trade, but it is a trade, and the dictionary should be sized as the smallest that closes most of
+the gap, not 16–64 MiB by assertion.
+
+**Nothing in §3.3's gain is measured.** "Gives the *same* cross-file redundancy" as a 256 MiB window
+is an assumption; no preset-dictionary experiment was run. Run one before spending format space:
+build a dictionary from a held-out slice of the source tree, compress at preset sizes 1/4/16/64 MiB,
+and plot ratio against decode RSS and compress time.
+
+### 3.5 zstd and LZMA2 are not the same lever
+
+§3.2 lumps them together; they scale oppositely, and the recommendation inherits the confusion.
+
+* A **zstd** dictionary is entropy tables plus a small content section, and upstream is explicit
+  that it does not scale. [`zdict.h`](https://raw.githubusercontent.com/facebook/zstd/dev/lib/zdict.h):
+  "A reasonable dictionary size, the `dictBufferCapacity`, is about 100KB", the CLI default is
+  110 KB, samples should total ~100× the dictionary, and "we don't expect dictionary compression to
+  be effective past 100KB". The "≈6 MB training memory" figure quoted in §3.2 is
+  `ZDICT_trainFromBuffer` at that ~100 KB scale; it does not describe a 64 MiB dictionary, which by
+  the same 100× rule would want ~6.4 GiB of samples.
+* An **LZMA2** preset dict is raw LZ77 history with no trained structure, so it *can* be large and
+  needs no ZDICT training at all — concatenating representative files in liblzma's recommended
+  order (most probable strings last) is the entire method.
+
+Consequence: the zstd path is a ~100 KB small-file lever; the LZMA2 path is the large-window lever.
+§3.3's "16–64 MiB per-extension **trained** dictionary" is only coherent for LZMA2, and "trained" is
+the wrong word for it.
+
 ---
 
 ## 4. Extraction parallelism — what `-mmt` actually parallelises
@@ -412,11 +546,21 @@ Recommended design for `.narc`:
   "unopenable" and "fully listable"). Optionally protect the chunk log at a user-chosen percent.
 * **Detection separate from correction.** Per-shard CRC32c; RS reconstructs only shards you know
   are bad. This is what PAR2/PAR3 do at format level, and what the Rust crates explicitly require.
-* **Codec:** [`reed-solomon-simd`](https://docs.rs/reed-solomon-simd/) — fork of `reed-solomon-16`
-  (Leopard-RS lineage), GF(2^16), O(n log n), runtime SSSE3/AVX2/Neon selection with a plain-Rust
-  fallback, 1–32768 shards, and since 3.0.0 shard sizes need not be multiples of 64.
+* **Codec:** [`reed-solomon-simd`](https://docs.rs/reed-solomon-simd/) **3.1.0** (2025-10-14),
+  licence **MIT AND BSD-3-Clause** (both apply — compatible with an open-source narc, but the
+  BSD-3 attribution clause must be carried). Fork of Markus Laire's `reed-solomon-16`, itself based
+  on Leopard-RS by Christopher A. Taylor; GF(2^16), O(n log n), runtime SSSE3/AVX2/Neon selection
+  with a plain-Rust fallback, 1–32768 original × 1–32768 recovery shards, and since 3.0.0 shard
+  sizes need not be multiples of 64. Its docs state plainly that it "does not detect or correct
+  errors within a shard" — which is why the per-shard CRC32c above is mandatory, not optional.
 * **Append-only.** Parity as a separate trailing section referenced by the footer keeps the
-  append-only commit protocol intact and lets `compact` regenerate it.
+  append-only commit protocol intact and lets `compact` regenerate it. **Unresolved tension:** every
+  append invalidates the parity that covered the previous chunk log, so parity is either recomputed
+  on each commit (which reintroduces exactly the whole-archive rewrite cost narc exists to avoid) or
+  left stale until `compact`. Stale parity must be *recorded as stale* in the footer, or the format
+  promises protection it does not have. The tiering above makes this tractable — footer+manifest
+  parity is kilobytes and can be rewritten every commit; bulk chunk parity is the part that must be
+  explicitly marked stale.
 
 Rejected: targeting PAR3 compatibility (still the **2022-01-28 ALPHA DRAFT** after four years);
 `reed-solomon-erasure` (repo header literally reads "*Looking for new owners/maintainers*", SIMD
@@ -617,7 +761,7 @@ narc-core), and the huge-pages work shows Pavlov still optimises the hot path.
 | journaling / versions | none | none | **yes**, append-only, rollback | append-only, single version |
 | recovery record | **none** (policy) | **yes**, Reed-Solomon, `rr`=3 % default | **none** | none |
 | quick open / list without scan | `StartHeader` at offset 0 → O(1) | **`QO` service header + locator record** in main header | index blocks per transaction | footer + manifest |
-| max dictionary | 4 GiB (`-md=8g` errors) | format field says up to 4096 MB; WinRAR 7 goes to 64 GB — 7-Zip 24.03 added `-smemx{size}g` and **defaults to a 4 GB limit** for RAR unpacking, prompting above that | n/a (CM/LZ77 per block) | chunk-bounded (16 MiB) |
+| max dictionary | 4 GiB (`-md=8g` errors) | format field says up to 4096 MB; WinRAR 7 goes to 64 GB — 7-Zip 24.03 added `-smemx{size}g` and **defaults to a 4 GB limit** for RAR unpacking, prompting above that | n/a (CM/LZ77 per block) | unit-bounded: dict = unit size, capped 64 MiB (`LZMA2_DICT_MAX`); max-tier CDC chunk ≤16 MiB, solid block 32 MiB (`MAX_CHUNK`) |
 | extraction RAM | **dict + 7.7 MiB** | dict-sized, up to 64 GB | model-sized | **chunk-sized** |
 | file checksum | CRC-32 | CRC-32 or **BLAKE2sp-256**, masked when encrypted headers are off | SHA-1 upstream; **XXH3/BLAKE3** in franz | BLAKE3-128 |
 | KDF / cipher | **no salt**, SHA-256 ×2^19, AES-256-CBC, no MAC | PBKDF2, **16-byte salt**, log-count, 12-byte check value, AES-256, no AEAD | AES-256-**CTR** via `-key` | not implemented |
@@ -670,3 +814,50 @@ All artefacts live in `D:\tmp\7zw\` (scratch, outside the repo):
 `\$` a literal `$`, so the path silently became `D:\tmp\7zw$name.7z`, 7-Zip found no archive, and
 runs "completed" in 0.11 s with a 7 MiB peak. Use forward slashes (`D:/tmp/7zw/...`) or `${name}`.
 Any measurement here showing ~0.1 s and ~7 MiB peak is a failed invocation, not a fast one.
+
+**A second instance of the same trap, in member selection:** `7z e sil-solid.7z xml` matches
+nothing — members are stored as `sil\xml`, and without a wildcard 7-Zip needs the stored path. It
+exits **0** having extracted **0 bytes** in ~45 ms. Always assert extracted byte count, never
+exit code alone.
+
+---
+
+## 14. Verification log (adversarial re-check)
+
+Re-measured independently against the same 7-Zip 26.02 install and surviving artefacts.
+
+**Reproduced, conclusion unchanged:**
+
+| claim | report | re-measured | verdict |
+|---|---|---|---|
+| extract RSS `-md=256m` | 263.7 MiB | **263.8 MiB** | ✅ linear, `dict + 7.7 MiB` |
+| extract RSS `-md=1024m` | 1031.7 MiB | **1031.8 MiB** | ✅ |
+| AES props / zero salt | `53 0f …`, salt bit clear | byte-identical | ✅ |
+| `-sns` / `-sni` on 7z | "Not implemented" | identical | ✅ |
+| codec list (no zstd in container) | 7 codecs + filters | identical (+`AES256CBC`) | ✅ |
+| `-md=4g` ok, `-md=8g` errors | — | identical | ✅ |
+| decode MT across 10 folders | 1.00× | 1468→1459 ms = **1.01×** | ✅ never parallelises |
+| decode MT, `c=16m` one folder | 3.6× | 1465→380 ms = **3.85×** | ✅ |
+| random access, solid folder | 1st 0.19 s / last 1.91 s / all 1.88 s | **0.122 / 1.494 / 1.548 s** | ✅ last ≈ whole |
+| Pavlov 2006 quotes, FR #1359/#1374 | verbatim | verbatim | ✅ |
+| `lzma-rust2` preset-dict line numbers | 5 citations | all exact | ✅ |
+| `ppmd-rust` has no priming API | — | `new(w, order, mem_size)` only | ✅ |
+| `reed-solomon-simd` properties | — | all confirmed; 3.1.0, MIT AND BSD-3 | ✅ |
+
+**Corrected in place:**
+
+* `-mmt=2` was **24 842 978 B**, not 24 834 470 B. The original figure came from a *failed* run
+  (`mt_curve.log`: `secs=0.51 peakMiB=2.8` after `rm: cannot remove … Device or resource busy`) —
+  the failure signature this very section documents. The mechanism now rests on
+  `Lzma2EncProps_Normalize`'s `t2 = t3 / t1n` instead of on the curve.
+* The small-files gap is **36.2 %** (§1.3's own table), not 31 %.
+* §1.4's update model: the repack recurs **per newly touched file** (13.8/14.0/13.8 s for three
+  further files, blocks 4→5→6→7), and `7z u` silently drops `LZMA2:28`→`LZMA2:25`.
+* §12's narc dictionary row (was "chunk-bounded (16 MiB)").
+* §3 gained §3.4/§3.5: the preset-dictionary cost model and the zstd-vs-LZMA2 conflation.
+
+**Could not re-verify:** narc's own extraction timings (§9, §12) — `sil.narc` is unreadable by the
+current build, which is what exposed §0.1. Note that `mem.ps1` (PowerShell `Start-Process`) inflates
+short runs by ~0.3 s versus direct exec: 7z full Silesia extract is **1.548 s** direct vs 1.88 s
+harnessed. Applying that correction makes narc's single-threaded decode deficit ≈**10.7×**, i.e.
+§12 *understates* the problem. Never compare a harnessed number against a shell-timed one.

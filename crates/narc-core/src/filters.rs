@@ -669,3 +669,139 @@ mod tests {
         );
     }
 }
+
+/// Guess the record width of structured binary data.
+///
+/// Tables of fixed-width records — database rows, star catalogues, 16-bit
+/// audio, arrays of floats, vertex buffers — look like noise to an LZ matcher
+/// because no byte sequence repeats, yet consecutive records differ only
+/// slightly *column by column*. Subtracting the value one record back turns
+/// those columns into runs of near-zero bytes, which every codec compresses
+/// well. The width is not declared anywhere, so it has to be inferred.
+///
+/// The estimator compares the order-0 entropy of the differenced stream for
+/// each candidate width against the raw stream and returns the best width, or
+/// `None` when differencing does not clearly help. It reads a sample, not the
+/// whole input: this runs during analysis, before anything is compressed.
+pub fn detect_delta_stride(sample: &[u8]) -> Option<u8> {
+    // Too short to tell signal from noise.
+    if sample.len() < 4096 {
+        return None;
+    }
+    let raw = entropy_bits(sample, 0);
+    let mut best = (raw, 0u8);
+    for d in 1..=MAX_DELTA_DISTANCE {
+        let e = entropy_bits(sample, d as usize);
+        if e < best.0 {
+            best = (e, d);
+        }
+    }
+    // Require a real margin: a 3% entropy drop is worth a filter byte, noise
+    // in the third decimal is not. Whatever this returns is only a proposal —
+    // the packer still stores the chunk raw if compression does not pay.
+    (best.1 > 0 && best.0 < raw * 0.97).then_some(best.1)
+}
+
+/// Order-0 entropy, in bits per byte, of the stream differenced at `distance`
+/// (0 = the raw bytes).
+fn entropy_bits(data: &[u8], distance: usize) -> f64 {
+    let mut hist = [0u32; 256];
+    if distance == 0 {
+        for &b in data {
+            hist[b as usize] += 1;
+        }
+    } else {
+        if data.len() <= distance {
+            return f64::MAX;
+        }
+        for i in distance..data.len() {
+            hist[data[i].wrapping_sub(data[i - distance]) as usize] += 1;
+        }
+    }
+    let total: u32 = hist.iter().sum();
+    if total == 0 {
+        return f64::MAX;
+    }
+    let total = total as f64;
+    -hist
+        .iter()
+        .filter(|&&c| c > 0)
+        .map(|&c| {
+            let p = c as f64 / total;
+            p * p.log2()
+        })
+        .sum::<f64>()
+}
+
+#[cfg(test)]
+mod stride_tests {
+    use super::*;
+
+    #[test]
+    fn finds_the_record_width_of_a_table() {
+        // 12-byte records: a counter, a near-constant, and a slow ramp.
+        let mut data = Vec::new();
+        for i in 0..4000u32 {
+            data.extend_from_slice(&i.to_le_bytes());
+            data.extend_from_slice(&(1_000_000u32 + i % 7).to_le_bytes());
+            data.extend_from_slice(&(i * 3).to_le_bytes());
+        }
+        assert_eq!(detect_delta_stride(&data), Some(12));
+    }
+
+    #[test]
+    fn finds_the_frame_width_of_16_bit_stereo_audio() {
+        // A random walk that actually roams, the way a waveform does: a signal
+        // that stays near zero has low entropy to begin with and needs no
+        // filter, which is a different case (covered by the noise test).
+        let mut data = Vec::new();
+        let (mut l, mut r) = (0i16, 0i16);
+        let mut seed = 0x2545F4914F6CDD1Du64;
+        for _ in 0..20000 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            l = l.wrapping_add((seed >> 40) as i16 / 64);
+            r = r.wrapping_add((seed >> 24) as i16 / 64);
+            data.extend_from_slice(&l.to_le_bytes());
+            data.extend_from_slice(&r.to_le_bytes());
+        }
+        // Four bytes is one stereo frame; two would also reduce entropy, so
+        // accept either as long as the estimator sees the structure.
+        let d = detect_delta_stride(&data).expect("audio frames are structured");
+        assert!(d == 4 || d == 2, "unexpected stride {d}");
+    }
+
+    #[test]
+    fn declines_on_text_and_on_noise() {
+        let text = "the quick brown fox jumps over the lazy dog. ".repeat(200);
+        assert_eq!(detect_delta_stride(text.as_bytes()), None);
+
+        let mut seed = 0x9E3779B97F4A7C15u64;
+        let noise: Vec<u8> = (0..8192)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                (seed >> 33) as u8
+            })
+            .collect();
+        assert_eq!(detect_delta_stride(&noise), None);
+    }
+
+    #[test]
+    fn round_trips_at_the_detected_stride() {
+        let mut data = Vec::new();
+        for i in 0..3000u32 {
+            data.extend_from_slice(&i.to_le_bytes());
+            data.extend_from_slice(&(i / 2).to_le_bytes());
+        }
+        let stride = detect_delta_stride(&data).expect("a table has a width");
+        let f = Filter::delta(stride).unwrap();
+        let mut work = data.clone();
+        f.apply(&mut work);
+        assert_ne!(work, data, "the filter should change something");
+        f.unapply(&mut work);
+        assert_eq!(work, data);
+    }
+}

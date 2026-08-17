@@ -32,6 +32,10 @@ use crate::manifest::{Extent, FileEntry, Geometry};
 use crate::paths;
 use crate::pipeline::Submitter;
 
+/// Below this size a file's content class is guesswork, so it is not allowed
+/// to decide anything: it simply joins whatever unit is open.
+const CLASSIFIABLE: u64 = 4096;
+
 /// Builds units and the file entries that point into them.
 pub(crate) struct Packer {
     tier: Tier,
@@ -47,6 +51,8 @@ pub(crate) struct Packer {
     files: Vec<FileEntry>,
     /// Bytes of the unit being assembled.
     buf: Vec<u8>,
+    /// What kind of data the current unit holds.
+    kind: Option<crate::analyze::Kind>,
     /// Extents waiting for their unit to be flushed: (file index, offset, len).
     pending: Vec<(usize, u64, u64)>,
 }
@@ -67,6 +73,7 @@ impl Packer {
             by_ci,
             files: Vec::new(),
             buf: Vec::new(),
+            kind: None,
             pending: Vec::new(),
         }
     }
@@ -134,11 +141,24 @@ impl Packer {
         // Only trust the verdict on a file large enough for it to mean
         // something: a 300-byte file rarely compresses on its own, but that
         // says nothing about how it compresses next to a thousand siblings.
-        let incompressible = meta.len() >= self.geom.chunked_from
-            && analyze::plan(&head, self.tier).codec == Codec::Store;
+        let plan = analyze::plan(&head, self.tier);
+        let incompressible = meta.len() >= self.geom.chunked_from && plan.codec == Codec::Store;
         let alone = incompressible || meta.len() >= self.geom.unit / 2;
-        if alone {
+
+        // A unit gets ONE codec and ONE filter, so mixing kinds forfeits the
+        // per-file choice the analyzer exists to make: on Silesia, whose files
+        // are 5-51 MiB of wildly different data with no extensions to sort by,
+        // mixing cost 8 MiB. But the verdict is only trusted for files big
+        // enough to classify — judging a 300-byte file by its "kind" and
+        // flushing on it shattered a source tree into 246 units of median
+        // 1.4 KiB, which cost 1.8 MiB.
+        let confident = meta.len() >= CLASSIFIABLE;
+        let mixed = confident && self.kind.is_some_and(|k| k != plan.kind);
+        if alone || mixed {
             self.flush(sub, stats)?;
+        }
+        if confident && self.kind.is_none() {
+            self.kind = Some(plan.kind);
         }
 
         if let Some(data) = whole {
@@ -212,6 +232,7 @@ impl Packer {
             return Ok(());
         }
         let buf = std::mem::take(&mut self.buf);
+        self.kind = None;
         let mut key = [0u8; 16];
         key.copy_from_slice(&blake3::hash(&buf).as_bytes()[..16]);
 
