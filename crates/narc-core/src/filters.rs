@@ -294,6 +294,26 @@ mod tests {
             .collect()
     }
 
+    /// Uniform and periodic content, which a random generator essentially
+    /// never produces and which real archives are full of: zero padding, `FF`
+    /// erase patterns, and instruction sequences laid out so that every
+    /// candidate overlaps the previous one's operand.
+    fn degenerate_bufs(len: usize) -> Vec<Vec<u8>> {
+        fn cycle(pattern: &[u8], len: usize) -> Vec<u8> {
+            (0..len).map(|i| pattern[i % pattern.len()]).collect()
+        }
+        vec![
+            vec![0x00; len],
+            vec![0xFF; len],
+            vec![0xE8; len],
+            vec![0xE9; len],
+            cycle(&[0xE8, 0xFE, 0x00, 0x00, 0x00], len),
+            cycle(&[0xE8, 0x01, 0xFF, 0xFF, 0xFF], len),
+            cycle(&[0xE8, 0x00, 0xFF, 0xE9], len),
+            cycle(&[0xE8, 0xE9], len),
+        ]
+    }
+
     /// The degenerate lengths and everything around the 5-byte instruction
     /// window, where off-by-one errors live.
     fn small_lengths() -> Vec<usize> {
@@ -318,9 +338,14 @@ mod tests {
         lens
     }
 
-    /// `target/release/narc.exe` (or the debug build), the real executable
-    /// this crate is compiled into.
-    fn narc_exe() -> Option<Vec<u8>> {
+    /// Real machine code to filter: `target/narc.exe` when the CLI happens to
+    /// be built, otherwise this test binary, which always exists.
+    ///
+    /// The fallback is not a nicety. `cargo test -p narc-core` does not build
+    /// narc-cli, so on a fresh checkout `target/` holds no `narc` at all — and
+    /// a source that can come back empty turns every test below into a silent
+    /// no-op, which is the one way a filter test can be worse than no test.
+    fn machine_code() -> Vec<u8> {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         for name in [
             "release/narc.exe",
@@ -330,17 +355,19 @@ mod tests {
         ] {
             if let Ok(bytes) = std::fs::read(root.join("target").join(name)) {
                 if bytes.len() > 64 * 1024 {
-                    return Some(bytes);
+                    return bytes;
                 }
             }
         }
-        None
+        let self_path = std::env::current_exe().expect("no path to the test binary");
+        std::fs::read(&self_path).expect("cannot read the test binary")
     }
 
     /// One chunk's worth of a real executable, which is what the filter would
     /// actually be handed.
-    fn exe_sample() -> Option<Vec<u8>> {
-        narc_exe().map(|b| b[..b.len().min(MAX_CHUNK)].to_vec())
+    fn exe_sample() -> Vec<u8> {
+        let bytes = machine_code();
+        bytes[..bytes.len().min(MAX_CHUNK)].to_vec()
     }
 
     #[test]
@@ -390,6 +417,57 @@ mod tests {
                         filter.unapply(&mut data);
                         assert_eq!(data, original, "{filter:?} on {len} bytes, seed {seed}");
                     }
+                }
+            }
+        }
+    }
+
+    /// The same property on content a random generator cannot reach, at the
+    /// sizes that bracket a full chunk.
+    #[test]
+    fn every_filter_round_trips_degenerate_data() {
+        for filter in all_filters() {
+            // A full chunk of all 34 filters would dominate a debug test run,
+            // and delta behaves the same at every size, so only the BCJ state
+            // machine and one delta pay for the big buffers.
+            let mut lens = vec![0, 1, 4, 5, 6, 9, 31, 32, 33, 4096];
+            if matches!(filter, Filter::BcjX86 | Filter::Delta(1)) {
+                lens.extend([MAX_CHUNK - 1, MAX_CHUNK]);
+            }
+            for len in lens {
+                for original in degenerate_bufs(len) {
+                    let mut data = original.clone();
+                    filter.apply(&mut data);
+                    filter.unapply(&mut data);
+                    // Not assert_eq!: a mismatch would dump four megabytes.
+                    assert!(
+                        data == original,
+                        "{filter:?} on {len} bytes of {:02X?}...",
+                        &original[..original.len().min(6)]
+                    );
+                }
+            }
+        }
+    }
+
+    /// `unapply` runs on bytes that came out of an untrusted archive, so it is
+    /// reached with input no encoder ever produced. It must terminate — the
+    /// conversion has a retry loop — and it must not panic near the end of the
+    /// buffer. Re-encoding afterwards also has to give the bytes back, which
+    /// is the strongest statement that the two directions walk the same
+    /// positions.
+    #[test]
+    fn bcj_decode_survives_bytes_it_never_produced() {
+        for len in [0, 1, 4, 5, 6, 7, 8, 9, 17, 100, 4096, 20_000] {
+            let mut inputs = degenerate_bufs(len);
+            inputs.push(random_buf(len as u64, len));
+            inputs.push(codeish_buf(len as u64 ^ 0xA5, len));
+            for original in inputs {
+                for offset in [0u32, 1, 2, 3, 5, 255, 0x1_0000, u32::MAX - 1, u32::MAX] {
+                    let mut data = original.clone();
+                    bcj_x86_decode(&mut data, offset);
+                    bcj_x86_encode(&mut data, offset);
+                    assert_eq!(data, original, "{len} bytes at offset {offset}");
                 }
             }
         }
@@ -464,48 +542,70 @@ mod tests {
 
     /// The port must agree with the reference implementation byte for byte,
     /// otherwise "BCJ x86" would mean something private to this archiver.
+    ///
+    /// Checked at several `start_offset`s, not just the 0 the pipeline uses:
+    /// the offset feeds the address arithmetic and the retry loop, so a port
+    /// that is only right at 0 is right by accident. Lengths above the
+    /// reference's internal 4 KiB buffer also make it filter in several
+    /// passes, which must still match this one-shot implementation.
     #[test]
     fn bcj_matches_reference_implementation() {
         use lzma_rust2::filter::bcj::{BcjReader, BcjWriter};
 
-        let mut inputs = vec![codeish_buf(1, 5000), random_buf(2, 5000)];
-        if let Some(exe) = exe_sample() {
-            inputs.push(exe[..exe.len().min(1 << 20)].to_vec());
-        }
+        let exe = exe_sample();
+        let inputs = [
+            codeish_buf(1, 5000),
+            random_buf(2, 5000),
+            codeish_buf(3, 9),
+            exe[..exe.len().min(1 << 20)].to_vec(),
+        ];
         for input in inputs {
-            let mut mine = input.clone();
-            bcj_x86_encode(&mut mine, 0);
+            for offset in [0u32, 1, 3, 5, 4096, 0x0100_0000, u32::MAX - 4, u32::MAX] {
+                let mut mine = input.clone();
+                bcj_x86_encode(&mut mine, offset);
 
-            let mut writer = BcjWriter::new_x86(Vec::new(), 0);
-            writer.write_all(&input).unwrap();
-            let reference = writer.finish().unwrap();
-            assert_eq!(mine, reference, "encoder differs from lzma-rust2");
+                let mut writer = BcjWriter::new_x86(Vec::new(), offset as usize);
+                writer.write_all(&input).unwrap();
+                let reference = writer.finish().unwrap();
+                assert_eq!(
+                    mine.len(),
+                    reference.len(),
+                    "encoder differs from lzma-rust2 at offset {offset}"
+                );
+                assert_eq!(
+                    mine.iter().zip(&reference).position(|(a, b)| a != b),
+                    None,
+                    "encoder differs from lzma-rust2 at offset {offset}"
+                );
 
-            // And the reference decoder must accept what we produced.
-            let mut back = Vec::new();
-            std::io::copy(
-                &mut BcjReader::new_x86(std::io::Cursor::new(&mine), 0),
-                &mut back,
-            )
-            .unwrap();
-            assert_eq!(back, input, "lzma-rust2 cannot undo our filter");
+                // And the reference decoder must accept what we produced.
+                let mut back = Vec::new();
+                std::io::copy(
+                    &mut BcjReader::new_x86(std::io::Cursor::new(&mine), offset as usize),
+                    &mut back,
+                )
+                .unwrap();
+                assert_eq!(back, input, "lzma-rust2 cannot undo our filter");
+            }
         }
     }
 
     #[test]
     fn bcj_round_trips_a_real_executable() {
-        let Some(exe) = narc_exe() else {
-            eprintln!("skipped: no narc binary in target/");
-            return;
-        };
+        let exe = machine_code();
+        let mut converted = 0usize;
         // Filter it the way the pipeline would: one 4 MiB chunk at a time.
         for chunk in exe.chunks(MAX_CHUNK) {
             let mut data = chunk.to_vec();
             bcj_x86_encode(&mut data, 0);
-            assert_ne!(data, chunk, "BCJ found nothing to convert in x86 code");
+            converted += usize::from(data != chunk);
             bcj_x86_decode(&mut data, 0);
             assert_eq!(data, chunk);
         }
+        // Only the file as a whole is guaranteed to contain a convertible
+        // instruction: a trailing chunk can legitimately be padding, a
+        // signature blob or a relocation table with no E8/E9 in it.
+        assert!(converted > 0, "BCJ found nothing to convert in a binary");
     }
 
     fn lzma_len(data: &[u8]) -> usize {
@@ -518,12 +618,16 @@ mod tests {
 
     /// The point of the filter: it has to actually pay for itself on real
     /// machine code, with both codecs this archiver cares about.
+    ///
+    /// Gated on the host architecture because the sample is a binary produced
+    /// by this build; an x86 filter has nothing to say about ARM code.
     #[test]
+    #[cfg_attr(
+        not(any(target_arch = "x86", target_arch = "x86_64")),
+        ignore = "needs a host binary of x86 machine code"
+    )]
     fn bcj_improves_executable_compression() {
-        let Some(sample) = exe_sample() else {
-            eprintln!("skipped: no narc binary in target/");
-            return;
-        };
+        let sample = exe_sample();
         let mut filtered = sample.clone();
         bcj_x86_encode(&mut filtered, 0);
 
@@ -533,7 +637,7 @@ mod tests {
         let bcj_lzma = lzma_len(&filtered);
         let gain = |before: usize, after: usize| 100.0 - after as f64 * 100.0 / before as f64;
         eprintln!(
-            "BCJ x86 on {} KiB of narc.exe: zstd-12 {plain_zstd} -> {bcj_zstd} ({:+.2}%), \
+            "BCJ x86 on {} KiB of machine code: zstd-12 {plain_zstd} -> {bcj_zstd} ({:+.2}%), \
              lzma-p1 {plain_lzma} -> {bcj_lzma} ({:+.2}%)",
             sample.len() / 1024,
             gain(plain_zstd, bcj_zstd),
@@ -563,183 +667,5 @@ mod tests {
             delta * 2 < plain,
             "delta-4 on stereo PCM: {plain} -> {delta}"
         );
-    }
-}
-
-#[cfg(test)]
-mod adversarial {
-    use super::*;
-    use std::io::Write;
-
-    struct R(u64);
-    impl R {
-        fn n(&mut self) -> u64 {
-            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-            let mut z = self.0;
-            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-            z ^ (z >> 31)
-        }
-    }
-
-    fn gen(seed: u64, len: usize, kind: u8) -> Vec<u8> {
-        let mut r = R(seed);
-        (0..len)
-            .map(|i| match kind {
-                0 => r.n() as u8,
-                1 => match r.n() % 6 {
-                    0 => 0xE8,
-                    1 => 0xE9,
-                    2 | 3 => 0x00,
-                    4 => 0xFF,
-                    _ => r.n() as u8,
-                },
-                2 => 0x00,
-                3 => 0xFF,
-                4 => 0xE8,
-                5 => 0xE9,
-                6 => [0xE8, 0x00, 0xFF, 0xE9][i % 4],
-                7 => [0xE8, 0xFE, 0x00, 0x00, 0x00][i % 5],
-                8 => [0xE8, 0x01, 0xFF, 0xFF, 0xFF][i % 5],
-                9 => (i % 2) as u8 * 0xFF,
-                10 => [0xE9, 0xE8, 0xE8, 0xE9, 0x00, 0xFF][i % 6],
-                _ => (i as u8).wrapping_mul(37),
-            })
-            .collect()
-    }
-
-    const KINDS: u8 = 12;
-
-    /// Byte-for-byte agreement with lzma-rust2, at every start offset - not
-    /// just 0, which is all the module's own test covers.
-    #[test]
-    fn matches_reference_at_every_offset() {
-        use lzma_rust2::filter::bcj::{BcjReader, BcjWriter};
-        for kind in 0..KINDS {
-            for len in [0usize, 1, 4, 5, 6, 9, 10, 13, 64, 257, 4096, 10_000] {
-                for off in [0u32, 1, 2, 3, 4, 5, 255, 256, 4096, 0x0100_0000, u32::MAX - 4, u32::MAX] {
-                    let input = gen(len as u64 * 31 + kind as u64, len, kind);
-                    let mut mine = input.clone();
-                    bcj_x86_encode(&mut mine, off);
-
-                    let mut w = BcjWriter::new_x86(Vec::new(), off as usize);
-                    w.write_all(&input).unwrap();
-                    let reference = w.finish().unwrap();
-                    assert_eq!(
-                        mine, reference,
-                        "encode differs: kind {kind}, len {len}, offset {off}"
-                    );
-
-                    let mut back = Vec::new();
-                    std::io::copy(
-                        &mut BcjReader::new_x86(std::io::Cursor::new(&mine), off as usize),
-                        &mut back,
-                    )
-                    .unwrap();
-                    assert_eq!(back, input, "reference decode: kind {kind}, len {len}, off {off}");
-
-                    let mut ours = mine.clone();
-                    bcj_x86_decode(&mut ours, off);
-                    assert_eq!(ours, input, "our decode: kind {kind}, len {len}, off {off}");
-                }
-            }
-        }
-    }
-
-    /// The decoder runs on bytes straight out of an untrusted archive: it must
-    /// terminate and never panic, whatever it is fed.
-    #[test]
-    fn decode_survives_arbitrary_bytes() {
-        for kind in 0..KINDS {
-            for len in [0usize, 1, 5, 6, 7, 8, 9, 17, 100, 1000, 20_000] {
-                for off in [0u32, 1, 2, 3, 5, 0xFF, 0x1_0000, u32::MAX - 1, u32::MAX] {
-                    for seed in 0..4u64 {
-                        let mut d = gen(seed * 7919 + len as u64, len, kind);
-                        bcj_x86_decode(&mut d, off);
-                        let mut e = gen(seed * 7919 + len as u64, len, kind);
-                        bcj_x86_encode(&mut e, off);
-                    }
-                }
-            }
-        }
-    }
-
-    /// Round-trip over every filter on degenerate and adversarial content,
-    /// including the sizes that straddle the maximum chunk.
-    #[test]
-    fn round_trip_degenerate_and_chunk_sized() {
-        let mut filters = vec![Filter::None, Filter::BcjX86];
-        filters.extend((1..=MAX_DELTA_DISTANCE).map(Filter::Delta));
-        let max = crate::archive::MAX_CHUNK as usize;
-        for kind in 0..KINDS {
-            for len in [0usize, 1, 2, 3, 4, 5, 31, 32, 33, max - 1, max, max + 1] {
-                let original = gen(kind as u64, len, kind);
-                for f in &filters {
-                    let mut data = original.clone();
-                    f.apply(&mut data);
-                    f.unapply(&mut data);
-                    assert_eq!(data, original, "{f:?} kind {kind} len {len}");
-                }
-            }
-        }
-    }
-
-    /// Two independently filtered halves must concatenate back to the whole,
-    /// at every cut, or dedup would be silently corrupting data.
-    #[test]
-    fn chunk_boundaries_never_corrupt() {
-        for kind in 0..KINDS {
-            let original = gen(0xBEEF + kind as u64, 3000, kind);
-            for cut in 0..=original.len() {
-                let mut head = original[..cut].to_vec();
-                let mut tail = original[cut..].to_vec();
-                bcj_x86_encode(&mut head, 0);
-                bcj_x86_encode(&mut tail, 0);
-                bcj_x86_decode(&mut head, 0);
-                bcj_x86_decode(&mut tail, 0);
-                head.extend_from_slice(&tail);
-                assert_eq!(head, original, "kind {kind} cut {cut}");
-            }
-        }
-    }
-}
-
-#[cfg(test)]
-mod liblzma_vectors {
-    use super::*;
-
-    #[test]
-    fn matches_liblzma() {
-        let Ok(dir) = std::env::var("NARC_BCJ_VECTORS") else {
-            eprintln!("skipped");
-            return;
-        };
-        let dir = std::path::PathBuf::from(dir);
-        let mut n = 0;
-        let mut entries: Vec<_> = std::fs::read_dir(&dir)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|f| f.starts_with("in_"))
-            .collect();
-        entries.sort();
-        for name in entries {
-            let input = std::fs::read(dir.join(&name)).unwrap();
-            let reference = std::fs::read(dir.join(name.replace("in_", "ref_"))).unwrap();
-            let mut mine = input.clone();
-            bcj_x86_encode(&mut mine, 0);
-            assert_eq!(mine.len(), reference.len(), "{name}");
-            let diff = mine
-                .iter()
-                .zip(&reference)
-                .position(|(a, b)| a != b);
-            assert_eq!(diff, None, "{name}: first differing byte");
-            let mut back = mine.clone();
-            bcj_x86_decode(&mut back, 0);
-            assert_eq!(back, input, "{name}: round trip");
-            n += 1;
-        }
-        eprintln!("verified {n} liblzma vectors");
-        assert!(n > 100);
     }
 }

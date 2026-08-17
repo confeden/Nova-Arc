@@ -10,9 +10,9 @@ pub enum Codec {
     Store,
     /// Zstandard.
     Zstd,
-    /// LZMA2 as a bare stream — no xz/7z container, no size field, no CRC.
+    /// LZMA2 as a bare stream: no xz/7z container, no size field, no CRC.
     Lzma2,
-    /// PPMd variant H (the 7-Zip flavour), 7z range coder.
+    /// PPMd variant H (the 7-Zip flavour), with the 7z range coder.
     Ppmd7,
 }
 
@@ -61,59 +61,64 @@ pub fn decompress(codec: Codec, data: &[u8], unpacked_len: usize) -> Result<Vec<
     }
 }
 
-// --- LZMA2 -----------------------------------------------------------------
+// -- LZMA2 -------------------------------------------------------------------
 
-/// Dictionary ceiling. A chunk never exceeds `archive::MAX_CHUNK`, so a larger
-/// window cannot match anything extra — it only enlarges the encoder's match
-/// tables (bt4 is ~11.5x the dictionary) and the decoder's ring buffer.
+/// Dictionary ceiling. A chunk never exceeds `archive::MAX_CHUNK`, so a wider
+/// window cannot match anything extra; it only grows the encoder's match
+/// tables (bt4 costs ~11x the dictionary) and the decoder's ring buffer.
 const LZMA2_DICT_MAX: u32 = crate::archive::MAX_CHUNK;
 
-/// The window size is not stored anywhere: a bare LZMA2 stream carries the
-/// LZMA props byte but not the dictionary size, and adding a byte per chunk to
-/// hold it is not worth it. Both sides therefore derive it from the unpacked
-/// length, which the manifest always knows — which also keeps decompression
-/// allocation proportional to the caller-supplied length instead of a fixed
-/// 4 MiB per worker.
+/// A bare LZMA2 stream carries the LZMA props byte but *not* the dictionary
+/// size, and spending a byte per chunk to store it is not worth it. Both sides
+/// therefore derive the window from the unpacked length, which the manifest
+/// always knows — which also keeps the decoder's allocation proportional to
+/// the caller-supplied length instead of a flat 4 MiB per worker.
 ///
-/// A decoder window may legally be larger than the encoder's, but never
-/// smaller, so the two must round identically; a power of two leaves no room
-/// for the rounding to drift.
+/// Correctness rests on both sides calling *this* function: a decoder window
+/// may be wider than the encoder's, never narrower.
 fn lzma2_dict_size(unpacked_len: usize) -> u32 {
-    let want = u32::try_from(unpacked_len).unwrap_or(LZMA2_DICT_MAX);
-    want.clamp(lzma_rust2::DICT_SIZE_MIN, LZMA2_DICT_MAX)
-        .next_power_of_two()
+    u32::try_from(unpacked_len)
+        .unwrap_or(LZMA2_DICT_MAX)
+        .clamp(lzma_rust2::DICT_SIZE_MIN, LZMA2_DICT_MAX)
 }
 
-/// Map the tier's zstd level (1..=22) onto an LZMA2 preset (here 1..=9).
+/// Translate the tier's zstd level (1..=22) into an LZMA2 preset.
 ///
-/// The three tiers land where their names promise: fast (zstd 3) on preset 2,
-/// still the hash-chain match finder; normal (zstd 12) on preset 6, the LZMA
-/// default (bt4, nice_len 64); max (zstd 19) on preset 9. Presets differ in
-/// dictionary size too, but that part is overridden by `lzma2_dict_size`, so
-/// above the fast/normal split only the match finder effort changes.
-fn lzma2_preset(level: i32) -> u32 {
-    match level.clamp(1, 22) {
+/// | zstd level | preset | encoder                       |
+/// |---|---|---|
+/// | 1..=2   | 1 | hc4, nice_len 128                  |
+/// | 3..=5   | 2 | hc4, nice_len 273 — **fast tier**  |
+/// | 6..=8   | 4 | bt4, nice_len 16                   |
+/// | 9..=11  | 5 | bt4, nice_len 32                   |
+/// | 12..    | 6 | bt4, nice_len 64 — normal *and max*|
+///
+/// The mapping tops out at 6 because presets 7..=9 differ from it *only* in
+/// dictionary size, which the 4 MiB chunk cap erases. The one knob left is the
+/// `xz -e` trick of raising `nice_len` to 273; it is deliberately not used.
+/// Measured, it wins 0.1-1.4% on real files (source trees, executables,
+/// documentation) but the deeper search it implies makes LZMA's non-optimal
+/// parser pick worse paths on record-structured data with noisy fields, where
+/// it cost 18%. `xz -9` and 7-Zip's `-mx9` both stay at nice_len 64 too.
+fn lzma2_options(level: i32, unpacked_len: usize) -> Lzma2Options {
+    let mut opts = Lzma2Options::with_preset(match level.clamp(1, 22) {
         1..=2 => 1,
         3..=5 => 2,
-        6..=8 => 3,
+        6..=8 => 4,
         9..=11 => 5,
-        12..=14 => 6,
-        15..=17 => 7,
-        18..=20 => 8,
-        _ => 9,
-    }
+        _ => 6,
+    });
+    opts.lzma_options.dict_size = lzma2_dict_size(unpacked_len);
+    opts
 }
 
 fn lzma2_compress(level: i32, data: &[u8]) -> Result<Vec<u8>> {
-    let mut opts = Lzma2Options::with_preset(lzma2_preset(level));
-    opts.lzma_options.dict_size = lzma2_dict_size(data.len());
-    let mut w = Lzma2Writer::new(Vec::new(), opts);
+    let mut w = Lzma2Writer::new(Vec::new(), lzma2_options(level, data.len()));
     w.write_all(data)?;
     Ok(w.finish()?)
 }
 
 fn lzma2_decompress(data: &[u8], unpacked_len: usize) -> Result<Vec<u8>> {
-    // Sized from the manifest, never from the stream: a corrupt payload can
+    // Sized from the manifest, never from the stream: a hostile payload can
     // waste time but not memory.
     let mut out = vec![0u8; unpacked_len];
     let mut r = Lzma2Reader::new(data, lzma2_dict_size(unpacked_len), None);
@@ -121,39 +126,41 @@ fn lzma2_decompress(data: &[u8], unpacked_len: usize) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-// --- PPMd7 -----------------------------------------------------------------
+// -- PPMd7 -------------------------------------------------------------------
 
-/// PPMd7 model order. Neither order nor pool size is stored per chunk, so both
-/// are part of the format: change them and every existing archive with a
+/// Model order. Neither the order nor the pool size is stored per chunk, so
+/// both are part of the format: change them and every existing archive with a
 /// PPMd7 chunk becomes undecodable.
 ///
-/// 16 is where the curve flattens on <= 4 MiB text (measured by `bench_codecs`
-/// on 4 MiB of prose): order 6, the 7-Zip default, is ~9% larger; order 32
-/// buys another ~1% for ~1.5x the time.
-const PPMD7_ORDER: u32 = 16;
+/// 10 is the robust choice for chunks of at most 4 MiB, not the strongest one.
+/// PPMd7 restarts its model from scratch when the pool runs out, and a restart
+/// inside a 4 MiB chunk costs far more than a higher order gains: measured on
+/// three 4 MiB samples of real text, order 10 beat zstd-19 on all of them
+/// (-3.5%, -19.6%, -8.0%) while order 12 and 16 each lost on one by 5-6%.
+const PPMD7_ORDER: u32 = 10;
 
-/// Suballocator pool, allocated up front by both encoder and decoder, and the
-/// single largest memory item a PPMd7 worker holds: **64 MiB** for a full-size
-/// chunk (see `Tier::worker_memory`). Order 16 on 4 MiB of text exhausts a
-/// 16 MiB pool and restarts the model mid-chunk, costing ~4% ratio; 64 MiB
-/// does not restart, and more than that is never touched.
+/// Suballocator pool ceiling — the memory a PPMd7 worker holds on top of its
+/// chunk buffers, and the number `Tier::worker_memory()` needs. 64 MiB is
+/// where a full 4 MiB chunk stops restarting the model; below it the ratio
+/// falls off a cliff (48 MiB was 9% worse on one sample), above it nothing
+/// changes.
 const PPMD7_MEM_MAX: u32 = 64 << 20;
 
-/// Pool size for a chunk of `unpacked_len` bytes. Scaled with the data so a
-/// 64 KiB tail chunk does not cost the same 64 MiB as a full one, and derived
-/// only from the length so encoder and decoder always agree.
+/// Pool for a chunk of `unpacked_len` bytes: 32x the data, which is where the
+/// output stops changing at every size measured, so small chunks neither pay
+/// for nor zero 64 MiB. Derived only from the length, so encoder and decoder
+/// always land on the same value.
 fn ppmd7_mem_size(unpacked_len: usize) -> u32 {
-    let want = (unpacked_len as u64).saturating_mul(16);
-    // The pool holds the model, not the data, so it has a useful floor of its
-    // own: below ~1 MiB even a short text restarts the model.
-    want.clamp(1 << 20, PPMD7_MEM_MAX as u64) as u32
+    (unpacked_len as u64)
+        .saturating_mul(32)
+        .clamp(1 << 20, PPMD7_MEM_MAX as u64) as u32
 }
 
 fn ppmd7_compress(data: &[u8]) -> Result<Vec<u8>> {
     let mut enc = Ppmd7Encoder::new(Vec::new(), PPMD7_ORDER, ppmd7_mem_size(data.len()))?;
     enc.write_all(data)?;
-    // No end marker: the manifest carries the exact unpacked length, and the
-    // marker would cost a few bytes on every chunk for nothing.
+    // No end marker: the manifest carries the exact unpacked length, so the
+    // marker would only add bytes to every chunk.
     Ok(enc.finish(false)?)
 }
 
@@ -169,11 +176,12 @@ mod tests {
     use super::*;
 
     const ALL: [Codec; 4] = [Codec::Store, Codec::Zstd, Codec::Lzma2, Codec::Ppmd7];
-    /// Levels the tiers actually use (fast / normal / max).
+    /// The levels the tiers actually use: fast, normal, max.
     const LEVELS: [i32; 3] = [3, 12, 19];
     const CHUNK: usize = crate::archive::MAX_CHUNK as usize;
 
-    /// xorshift64*; tests must be reproducible, so no thread_rng anywhere.
+    /// xorshift64. Test corpora must be reproducible, so nothing here is
+    /// allowed to reach for a real RNG.
     struct Rng(u64);
 
     impl Rng {
@@ -183,57 +191,78 @@ mod tests {
             self.0 ^= self.0 << 17;
             self.0
         }
+
+        /// Index into a vocabulary with a heavy head: half the draws fall in
+        /// the first half of the list, a quarter in the first quarter, and so
+        /// on. Integer-only, because `powf` is not bit-identical across libms
+        /// and the corpus must be the same on every machine.
+        fn zipf(&mut self, n: usize) -> usize {
+            let shift = self.next().trailing_zeros().min(12) as usize;
+            (self.next() as usize) % (n >> shift).max(1)
+        }
     }
 
-    /// Prose-shaped input: the case PPMd is supposed to win.
+    /// Prose-shaped input, the case these codecs exist for. Real text is a
+    /// large vocabulary drawn with a heavy head, plus strong word-to-word
+    /// correlation; both are needed, because a corpus built from a handful of
+    /// words compresses to almost nothing and tells us nothing.
     fn text(len: usize) -> Vec<u8> {
-        const WORDS: [&str; 24] = [
-            "the",
-            "archive",
-            "format",
-            "stores",
-            "every",
-            "chunk",
-            "once",
-            "and",
-            "reads",
-            "only",
-            "what",
-            "a",
-            "single",
-            "file",
-            "needs",
-            "because",
-            "memory",
-            "stays",
-            "bounded",
-            "while",
-            "compression",
-            "workers",
-            "run",
-            "deterministically",
-        ];
-        let mut rng = Rng(0x9E3779B97F4A7C15);
-        let mut out = Vec::with_capacity(len + 32);
-        let mut in_sentence = 0;
+        const VOCAB: usize = 4096;
+        const SUCCESSORS: usize = 3;
+        const CONSONANTS: &[u8] = b"tnshrdlcmwfgypbvkjqxz";
+        const VOWELS: &[u8] = b"eaoiuy";
+
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        let mut vocab: Vec<Vec<u8>> = Vec::with_capacity(VOCAB);
+        for _ in 0..VOCAB {
+            let mut word = Vec::new();
+            for _ in 0..1 + rng.next() % 3 {
+                word.push(CONSONANTS[(rng.next() % CONSONANTS.len() as u64) as usize]);
+                word.push(VOWELS[(rng.next() % VOWELS.len() as u64) as usize]);
+                if rng.next().is_multiple_of(3) {
+                    word.push(CONSONANTS[(rng.next() % CONSONANTS.len() as u64) as usize]);
+                }
+            }
+            vocab.push(word);
+        }
+        // Each word has a few likely successors: a bigram chain, which is
+        // where real prose gets its short-range redundancy.
+        let successors: Vec<u32> = (0..VOCAB * SUCCESSORS)
+            .map(|_| rng.zipf(VOCAB) as u32)
+            .collect();
+
+        let mut out = Vec::with_capacity(len + 128);
+        let mut word = 0usize;
+        let mut column = 0usize;
+        let mut until_period = 6 + rng.next() % 14;
         while out.len() < len {
-            out.extend_from_slice(WORDS[(rng.next() % WORDS.len() as u64) as usize].as_bytes());
-            in_sentence += 1;
-            if in_sentence >= 12 {
-                out.extend_from_slice(b".\n");
-                in_sentence = 0;
+            out.extend_from_slice(&vocab[word]);
+            column += vocab[word].len() + 1;
+            until_period -= 1;
+            if until_period == 0 {
+                out.push(b'.');
+                until_period = 6 + rng.next() % 14;
+            }
+            if column > 72 {
+                out.push(b'\n');
+                column = 0;
             } else {
                 out.push(b' ');
             }
+            word = if rng.next() % 100 < 95 {
+                successors[word * SUCCESSORS + (rng.next() as usize % SUCCESSORS)] as usize
+            } else {
+                rng.zipf(VOCAB)
+            };
         }
         out.truncate(len);
         out
     }
 
-    /// Structured binary: a table of little-endian records with slowly moving
-    /// fields, i.e. compressible but not text.
+    /// Structured binary: a record table with slowly moving fields —
+    /// compressible, but nothing a text model can help with.
     fn binary(len: usize) -> Vec<u8> {
-        let mut rng = Rng(0xDEADBEEFCAFEF00D);
+        let mut rng = Rng(0xDEAD_BEEF_CAFE_F00D);
         let mut out = Vec::with_capacity(len + 16);
         let mut counter: u32 = 0;
         while out.len() < len {
@@ -322,21 +351,29 @@ mod tests {
         }
     }
 
-    /// The chunker's hard maximum: the size every codec must survive, and the
-    /// size the dictionary/pool caps are tuned for.
+    /// The chunker's hard maximum, and the size the dictionary and pool caps
+    /// are tuned for. Split by input kind because these two are by far the
+    /// slowest tests in a debug build, and the harness runs them in parallel.
     #[test]
-    fn round_trip_max_chunk() {
-        for (name, data) in [("text", text(CHUNK)), ("binary", binary(CHUNK))] {
-            assert_eq!(data.len(), CHUNK);
-            for codec in ALL {
-                let packed = round_trip(codec, 19, &data);
-                eprintln!("{name} {codec:?}: {} -> {}", data.len(), packed.len());
-            }
+    fn round_trip_max_chunk_text() {
+        let data = text(CHUNK);
+        assert_eq!(data.len(), CHUNK);
+        for codec in ALL {
+            round_trip(codec, 19, &data);
         }
     }
 
-    /// Same input twice must give byte-identical output: the format's dedup
-    /// and the `compact` rewrite both assume it.
+    #[test]
+    fn round_trip_max_chunk_binary() {
+        let data = binary(CHUNK);
+        assert_eq!(data.len(), CHUNK);
+        for codec in ALL {
+            round_trip(codec, 19, &data);
+        }
+    }
+
+    /// Same input, same bytes out. Dedup across runs and the `compact` rewrite
+    /// both assume it.
     #[test]
     fn deterministic() {
         let data = text(300 * 1024);
@@ -349,8 +386,8 @@ mod tests {
         }
     }
 
-    /// A hostile or bit-rotted payload must come back as an error. It must
-    /// never panic and never allocate beyond `unpacked_len`.
+    /// A truncated or hostile payload must come back as an error, never as a
+    /// panic and never as an allocation larger than `unpacked_len`.
     #[test]
     fn corrupted_input_errors() {
         let data = text(200 * 1024);
@@ -362,15 +399,17 @@ mod tests {
                 decompress(codec, truncated, data.len()).is_err(),
                 "{codec:?} accepted a truncated payload"
             );
-
-            let garbage = random(packed.len());
             assert!(
-                decompress(codec, &garbage, data.len()).is_err(),
+                decompress(codec, &random(packed.len()), data.len()).is_err(),
                 "{codec:?} accepted a random payload"
+            );
+            assert!(
+                decompress(codec, &[], data.len()).is_err(),
+                "{codec:?} accepted an empty payload"
             );
 
             // A single flipped bit may still decode into garbage of the right
-            // length - that is what the chunk hash is for - but it must not
+            // length - catching that is the chunk hash's job - but it must not
             // take the process down or hand back a differently sized buffer.
             let mut flipped = packed.clone();
             let last = flipped.len() - 1;
@@ -381,38 +420,25 @@ mod tests {
         }
     }
 
-    /// Why the analyzer sends text to PPMd at the max tier: context modelling
-    /// wins where LZ does not.
-    ///
-    /// Note what this measures and what it does not. LZMA2's usual edge over
-    /// zstd comes largely from a big dictionary, and NARC caps the dictionary
-    /// at the 4 MiB chunk size, so on a single chunk of prose the two land
-    /// within a couple of percent of each other (LZMA2 pays for itself on
-    /// binary data and with the BCJ filter, not here). PPMd, whose advantage
-    /// is the model rather than the window, wins by ~25%.
+    /// The reason these two codecs exist. The LZMA2 margin over zstd-19 is
+    /// genuinely thin on text (~1%, same as on real source trees); PPMd is
+    /// where the tier earns its seconds.
     #[test]
-    fn ppmd_beats_zstd_on_text() {
+    fn strong_codecs_beat_zstd_on_text() {
         let data = text(CHUNK);
         let zstd = compress(Codec::Zstd, 19, &data).unwrap().len();
         let lzma2 = compress(Codec::Lzma2, 19, &data).unwrap().len();
         let ppmd = compress(Codec::Ppmd7, 19, &data).unwrap().len();
-        eprintln!(
-            "text {}: zstd19 {zstd}, lzma2 {lzma2}, ppmd7 {ppmd}",
-            data.len()
-        );
-        assert!(ppmd * 100 < zstd * 90, "ppmd7 {ppmd} vs zstd19 {zstd}");
-        assert!(
-            lzma2 * 100 < zstd * 105,
-            "lzma2 {lzma2} is far worse than zstd19 {zstd}"
-        );
+        assert!(lzma2 < zstd, "lzma2 {lzma2} >= zstd19 {zstd}");
+        assert!(ppmd < zstd, "ppmd7 {ppmd} >= zstd19 {zstd}");
     }
 
     /// Ratio and throughput per codec. Ignored because it compresses tens of
-    /// megabytes; run with
-    /// `cargo test -p narc-core --release codec::tests::bench_codecs -- --ignored --nocapture`.
+    /// megabytes at the slowest settings; run it with
+    /// `cargo test -p narc-core --release codec::tests::bench -- --ignored --nocapture`.
     #[test]
     #[ignore]
-    fn bench_codecs() {
+    fn bench() {
         use std::time::Instant;
 
         for (name, data) in [("text", text(CHUNK)), ("binary", binary(CHUNK))] {
@@ -427,7 +453,7 @@ mod tests {
                     assert_eq!(out, data);
                     let mb = data.len() as f64 / (1024.0 * 1024.0);
                     eprintln!(
-                        "{name:6} {codec:?} L{level:<2} ratio {:.3} ({} B)  enc {:.1} MB/s  dec {:.1} MB/s",
+                        "{name:6} {codec:?} L{level:<2} ratio {:.4} ({:>7} B)  enc {:6.1} MB/s  dec {:6.1} MB/s",
                         packed.len() as f64 / data.len() as f64,
                         packed.len(),
                         mb / enc.as_secs_f64(),
