@@ -302,7 +302,7 @@ fn open_entry(
         let dir = std::env::temp_dir().join(format!("nova-arc-{}", std::process::id()));
         let sub = dir.join(format!("{}", temps.0.lock().expect("temp mutex").len()));
         std::fs::create_dir_all(&sub)?;
-        a.extract(&sub, Some(&[path.clone()]), Overwrite::Force)?;
+        a.extract(&sub, Some(std::slice::from_ref(&path)), Overwrite::Force)?;
         temps.0.lock().expect("temp mutex").push(sub.clone());
         Ok(sub.join(path.replace('/', std::path::MAIN_SEPARATOR_STR)))
     };

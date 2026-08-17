@@ -326,13 +326,9 @@ impl Archive {
         };
 
         let files_total = (big.len() + small.len()) as u64;
-        let bytes_total: u64 = big
-            .iter()
-            .chain(small.iter())
-            .map(|(_, _, len)| *len)
-            .sum();
+        let bytes_total: u64 = big.iter().chain(small.iter()).map(|(_, _, len)| *len).sum();
         let out = pipeline::pack_with(&mut self.file, opts, |sub| {
-            let mut report = |stats: &AddStats| {
+            let report = |stats: &AddStats| {
                 if let Some(cb) = progress {
                     cb(Progress {
                         files_done: stats.files as u64,

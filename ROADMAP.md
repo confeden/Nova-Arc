@@ -4,8 +4,10 @@
 
 - Cargo workspace, Rust 1.95, edition 2021: `narc-core` (format,
   `#![forbid(unsafe_code)]`), `narc-cli` (binary `narc`), `narc-platform`
-  (all OS/unsafe code: priorities, I/O hints, memory status, file lock).
-- Format v0.2 = v0.1 + solid blocks + per-chunk filter byte + LZMA2/PPMd7.
+  (all OS/unsafe code), `narc-gui` (Tauri 2 desktop app). Frontend: `ui/`
+  (TS + Vite, no framework). Node 26, WebView2 present on this machine.
+- Format v0.2 = v0.1 + solid blocks + per-chunk filter/param bytes +
+  LZMA2/PPMd7 + manifest `geometry` (chunk sizes are an archive property).
 - NARC v0 container implemented and VERIFIED: append-only chunk log, FastCDC
   256K/1M/4M, blake3-128 dedup+integrity, MessagePack(named)+zstd manifest,
   80-byte offset-bound footer, generation counter, resumable crash recovery,
@@ -13,11 +15,21 @@
   Spec: `docs/format.md`.
 - Multi-threaded packing pipeline (`pipeline.rs`): reader hashes+dedups,
   worker pool compresses, writer appends in submission order; byte-budget
-  backpressure. Extraction pool exists but defaults to 1 worker (see negative
-  knowledge). CLI: `-j/--threads`, `--memory`, `--eco`, `--full`, and packing
-  prints peak RAM.
+  backpressure. Extraction thread count keys off the archive's codecs (1 for
+  zstd/store, all cores for LZMA2/PPMd since they are CPU-bound to decode).
+  `narc-core` exposes `Progress` callbacks on add/extract for the GUI.
+  CLI: `-j/--threads`, `--memory`, `--eco`, `--full`, packing prints peak RAM.
 - CLI: create/add/extract/list/remove/compact/info (+aliases c/a/x/l/rm),
   extract has `--force` / `--skip-existing` (default: refuse to clobber).
+- GUI (crate narc-gui, VERIFIED running): open/create/add/extract/remove/
+  compact, virtualized file list with type glyphs + solid-block badges,
+  sortable columns, multi-select, right-click menu, double-click opens a file
+  from a temp dir (auto-removed on exit), Explorer drag&drop both ways,
+  streamed+throttled progress, level/memory in toolbar, below-normal priority.
+  Opens an archive passed as argv[1]. Built via Tauri CLI (`cargo build`
+  alone leaves it in dev mode expecting the Vite server - see gotchas).
+- Two desktop shortcuts made: "nArc (dev)" (PowerShell console) and
+  "Nova Arc" (the app exe). Both on D:\Desktop.
 - 52 tests green (`cargo test`), clippy clean. Covers roundtrip,
   append-without-rewrite, dedup, replace, remove+compact, selective extract,
   crash recovery, torn-manifest fallback, embedded-footer confusion, forged
@@ -101,6 +113,15 @@
   offset 0xFFFF_FFFF_FFFF_0000 — a pure mutex range, never real data.
 - `File::try_clone` SHARES the file position on Windows: extraction workers
   must each `File::open` the archive, never clone a handle.
+- GUI: `cargo build -p narc-gui` leaves the app in DEV mode (tauri-build emits
+  cfg(dev)), so the exe expects the Vite server at :5173 and shows
+  ERR_CONNECTION_REFUSED. Build with the Tauri CLI instead:
+  `cd crates/narc-gui && node ../../ui/node_modules/@tauri-apps/cli/tauri.js
+  build --no-bundle`. Prebuild `ui/dist` (npm run build) - the CLI's
+  beforeBuildCommand runs from an unpredictable cwd, so it is set to "".
+- Windows: pass a path with spaces to the exe in QUOTES or Start-Process
+  -ArgumentList splits it and argv[1] is truncated (this fooled a GUI test).
+- .cmd launchers mangle Cyrillic (OEM codepage); use a BOM'd .ps1 instead.
 - zstd already shrinks its window to the source size, so capping WindowLog
   for 4 MiB chunks changes nothing; per-worker memory is match tables.
 - A formatter hook rewrites files after every Write/Edit in this repo.
@@ -127,6 +148,25 @@
   global in-flight-bytes semaphore, single reader + single ordered writer.
 - `--eco` (opt-in): IDLE class + EcoQoS + IoPriorityHintVeryLow.
   `--full`: NORMAL class + EcoQoS off.
+
+## Compression design (measured, v0.6 max tier)
+
+- No single codec wins: PPMd7 beats LZMA2 13-24% on prose/wiki/db-records,
+  LZMA2 beats PPMd7 16% on binaries and 10-20% on source blocks. So MAX runs
+  a per-unit tournament (LZMA2 + PPMd7 orders 10 & 16), keeps the smallest.
+  Fast/normal trust the analyzer's single pick.
+- Chunk size = compression unit = edit granularity. fast/normal 256K/1M/4M;
+  max 1M/4M/16M (FastCDC hard-caps max at 16 MiB). Bigger = better ratio,
+  costlier edits. Solid block target: 4/16/32 MiB by tier.
+- Solid block boundaries are content-defined PER FILE (cut prob = size/target
+  from the file's own blake3), so one file changing size never shifts other
+  boundaries. A size-accumulator rule cost 17 MiB growth for a 1-line edit.
+- Measured vs 7-Zip 26.02: Silesia (202 MiB) narc max 47 MiB / 6.8 s ~=
+  7z -mx9 47 MiB / 49 s. Source tree (114 MiB) narc max 12 MiB / 22 s vs
+  7z -mx9 8.8 MiB / 19 s - 7z still wins on many-small-files (bigger window).
+  narc edit-one-file: 0.4-1 s; 7z u: 14 s. Benchmarks: test/compare-7z.sh,
+  test/dict-experiment.py. Corpora: test/Silesia-compression-corpus/raw,
+  test/enwik8/enwik8 (100 MB), test/corpus (source tree).
 
 ## GPU policy (decided, from research 08)
 
@@ -206,10 +246,16 @@
    unified `narc` UX over foreign formats.
 3. v0.4: GUI skeleton (framework per owner decision), file list + icons +
    thumbnails, drag&drop, temp-open flow with watcher.
-4. v0.5 DONE (filters, solid groups, LZMA2/PPMd). Remaining from it:
-   trained dictionaries per file-type group.
-5. v0.6: recompression pipeline for deflate/JPEG/MP3 (research 02) — the
+4. v0.5 DONE (filters, solid groups, LZMA2/PPMd).
+5. v0.6 DONE (max-tier tournament, big chunks/blocks, geometry pinned).
+   Remaining: trained dictionaries per file-type group; larger LZMA2 dict is
+   the lever for the many-small-files gap vs 7z (needs blocks > 16 MiB, which
+   means not routing them through FastCDC).
+6. GUI DONE (basic). Next GUI: shell icons/thumbnails via IShellItemImageFactory
+   (research 06/07), .narc file association + installer, in-archive folder tree.
+7. v0.7: recompression pipeline for deflate/JPEG/MP3 (research 02) — the
    remaining big ratio win, and the thing 7-Zip/WinRAR cannot do.
+8. zip/7z unpack + zip pack (sevenz-rust2), rar unpack (unrar).
 6. Later: GPU acceleration experiments (nvCOMP/GDeflate, research 08),
    encryption (XChaCha20-Poly1305), Explorer shell integration (research 07),
    installers, Linux/macOS/Android ports.

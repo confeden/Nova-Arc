@@ -4,9 +4,9 @@ A modern archiver for Windows 10/11 (Linux/macOS/Android planned), built in
 Rust around a new archive format — **`.narc`** — designed for *editing*
 archives, not just creating them.
 
-> Status: early development. The `.narc` container v0 and a CLI work today;
-> GUI, zip/7z/rar support and the advanced compression pipeline are in
-> progress. Expect the format to change before v1.0.
+> Status: early development, but usable. The `.narc` format, a CLI and a
+> desktop GUI work today. zip/7z/rar support and recompression of
+> already-compressed data are next. Expect the format to change before v1.0.
 
 ## Why another archiver?
 
@@ -17,19 +17,23 @@ deduplication, a manifest and a crash-safe footer. Replacing one file in a
 46 MiB archive takes ~0.1 s and grows the archive by ~100 KiB; dead space is
 reclaimed by an explicit `compact`.
 
-Planned on top of that:
+Built on top of that:
 
 - **Two-phase compression** — every file is analyzed first, then compressed
   with the method that suits it: PPMd for text, LZMA2 for binaries, a BCJ
   transform for executables, and nothing at all for data that is already
   compressed. Small files are packed into solid blocks so the compressor can
-  exploit what they have in common. Measured on 5751 source files (114 MiB):
-  16 MiB at the max tier, in 2.6 s.
-  Still to come: recompression of already-compressed data (deflate/JPEG/MP3).
-- **Familiar formats** — pack/unpack zip & 7z, unpack rar (creating RAR
-  archives is not legally possible for anyone but RARLAB).
-- **GUI** with file list, icons and previews; "open from archive in
-  Explorer" with automatic temp cleanup and write-back.
+  exploit what they have in common. At the max tier each unit is compressed by
+  several codecs and the smallest result kept. On the Silesia corpus the max
+  tier matches 7-Zip's best ratio (23.2% vs 23.0%) in a fraction of the time.
+- **A desktop GUI** (Tauri 2): a file list with type glyphs and solid-block
+  badges, open a file straight from the archive (extracted to a temp folder
+  that is cleaned up automatically), drag & drop with Explorer both ways,
+  live progress. No framework telemetry.
+- **Familiar formats** (planned) — pack/unpack zip & 7z, unpack rar (creating
+  RAR archives is not legally possible for anyone but RARLAB).
+- **Recompression** (planned) — losslessly repack deflate (zip/docx/apk/png),
+  JPEG and MP3 for gains 7-Zip and WinRAR cannot reach.
 - **Polite resource usage** — packing uses every core at below-normal CPU,
   memory and I/O priority, inside a memory budget that adapts to how loaded
   the machine already is (`--memory 512M`, `--eco`, `-j`). Extraction needs
@@ -54,7 +58,18 @@ target/release/narc compact photos.narc
 - `crates/narc-core` — the NARC format library ([format spec](docs/format.md))
 - `crates/narc-cli` — the `narc` command-line tool
 - `crates/narc-platform` — OS resource policy (priorities, I/O hints, limits)
+- `crates/narc-gui` + `ui/` — the desktop app (Rust core, TypeScript frontend)
 - `docs/research/` — technology research the design decisions are based on
+
+## Build the app
+
+```bash
+cargo build --release                          # the narc CLI
+cd ui && npm install && npm run build && cd ..  # the frontend bundle
+cd crates/narc-gui && node ../../ui/node_modules/@tauri-apps/cli/tauri.js build --no-bundle
+```
+
+The app binary is `target/release/nova-arc.exe`.
 
 ## License
 
