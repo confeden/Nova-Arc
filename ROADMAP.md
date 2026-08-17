@@ -188,6 +188,21 @@
 
 ## Negative knowledge
 
+- Shared/trained dictionaries at creation time — MEASURED NET LOSS at 32 MiB
+  units (7.88% -> 7.60% before charging the dictionary's own storage; research
+  10 measured 100.0-100.8% of the no-dictionary total). A dictionary is a
+  SUBSTITUTE for solidity, not an addition. Only the append path (units created
+  after `create`) is worth revisiting: -21% to -31% there.
+- Alphabet/numeral-system transforms — folklore in front of a modern codec.
+  MEASURED: frequency remapping 0.0%, RLE ~1%, MTF +202% (catastrophic),
+  sparse packing 0.4% for zstd. Only base64-undo is real (-28%).
+- Byte transposition on float data (sao) — +25 to +29%, worse than raw.
+- Applying the record-width filter to data that already compresses — measured
+  worse; the filter is only for data that would otherwise be stored raw.
+- Flushing a unit on every change of content class — shatters a source tree
+  into 246 units (median 1.4 KiB) and costs 1.8 MiB. Only files >= 4 KiB may
+  trigger a class split.
+
 - Creating RAR archives is legally impossible (RARLAB license); only
   extraction via unrar is allowed. Plan pack: zip/7z/narc; unpack adds rar.
 - `PROCESS_MODE_BACKGROUND_BEGIN` — drops I/O and memory priority to Very Low

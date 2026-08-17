@@ -13,15 +13,14 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use anyhow::{bail, Context, Result};
-use fastcdc::v2020::StreamCDC;
 
-use crate::analyze::{self, Tier};
+use crate::analyze::Tier;
 use crate::codec::{self, Codec};
 use crate::footer::{self, Footer, FOOTER_LEN, HEADER_LEN};
 use crate::manifest::{ChunkRec, Extent, FileEntry, Manifest};
@@ -39,9 +38,6 @@ pub(crate) const HEAD_SAMPLE: usize = 64 * 1024;
 /// Upper bound on a stored chunk. Compression can expand incompressible data
 /// slightly, hence the headroom; anything beyond is a corrupt manifest.
 const MAX_STORED_CHUNK: u64 = MAX_CHUNK as u64 * 2;
-
-/// Upper bound on a solid block, for the same reason.
-const MAX_STORED_BLOCK: u64 = MAX_CHUNK as u64 * 2;
 
 /// How many footer candidates to try before declaring an archive corrupt.
 /// Each retry means "this footer's manifest did not verify"; a handful covers
