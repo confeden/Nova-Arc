@@ -5,7 +5,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use narc_core::{Archive, Overwrite, Tier};
+use narc_core::{Archive, Overwrite, PackOptions, Tier};
 
 /// Deterministic pseudo-random (incompressible) bytes.
 fn rnd(len: usize, mut seed: u64) -> Vec<u8> {
@@ -85,7 +85,7 @@ fn walkdir_files(root: &Path) -> Vec<PathBuf> {
 fn roundtrip_create_extract() {
     let fx = fixture();
     let mut a = Archive::create(&fx.arc).unwrap();
-    let s = a.add_paths(std::slice::from_ref(&fx.src), Tier::Normal).unwrap();
+    let s = a.add_paths(std::slice::from_ref(&fx.src), &PackOptions::new(Tier::Normal)).unwrap();
     assert_eq!(s.files, 4);
     drop(a);
 
@@ -105,7 +105,7 @@ fn roundtrip_create_extract() {
 fn update_appends_without_rewriting() {
     let fx = fixture();
     let mut a = Archive::create(&fx.arc).unwrap();
-    a.add_paths(std::slice::from_ref(&fx.src), Tier::Normal).unwrap();
+    a.add_paths(std::slice::from_ref(&fx.src), &PackOptions::new(Tier::Normal)).unwrap();
     drop(a);
 
     let before = fs::read(&fx.arc).unwrap();
@@ -113,7 +113,7 @@ fn update_appends_without_rewriting() {
     // "edit one photo out of 700": add one new file
     fs::write(fx.src.join("new.txt"), text(50_000)).unwrap();
     let mut a = Archive::open_rw(&fx.arc).unwrap();
-    a.add_paths(std::slice::from_ref(&fx.src), Tier::Normal).unwrap();
+    a.add_paths(std::slice::from_ref(&fx.src), &PackOptions::new(Tier::Normal)).unwrap();
     drop(a);
 
     let after = fs::read(&fx.arc).unwrap();
@@ -135,13 +135,13 @@ fn update_appends_without_rewriting() {
 fn replace_reuses_unchanged_chunks() {
     let fx = fixture();
     let mut a = Archive::create(&fx.arc).unwrap();
-    a.add_paths(std::slice::from_ref(&fx.src), Tier::Normal).unwrap();
+    a.add_paths(std::slice::from_ref(&fx.src), &PackOptions::new(Tier::Normal)).unwrap();
     drop(a);
 
     // change one small file, re-add the whole tree
     fs::write(fx.src.join("docs/a.txt"), text(100_000)).unwrap();
     let mut a = Archive::open_rw(&fx.arc).unwrap();
-    let s = a.add_paths(std::slice::from_ref(&fx.src), Tier::Normal).unwrap();
+    let s = a.add_paths(std::slice::from_ref(&fx.src), &PackOptions::new(Tier::Normal)).unwrap();
     // the unchanged 3 MiB pic.bin must be fully deduplicated
     assert!(s.bytes_deduped >= 3 << 20, "dedup: {}", s.bytes_deduped);
     let info = a.info();
@@ -160,7 +160,7 @@ fn dedup_identical_files() {
     let dup = fx.src.join("pic_copy.bin");
     fs::copy(fx.src.join("pic.bin"), &dup).unwrap();
     let mut a = Archive::create(&fx.arc).unwrap();
-    let s = a.add_paths(std::slice::from_ref(&fx.src), Tier::Fast).unwrap();
+    let s = a.add_paths(std::slice::from_ref(&fx.src), &PackOptions::new(Tier::Fast)).unwrap();
     assert!(s.bytes_deduped >= 3 << 20, "identical file should dedup");
     let info = a.info();
     assert!(
@@ -174,7 +174,7 @@ fn dedup_identical_files() {
 fn remove_then_compact() {
     let fx = fixture();
     let mut a = Archive::create(&fx.arc).unwrap();
-    a.add_paths(std::slice::from_ref(&fx.src), Tier::Normal).unwrap();
+    a.add_paths(std::slice::from_ref(&fx.src), &PackOptions::new(Tier::Normal)).unwrap();
 
     let n = a.remove(&["src/pic.bin".to_string()]).unwrap();
     assert_eq!(n, 1);
@@ -196,7 +196,7 @@ fn remove_then_compact() {
 fn selective_extract() {
     let fx = fixture();
     let mut a = Archive::create(&fx.arc).unwrap();
-    a.add_paths(std::slice::from_ref(&fx.src), Tier::Fast).unwrap();
+    a.add_paths(std::slice::from_ref(&fx.src), &PackOptions::new(Tier::Fast)).unwrap();
     let out = fx.root.join("out");
     let xs = a
         .extract(&out, Some(&["src/docs".to_string()]), Overwrite::Fail)
@@ -210,7 +210,7 @@ fn selective_extract() {
 fn crash_recovery_ignores_trailing_garbage() {
     let fx = fixture();
     let mut a = Archive::create(&fx.arc).unwrap();
-    a.add_paths(std::slice::from_ref(&fx.src), Tier::Fast).unwrap();
+    a.add_paths(std::slice::from_ref(&fx.src), &PackOptions::new(Tier::Fast)).unwrap();
     drop(a);
     let committed = fs::read(&fx.arc).unwrap();
 
@@ -227,7 +227,7 @@ fn crash_recovery_ignores_trailing_garbage() {
     // read-write open truncates the garbage and can keep appending
     let mut a = Archive::open_rw(&fx.arc).unwrap();
     fs::write(fx.src.join("more.txt"), text(1000)).unwrap();
-    a.add_paths(std::slice::from_ref(&fx.src), Tier::Fast).unwrap();
+    a.add_paths(std::slice::from_ref(&fx.src), &PackOptions::new(Tier::Fast)).unwrap();
     drop(a);
 
     let now = fs::read(&fx.arc).unwrap();
@@ -277,7 +277,7 @@ fn footer_fields(path: &Path) -> (u64, u64) {
 fn extract_refuses_to_clobber_by_default() {
     let fx = fixture();
     let mut a = Archive::create(&fx.arc).unwrap();
-    a.add_paths(std::slice::from_ref(&fx.src), Tier::Fast).unwrap();
+    a.add_paths(std::slice::from_ref(&fx.src), &PackOptions::new(Tier::Fast)).unwrap();
     drop(a);
 
     let out = fx.root.join("out");
@@ -307,13 +307,13 @@ fn extract_refuses_to_clobber_by_default() {
 fn torn_manifest_falls_back_to_previous_generation() {
     let fx = fixture();
     let mut a = Archive::create(&fx.arc).unwrap();
-    a.add_paths(std::slice::from_ref(&fx.src), Tier::Fast).unwrap();
+    a.add_paths(std::slice::from_ref(&fx.src), &PackOptions::new(Tier::Fast)).unwrap();
     drop(a);
     let files_before = Archive::open_ro(&fx.arc).unwrap().manifest.files.len();
 
     fs::write(fx.src.join("second.txt"), text(30_000)).unwrap();
     let mut a = Archive::open_rw(&fx.arc).unwrap();
-    a.add_paths(std::slice::from_ref(&fx.src), Tier::Fast).unwrap();
+    a.add_paths(std::slice::from_ref(&fx.src), &PackOptions::new(Tier::Fast)).unwrap();
     drop(a);
 
     // Corrupt the newest manifest, keeping its (valid) footer: exactly what a
@@ -339,16 +339,16 @@ fn embedded_footer_in_stored_data_is_not_mistaken_for_commit() {
     // an inner archive whose bytes (including its own footer) get stored raw
     let inner = fx.root.join("inner.narc");
     let mut b = Archive::create(&inner).unwrap();
-    b.add_paths(&[fx.src.join("pic.bin")], Tier::Fast).unwrap();
+    b.add_paths(&[fx.src.join("pic.bin")], &PackOptions::new(Tier::Fast)).unwrap();
     drop(b);
 
     let mut a = Archive::create(&fx.arc).unwrap();
-    a.add_paths(&[fx.src.join("docs")], Tier::Fast).unwrap();
+    a.add_paths(&[fx.src.join("docs")], &PackOptions::new(Tier::Fast)).unwrap();
     drop(a);
     let files_before = Archive::open_ro(&fx.arc).unwrap().manifest.files.len();
 
     let mut a = Archive::open_rw(&fx.arc).unwrap();
-    a.add_paths(std::slice::from_ref(&inner), Tier::Fast).unwrap();
+    a.add_paths(std::slice::from_ref(&inner), &PackOptions::new(Tier::Fast)).unwrap();
     drop(a);
 
     // Simulate a crash after the chunks were appended but before the commit:
@@ -368,7 +368,7 @@ fn embedded_footer_in_stored_data_is_not_mistaken_for_commit() {
 fn rejects_forged_footer_claiming_huge_manifest() {
     let fx = fixture();
     let mut a = Archive::create(&fx.arc).unwrap();
-    a.add_paths(&[fx.src.join("docs")], Tier::Fast).unwrap();
+    a.add_paths(&[fx.src.join("docs")], &PackOptions::new(Tier::Fast)).unwrap();
     drop(a);
 
     let mut b = fs::read(&fx.arc).unwrap();
@@ -396,7 +396,7 @@ fn rejects_forged_footer_claiming_huge_manifest() {
 fn second_writer_is_locked_out() {
     let fx = fixture();
     let mut a = Archive::create(&fx.arc).unwrap();
-    a.add_paths(&[fx.src.join("docs")], Tier::Fast).unwrap();
+    a.add_paths(&[fx.src.join("docs")], &PackOptions::new(Tier::Fast)).unwrap();
     assert!(
         Archive::open_rw(&fx.arc).is_err(),
         "a second writer must not be able to append at a stale EOF"
@@ -409,7 +409,7 @@ fn second_writer_is_locked_out() {
 fn selectors_accept_windows_separators_and_report_misses() {
     let fx = fixture();
     let mut a = Archive::create(&fx.arc).unwrap();
-    a.add_paths(std::slice::from_ref(&fx.src), Tier::Fast).unwrap();
+    a.add_paths(std::slice::from_ref(&fx.src), &PackOptions::new(Tier::Fast)).unwrap();
     let out = fx.root.join("out");
 
     let s = a
@@ -439,7 +439,7 @@ fn add_rejects_paths_extract_would_refuse() {
             "add must reject {bad:?} because extract does"
         );
     }
-    let s = a.add_paths(std::slice::from_ref(&fx.src), Tier::Fast).unwrap();
+    let s = a.add_paths(std::slice::from_ref(&fx.src), &PackOptions::new(Tier::Fast)).unwrap();
     assert_eq!(s.files, 4);
 }
 
@@ -451,7 +451,7 @@ fn preserves_pre_1970_timestamps() {
     filetime::set_file_mtime(&old, t).unwrap();
 
     let mut a = Archive::create(&fx.arc).unwrap();
-    a.add_paths(std::slice::from_ref(&fx.src), Tier::Fast).unwrap();
+    a.add_paths(std::slice::from_ref(&fx.src), &PackOptions::new(Tier::Fast)).unwrap();
     let entry = a
         .manifest
         .files
@@ -472,7 +472,7 @@ fn preserves_pre_1970_timestamps() {
 fn compact_detects_corrupted_chunk_instead_of_copying_it() {
     let fx = fixture();
     let mut a = Archive::create(&fx.arc).unwrap();
-    a.add_paths(&[fx.src.join("docs")], Tier::Fast).unwrap();
+    a.add_paths(&[fx.src.join("docs")], &PackOptions::new(Tier::Fast)).unwrap();
     let first = a.manifest.chunks[0].clone();
     drop(a);
 

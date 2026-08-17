@@ -2,30 +2,56 @@
 
 ## Current state
 
-- Cargo workspace: `crates/narc-core` (format library, `#![forbid(unsafe_code)]`)
-  + `crates/narc-cli` (binary `narc`). Rust 1.95, edition 2021.
+- Cargo workspace, Rust 1.95, edition 2021: `narc-core` (format,
+  `#![forbid(unsafe_code)]`), `narc-cli` (binary `narc`), `narc-platform`
+  (all OS/unsafe code: priorities, I/O hints, memory status, file lock).
 - NARC v0 container implemented and VERIFIED: append-only chunk log, FastCDC
   256K/1M/4M, blake3-128 dedup+integrity, MessagePack(named)+zstd manifest,
-  80-byte self-checked footer at EOF, generation counter, backward-scan crash
-  recovery, rw-open truncates uncommitted tail, offline `compact` with atomic
-  swap (rename dance, .bak fallback). Spec: `docs/format.md`.
-- CLI: create/add/extract/list/remove/compact/info (+aliases c/a/x/l/rm).
-  Process runs at BELOW_NORMAL priority on Windows (narc-cli/src/main.rs).
-- 11 tests green (`cargo test`): roundtrip, append-without-rewrite, dedup,
-  replace, remove+compact, selective extract, crash recovery, hostile-file
-  rejects, no-clobber create. Cyrillic paths + selective extract verified
-  manually. Real-data smoke: 46 MiB tree → edit 1 file → re-save 0.14 s,
-  +98 KiB growth; 20 MB duplicate deduped.
-- `test/` dir = local playground (gitignored), sample data + RU readme.
-- GUI, zip/7z/rar support, multithreading, GPU: not started.
+  80-byte offset-bound footer, generation counter, resumable crash recovery,
+  rw-open truncates uncommitted tail, `compact` with verify + atomic replace.
+  Spec: `docs/format.md`.
+- Multi-threaded packing pipeline (`pipeline.rs`): reader hashes+dedups,
+  worker pool compresses, writer appends in submission order; byte-budget
+  backpressure. Extraction pool exists but defaults to 1 worker (see negative
+  knowledge). CLI: `-j/--threads`, `--memory`, `--eco`, `--full`, and packing
+  prints peak RAM.
+- CLI: create/add/extract/list/remove/compact/info (+aliases c/a/x/l/rm),
+  extract has `--force` / `--skip-existing` (default: refuse to clobber).
+- 22 tests green (`cargo test`), clippy clean. Covers roundtrip,
+  append-without-rewrite, dedup, replace, remove+compact, selective extract,
+  crash recovery, torn-manifest fallback, embedded-footer confusion, forged
+  footer, writer lock, selector normalization, pre-1970 mtime, overwrite
+  policy, compact-detects-corruption.
+- Measured (8 logical cores, this machine, `bash test/bench.sh`):
+  · 106 MiB / 4 big files: normal 1.8 s (‑j1: 5.5 s → 2.9× scaling), max 6.0 s
+  · 114 MiB / 5751 small files: fast 6.5 s, normal 6.7 s, max 8.0 s
+    (reader-bound: small files never reach the worker pool; solid grouping
+    is the fix, planned in v0.5)
+  · peak RAM tracks `--memory`: 128M→~100 MiB, 256M→~196 MiB, default→~340 MiB
+  · extraction 113 MiB in ~1-2 s at ~10 MiB peak RAM
+  · 46 MiB tree, edit 1 file → re-save 0.14 s, archive grows ~98 KiB
+- `test/` = local playground (gitignored): corpus, bench.sh, RU readme.
+- GUI, zip/7z/rar support, GPU: not started.
 - Research reports live in `docs/research/01..09-*.md`.
 
 ## Architecture & invariants
 
-- Archive layout: `[header][chunks…][manifest gN][footer gN]` repeated per
-  update; committed bytes are NEVER rewritten except by `compact`.
-- Commit point = footer fsynced at EOF. Readers: footer at EOF−80, else
-  backward scan for last self-valid footer. Update durability is all-or-nothing.
+- Archive layout: `[header][manifest g1][footer g1]` from `create`, then
+  `[chunks…][manifest gN][footer gN]` per update; committed bytes are NEVER
+  rewritten except by `compact`.
+- Commit = manifest write → fsync → footer write → fsync (the barrier is
+  required: without it a valid footer can point at a torn manifest).
+- Footer self-hash covers its own absolute offset, so a `.narc` stored inside
+  another archive cannot be mistaken for a commit. Readers verify the
+  manifest of each footer candidate and resume the backward scan on failure
+  (≤64 candidates).
+- Packing invariant: the writer appends chunks in submission order, so the
+  reader predicts each chunk index as `base + submission index` and builds
+  file entries without waiting for compression.
+- Memory model: `budget ≈ 32 MiB base + workers × (zstd tables + 8 MiB) +
+  queued chunks`; workers are capped by the budget, then in-flight bytes are
+  capped by the workers. zstd table cost measured per tier in
+  `Tier::worker_memory()` (fast 4, normal 40, max 56 MiB).
 - Chunk hash = blake3(uncompressed)[..16]; serves dedup AND extract integrity.
   Dead (unreferenced) chunk records stay in manifest as dedup sources until compact.
 - Codec ids: 0=store, 1=zstd. Per-chunk raw fallback if compression doesn't pay.
@@ -42,7 +68,15 @@
 
 - `tempfile` must be a REGULAR dep of narc-core (compact uses it), not dev-dep.
 - Windows: cannot rename over an open file — compact consumes `self`, closes
-  handle, then rename-to-.bak + persist + rollback on error.
+  the handle, then `NamedTempFile::persist` (atomic replace, no .bak window).
+- Windows file locks are MANDATORY per byte range: a whole-file
+  `File::try_lock` makes our OWN extraction threads fail with ERROR_LOCK_
+  VIOLATION (33). Hence `narc_platform::try_lock_exclusive` locks one byte at
+  offset 0xFFFF_FFFF_FFFF_0000 — a pure mutex range, never real data.
+- `File::try_clone` SHARES the file position on Windows: extraction workers
+  must each `File::open` the archive, never clone a handle.
+- zstd already shrinks its window to the source size, so capping WindowLog
+  for 4 MiB chunks changes nothing; per-worker memory is match tables.
 - A formatter hook rewrites files after every Write/Edit in this repo.
 - zstd/blake3 crates build C via MSVC — fine here, but keep pure-Rust
   fallbacks in mind for exotic targets.
@@ -93,6 +127,11 @@
 - libzstd internal MT (`ZSTD_c_nbWorkers`) — breaks memory estimation and
   duplicates our chunk parallelism. zstd `--long`/window ≥128 MiB — pointless
   under 4 MiB CDC chunks and breaks bounded extraction.
+- Parallel EXTRACTION with zstd — measured slower, not faster: 5751 small
+  files take 1.0 s on 1 thread, 1.2 s on 4, 2.5 s on 8 (NTFS directory
+  metadata contention + seeks); big files show no gain either (~660 MB/s = 
+  I/O speed). Default extract workers = 1; revisit when slow-decoding codecs
+  (LZMA/PPMd) land. `-j` still honoured.
 - GPU for blake3/dedup — slower than CPU SIMD, PCIe erases gains.
 - GPU high-ratio compression (LZMA-class) — does not exist in 2026; GPU codecs
   land near zstd-1..3 ratios. Blackwell HW decompression engine is
@@ -120,10 +159,11 @@
 - GUI framework decision pending owner confirmation (research report 06).
 - Not preserved yet: empty dirs, symlinks, NTFS attrs/ADS, ACLs.
 - Manifest fully in RAM (fine ≤ ~1 TB archives); paged index only if needed.
-- `narc extract` overwrites existing files silently — decide policy.
 - Long-path (>260 chars) handling on Windows untested.
-- Multithreaded compression pipeline (rayon, bounded queue backpressure) not
-  yet implemented; single-threaded today.
+- Many-small-files packing is reader-bound (single reader thread): needs
+  parallel file reading and/or solid grouping.
+- `--eco`/`--full`/EcoQoS paths are built but not measured under load; the
+  "no lag" claim is unverified (research 09 §10 has the methodology).
 
 ## Plans
 

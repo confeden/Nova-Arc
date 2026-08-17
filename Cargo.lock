@@ -176,6 +176,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "crossbeam-channel"
+version = "0.5.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d85363c37faeca707aef026efa9f3b34d077bce547e48f770770625c6013679e"
+dependencies = [
+ "crossbeam-utils",
+]
+
+[[package]]
+name = "crossbeam-utils"
+version = "0.8.22"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "61803da095bee82a81bb1a452ecc25d3b2f1416d1897eb86430c6159ef717c17"
+
+[[package]]
 name = "errno"
 version = "0.3.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -265,7 +280,7 @@ dependencies = [
  "anyhow",
  "clap",
  "narc-core",
- "windows-sys 0.60.2",
+ "narc-platform",
 ]
 
 [[package]]
@@ -274,13 +289,22 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "blake3",
+ "crossbeam-channel",
  "fastcdc",
  "filetime",
+ "narc-platform",
  "rmp-serde",
  "serde",
  "tempfile",
  "walkdir",
  "zstd",
+]
+
+[[package]]
+name = "narc-platform"
+version = "0.1.0"
+dependencies = [
+ "windows-sys 0.60.2",
 ]
 
 [[package]]

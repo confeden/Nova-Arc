@@ -18,7 +18,9 @@ pub mod codec;
 pub mod footer;
 pub mod manifest;
 pub mod paths;
+pub mod pipeline;
 
 pub use analyze::Tier;
 pub use archive::{AddStats, Archive, ExtractStats, InfoStats, Overwrite};
 pub use codec::Codec;
+pub use pipeline::PackOptions;

@@ -15,6 +15,8 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 use anyhow::{bail, Context, Result};
 use fastcdc::v2020::StreamCDC;
@@ -24,6 +26,7 @@ use crate::codec::{self, Codec};
 use crate::footer::{self, Footer, FOOTER_LEN, HEADER_LEN};
 use crate::manifest::{ChunkRec, FileEntry, Manifest};
 use crate::paths;
+use crate::pipeline::{self, PackOptions};
 
 pub const MIN_CHUNK: u32 = 256 * 1024;
 pub const AVG_CHUNK: u32 = 1024 * 1024;
@@ -190,18 +193,83 @@ impl Archive {
 
     /// Add files or directory trees. Entries with the same archive path are
     /// replaced. Unchanged content costs nothing thanks to chunk dedup.
-    pub fn add_paths(&mut self, inputs: &[PathBuf], tier: Tier) -> Result<AddStats> {
+    ///
+    /// Chunking and hashing happen here; compression runs on a worker pool
+    /// and writing on a dedicated thread, all inside a fixed memory budget
+    /// (see [`crate::pipeline`]).
+    pub fn add_paths(&mut self, inputs: &[PathBuf], opts: &PackOptions) -> Result<AddStats> {
         if !self.writable {
             bail!("archive opened read-only");
         }
         let mut stats = AddStats::default();
-        let mut dedup: HashMap<[u8; 16], u32> = self
-            .manifest
-            .chunks
-            .iter()
-            .enumerate()
-            .map(|(i, c)| (c.hash, i as u32))
-            .collect();
+        let mut ctx = AddCtx {
+            base: u32::try_from(self.manifest.chunks.len())
+                .context("archive chunk count exceeds format limit")?,
+            dedup: self
+                .manifest
+                .chunks
+                .iter()
+                .enumerate()
+                .map(|(i, c)| (c.hash, i as u32))
+                .collect(),
+            by_ci: self
+                .manifest
+                .files
+                .iter()
+                .map(|f| (paths::collision_key(&f.path), f.path.clone()))
+                .collect(),
+            files: Vec::new(),
+        };
+
+        let out = pipeline::pack_with(&mut self.file, opts, |sub| {
+            for input in inputs {
+                let meta = fs::symlink_metadata(input)
+                    .with_context(|| format!("cannot access {}", input.display()))?;
+                if meta.file_type().is_symlink() {
+                    stats.symlinks_skipped += 1;
+                    continue;
+                }
+                if meta.is_file() {
+                    let rel = match input.file_name() {
+                        Some(n) => paths::normalize_rel(Path::new(n))?,
+                        None => bail!("cannot determine archive name for {}", input.display()),
+                    };
+                    ctx.add_file(sub, input, rel, &mut stats)?;
+                } else {
+                    let root_name = input.file_name().map(|n| n.to_owned());
+                    for entry in walkdir::WalkDir::new(input)
+                        .sort_by_file_name()
+                        .follow_links(false)
+                    {
+                        let entry = entry?;
+                        if entry.file_type().is_symlink() {
+                            stats.symlinks_skipped += 1;
+                            continue;
+                        }
+                        if !entry.file_type().is_file() {
+                            continue;
+                        }
+                        let inner = entry
+                            .path()
+                            .strip_prefix(input)
+                            .expect("walkdir yields children of its root");
+                        let mut relp = PathBuf::new();
+                        if let Some(ref n) = root_name {
+                            relp.push(n);
+                        }
+                        relp.push(inner);
+                        let rel = paths::normalize_rel(&relp)?;
+                        ctx.add_file(sub, entry.path(), rel, &mut stats)?;
+                    }
+                }
+            }
+            Ok(())
+        })?;
+
+        // The writer emitted chunks in submission order, so the indices the
+        // reader predicted (base + submission index) are now correct.
+        stats.bytes_stored = out.bytes_stored;
+        self.manifest.chunks.extend(out.chunks);
         let mut by_path: HashMap<String, usize> = self
             .manifest
             .files
@@ -209,68 +277,12 @@ impl Archive {
             .enumerate()
             .map(|(i, f)| (f.path.clone(), i))
             .collect();
-        let mut by_ci: HashMap<String, String> = self
-            .manifest
-            .files
-            .iter()
-            .map(|f| (paths::collision_key(&f.path), f.path.clone()))
-            .collect();
-        let level = tier.zstd_level();
-
-        for input in inputs {
-            let meta = fs::symlink_metadata(input)
-                .with_context(|| format!("cannot access {}", input.display()))?;
-            if meta.file_type().is_symlink() {
-                stats.symlinks_skipped += 1;
-                continue;
-            }
-            if meta.is_file() {
-                let rel = match input.file_name() {
-                    Some(n) => paths::normalize_rel(Path::new(n))?,
-                    None => bail!("cannot determine archive name for {}", input.display()),
-                };
-                self.add_one(
-                    input,
-                    rel,
-                    level,
-                    &mut dedup,
-                    &mut by_path,
-                    &mut by_ci,
-                    &mut stats,
-                )?;
-            } else {
-                let root_name = input.file_name().map(|n| n.to_owned());
-                for entry in walkdir::WalkDir::new(input)
-                    .sort_by_file_name()
-                    .follow_links(false)
-                {
-                    let entry = entry?;
-                    if entry.file_type().is_symlink() {
-                        stats.symlinks_skipped += 1;
-                        continue;
-                    }
-                    if !entry.file_type().is_file() {
-                        continue;
-                    }
-                    let inner = entry
-                        .path()
-                        .strip_prefix(input)
-                        .expect("walkdir yields children of its root");
-                    let mut relp = PathBuf::new();
-                    if let Some(ref n) = root_name {
-                        relp.push(n);
-                    }
-                    relp.push(inner);
-                    let rel = paths::normalize_rel(&relp)?;
-                    self.add_one(
-                        entry.path(),
-                        rel,
-                        level,
-                        &mut dedup,
-                        &mut by_path,
-                        &mut by_ci,
-                        &mut stats,
-                    )?;
+        for entry in ctx.files {
+            match by_path.get(&entry.path) {
+                Some(&i) => self.manifest.files[i] = entry,
+                None => {
+                    by_path.insert(entry.path.clone(), self.manifest.files.len());
+                    self.manifest.files.push(entry);
                 }
             }
         }
@@ -278,119 +290,29 @@ impl Archive {
         Ok(stats)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn add_one(
-        &mut self,
-        disk: &Path,
-        rel: String,
-        level: i32,
-        dedup: &mut HashMap<[u8; 16], u32>,
-        by_path: &mut HashMap<String, usize>,
-        by_ci: &mut HashMap<String, String>,
-        stats: &mut AddStats,
-    ) -> Result<()> {
-        let meta = fs::metadata(disk)?;
-        let mtime = match meta.modified() {
-            Ok(t) => match t.duration_since(std::time::UNIX_EPOCH) {
-                Ok(d) => d.as_secs() as i64,
-                // Pre-1970 timestamps are representable and worth keeping.
-                Err(e) => -(e.duration().as_secs() as i64),
-            },
-            Err(_) => 0,
-        };
-
-        let mut chunk_ids: Vec<u32> = Vec::new();
-        let mut actual_size = 0u64;
-        if meta.len() > 0 {
-            let mut f =
-                File::open(disk).with_context(|| format!("cannot read {}", disk.display()))?;
-            // Phase 1: analysis — sample the head, pick the storage method.
-            let head_len = HEAD_SAMPLE.min(meta.len() as usize);
-            let mut head = Vec::with_capacity(head_len);
-            (&mut f).take(head_len as u64).read_to_end(&mut head)?;
-            let file_codec = pick_codec(&head);
-            // Phase 2: chunk + compress, streaming; memory stays bounded by
-            // MAX_CHUNK regardless of file size.
-            let reader = std::io::Cursor::new(head).chain(BufReader::new(f));
-            for result in StreamCDC::new(reader, MIN_CHUNK, AVG_CHUNK, MAX_CHUNK) {
-                let chunk = result.with_context(|| format!("reading {}", disk.display()))?;
-                let data = chunk.data;
-                let unpacked_len = data.len() as u64;
-                stats.bytes_in += unpacked_len;
-                actual_size += unpacked_len;
-                let mut key = [0u8; 16];
-                key.copy_from_slice(&blake3::hash(&data).as_bytes()[..16]);
-                if let Some(&idx) = dedup.get(&key) {
-                    stats.bytes_deduped += unpacked_len;
-                    chunk_ids.push(idx);
-                    continue;
-                }
-                let (codec_used, payload) = match file_codec {
-                    Codec::Store => (Codec::Store, data),
-                    Codec::Zstd => {
-                        let c = codec::compress(Codec::Zstd, level, &data)?;
-                        if c.len() >= data.len() {
-                            (Codec::Store, data)
-                        } else {
-                            (Codec::Zstd, c)
-                        }
-                    }
-                };
-                let offset = self.file.seek(SeekFrom::End(0))?;
-                self.file.write_all(&payload)?;
-                let idx = u32::try_from(self.manifest.chunks.len())
-                    .context("archive chunk count exceeds format limit")?;
-                self.manifest.chunks.push(ChunkRec {
-                    offset,
-                    packed: payload.len() as u64,
-                    unpacked: unpacked_len,
-                    codec: codec_used.id(),
-                    hash: key,
-                });
-                stats.bytes_stored += payload.len() as u64;
-                dedup.insert(key, idx);
-                chunk_ids.push(idx);
-            }
-        }
-
-        let entry = FileEntry {
-            path: rel.clone(),
-            size: actual_size,
-            mtime,
-            chunks: chunk_ids,
-        };
-        match by_path.get(&rel) {
-            Some(&i) => self.manifest.files[i] = entry,
-            None => {
-                // Two entries differing only in case cannot both be extracted
-                // on Windows/macOS - warn while the user can still react.
-                let ck = paths::collision_key(&rel);
-                if let Some(other) = by_ci.get(&ck) {
-                    if other != &rel {
-                        stats.warnings.push(format!(
-                            "{rel:?} differs only in letter case from {other:?}; \
-                             they cannot both be extracted on Windows"
-                        ));
-                    }
-                } else {
-                    by_ci.insert(ck, rel.clone());
-                }
-                by_path.insert(rel, self.manifest.files.len());
-                self.manifest.files.push(entry);
-            }
-        }
-        stats.files += 1;
-        Ok(())
-    }
-
     /// Extract everything, or only entries matching the given archive paths
     /// (exact file path or directory prefix). Selectors are normalized, and
     /// a selector matching nothing is an error rather than a silent no-op.
+    ///
+    /// Files are independent, so extraction runs on a worker pool; each
+    /// worker opens its own read handle and holds at most one chunk, keeping
+    /// extraction memory in the low tens of MB no matter how big the archive
+    /// is. `opts` only supplies the thread and memory limits here.
     pub fn extract(
         &self,
         dest: &Path,
         select: Option<&[String]>,
         overwrite: Overwrite,
+    ) -> Result<ExtractStats> {
+        self.extract_with(dest, select, overwrite, &PackOptions::new(Tier::Normal))
+    }
+
+    pub fn extract_with(
+        &self,
+        dest: &Path,
+        select: Option<&[String]>,
+        overwrite: Overwrite,
+        opts: &PackOptions,
     ) -> Result<ExtractStats> {
         let mut stats = ExtractStats::default();
         let selectors: Option<Vec<String>> = select.map(|s| {
@@ -400,9 +322,11 @@ impl Archive {
         });
         let mut used = vec![false; selectors.as_ref().map_or(0, |s| s.len())];
         let file_len = self.file.metadata()?.len();
-        let mut seen: HashSet<String> = HashSet::new();
-        let mut reader = &self.file;
 
+        // Selection, path safety and collision checks run once, in order, so
+        // the warnings a user sees do not depend on thread scheduling.
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut work: Vec<(&FileEntry, PathBuf)> = Vec::new();
         for entry in &self.manifest.files {
             if let Some(sel) = &selectors {
                 let mut hit = false;
@@ -431,57 +355,7 @@ impl Archive {
                 ));
                 continue;
             }
-            let target = dest.join(&safe);
-            if let Some(parent) = target.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            let mut out = match OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&target)
-            {
-                Ok(f) => f,
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => match overwrite {
-                    Overwrite::Fail => bail!(
-                        "{} already exists - use --force to overwrite or --skip-existing",
-                        target.display()
-                    ),
-                    Overwrite::Skip => {
-                        stats.skipped_existing += 1;
-                        continue;
-                    }
-                    Overwrite::Force => File::create(&target)
-                        .with_context(|| format!("cannot write {}", target.display()))?,
-                },
-                Err(e) => {
-                    return Err(e).with_context(|| format!("cannot write {}", target.display()))
-                }
-            };
-            let mut written = 0u64;
-            for &idx in &entry.chunks {
-                let rec = self
-                    .manifest
-                    .chunks
-                    .get(idx as usize)
-                    .context("corrupt manifest: chunk index out of range")?;
-                let packed = read_packed(&mut reader, rec, file_len)?;
-                let data =
-                    verify_chunk(rec, &packed).with_context(|| format!("in {}", entry.path))?;
-                out.write_all(&data)?;
-                written += data.len() as u64;
-            }
-            if written != entry.size {
-                bail!("size mismatch extracting {}", entry.path);
-            }
-            drop(out);
-            if entry.mtime != 0 {
-                let _ = filetime::set_file_mtime(
-                    &target,
-                    filetime::FileTime::from_unix_time(entry.mtime, 0),
-                );
-            }
-            stats.files += 1;
-            stats.bytes += written;
+            work.push((entry, dest.join(&safe)));
         }
 
         if let Some(sel) = &selectors {
@@ -495,6 +369,85 @@ impl Archive {
                 bail!("not found in archive: {}", missing.join(", "));
             }
         }
+
+        // Fail fast, before writing anything: a refused extraction should not
+        // leave half a tree behind.
+        if overwrite == Overwrite::Fail {
+            if let Some((_, target)) = work.iter().find(|(_, t)| t.exists()) {
+                bail!(
+                    "{} already exists - use --force to overwrite or --skip-existing",
+                    target.display()
+                );
+            }
+        }
+
+        let workers = opts.extract_workers().min(work.len().max(1));
+        let counters = Mutex::new((0usize, 0u64, 0usize)); // files, bytes, skipped
+        let failure: Mutex<Option<anyhow::Error>> = Mutex::new(None);
+        let stop = AtomicBool::new(false);
+        let next = AtomicUsize::new(0);
+
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                scope.spawn(|| {
+                    // A private handle per worker: cloned handles share a file
+                    // position on Windows, which would corrupt concurrent reads.
+                    let mut reader = match File::open(&self.path) {
+                        Ok(f) => f,
+                        Err(e) => {
+                            *failure.lock().expect("mutex") = Some(anyhow::Error::new(e));
+                            stop.store(true, Ordering::Relaxed);
+                            return;
+                        }
+                    };
+                    narc_platform::lower_io_priority(&reader);
+                    let mut local = (0usize, 0u64, 0usize);
+                    loop {
+                        if stop.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        let Some((entry, target)) = work.get(i) else {
+                            break;
+                        };
+                        match extract_one(
+                            &mut reader,
+                            &self.manifest,
+                            entry,
+                            target,
+                            overwrite,
+                            file_len,
+                        ) {
+                            Ok(Some(bytes)) => {
+                                local.0 += 1;
+                                local.1 += bytes;
+                            }
+                            Ok(None) => local.2 += 1,
+                            Err(e) => {
+                                stop.store(true, Ordering::Relaxed);
+                                let mut slot = failure.lock().expect("mutex");
+                                if slot.is_none() {
+                                    *slot = Some(e);
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    let mut c = counters.lock().expect("mutex");
+                    c.0 += local.0;
+                    c.1 += local.1;
+                    c.2 += local.2;
+                });
+            }
+        });
+
+        if let Some(e) = failure.into_inner().expect("mutex") {
+            return Err(e);
+        }
+        let c = counters.into_inner().expect("mutex");
+        stats.files = c.0;
+        stats.bytes = c.1;
+        stats.skipped_existing = c.2;
         Ok(stats)
     }
 
@@ -638,18 +591,158 @@ impl Archive {
     }
 }
 
+/// Write one entry to `target`. Returns the number of bytes written, or
+/// `None` when an existing file was kept per the overwrite policy.
+fn extract_one(
+    reader: &mut File,
+    manifest: &Manifest,
+    entry: &FileEntry,
+    target: &Path,
+    overwrite: Overwrite,
+    file_len: u64,
+) -> Result<Option<u64>> {
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut out = match OpenOptions::new().write(true).create_new(true).open(target) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => match overwrite {
+            Overwrite::Fail => bail!(
+                "{} already exists - use --force to overwrite or --skip-existing",
+                target.display()
+            ),
+            Overwrite::Skip => return Ok(None),
+            Overwrite::Force => File::create(target)
+                .with_context(|| format!("cannot write {}", target.display()))?,
+        },
+        Err(e) => return Err(e).with_context(|| format!("cannot write {}", target.display())),
+    };
+    narc_platform::lower_io_priority(&out);
+
+    let mut written = 0u64;
+    for &idx in &entry.chunks {
+        let rec = manifest
+            .chunks
+            .get(idx as usize)
+            .context("corrupt manifest: chunk index out of range")?;
+        let packed = read_packed(&mut &*reader, rec, file_len)?;
+        let data = verify_chunk(rec, &packed).with_context(|| format!("in {}", entry.path))?;
+        out.write_all(&data)?;
+        written += data.len() as u64;
+    }
+    if written != entry.size {
+        bail!("size mismatch extracting {}", entry.path);
+    }
+    drop(out);
+    if entry.mtime != 0 {
+        let _ =
+            filetime::set_file_mtime(target, filetime::FileTime::from_unix_time(entry.mtime, 0));
+    }
+    Ok(Some(written))
+}
+
+/// Reader-side state for one `add_paths` run: dedup index, collision
+/// detection, and the file entries being built. Chunk indices are predicted
+/// as `base + submission index`, which is exact because the pipeline's writer
+/// appends chunks in submission order.
+struct AddCtx {
+    base: u32,
+    dedup: HashMap<[u8; 16], u32>,
+    by_ci: HashMap<String, String>,
+    files: Vec<FileEntry>,
+}
+
+impl AddCtx {
+    fn add_file(
+        &mut self,
+        sub: &mut pipeline::Submitter,
+        disk: &Path,
+        rel: String,
+        stats: &mut AddStats,
+    ) -> Result<()> {
+        let meta = fs::metadata(disk)?;
+        let mtime = match meta.modified() {
+            Ok(t) => match t.duration_since(std::time::UNIX_EPOCH) {
+                Ok(d) => d.as_secs() as i64,
+                // Pre-1970 timestamps are representable and worth keeping.
+                Err(e) => -(e.duration().as_secs() as i64),
+            },
+            Err(_) => 0,
+        };
+
+        let mut chunk_ids: Vec<u32> = Vec::new();
+        let mut actual_size = 0u64;
+        if meta.len() > 0 {
+            let mut f =
+                File::open(disk).with_context(|| format!("cannot read {}", disk.display()))?;
+            narc_platform::lower_io_priority(&f);
+            // Phase 1: analysis — sample the head, pick the storage method.
+            let head_len = HEAD_SAMPLE.min(meta.len() as usize);
+            let mut head = Vec::with_capacity(head_len);
+            (&mut f).take(head_len as u64).read_to_end(&mut head)?;
+            let file_codec = pick_codec(&head);
+            // Phase 2: chunk, hash, dedup, then hand unique chunks to the
+            // compression pipeline. Memory stays bounded by the pipeline's
+            // budget regardless of file size.
+            let reader = std::io::Cursor::new(head).chain(BufReader::new(f));
+            for result in StreamCDC::new(reader, MIN_CHUNK, AVG_CHUNK, MAX_CHUNK) {
+                let chunk = result.with_context(|| format!("reading {}", disk.display()))?;
+                let data = chunk.data;
+                let unpacked_len = data.len() as u64;
+                stats.bytes_in += unpacked_len;
+                actual_size += unpacked_len;
+                let mut key = [0u8; 16];
+                key.copy_from_slice(&blake3::hash(&data).as_bytes()[..16]);
+                if let Some(&idx) = self.dedup.get(&key) {
+                    stats.bytes_deduped += unpacked_len;
+                    chunk_ids.push(idx);
+                    continue;
+                }
+                let local = sub.submit(data, key, file_codec)?;
+                let idx = self
+                    .base
+                    .checked_add(local)
+                    .context("archive chunk count exceeds format limit")?;
+                self.dedup.insert(key, idx);
+                chunk_ids.push(idx);
+            }
+        }
+
+        let entry = FileEntry {
+            path: rel.clone(),
+            size: actual_size,
+            mtime,
+            chunks: chunk_ids,
+        };
+        // Two entries differing only in case cannot both be extracted on
+        // Windows/macOS - warn while the user can still react.
+        let ck = paths::collision_key(&rel);
+        match self.by_ci.get(&ck) {
+            Some(other) if other != &rel => stats.warnings.push(format!(
+                "{rel:?} differs only in letter case from {other:?}; \
+                 they cannot both be extracted on Windows"
+            )),
+            Some(_) => {}
+            None => {
+                self.by_ci.insert(ck, rel);
+            }
+        }
+        self.files.push(entry);
+        stats.files += 1;
+        Ok(())
+    }
+}
+
 /// Take an exclusive advisory lock so two writers cannot append at the same
 /// stale EOF and corrupt each other's chunks.
 fn lock_exclusive(file: &File, path: &Path) -> Result<()> {
-    match file.try_lock() {
-        Ok(()) => Ok(()),
-        Err(fs::TryLockError::WouldBlock) => bail!(
+    match narc_platform::try_lock_exclusive(file) {
+        Ok(true) => Ok(()),
+        Ok(false) => bail!(
             "{} is already open for writing by another process",
             path.display()
         ),
-        Err(fs::TryLockError::Error(e)) => {
-            Err(e).with_context(|| format!("cannot lock {}", path.display()))
-        }
+        Err(e) => Err(e).with_context(|| format!("cannot lock {}", path.display())),
     }
 }
 

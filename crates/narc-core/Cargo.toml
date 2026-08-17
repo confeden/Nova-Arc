@@ -6,8 +6,10 @@ repository.workspace = true
 description = "Core library for the NARC archive format (Nova Arc)"
 
 [dependencies]
+narc-platform = { path = "../narc-platform" }
 anyhow.workspace = true
 blake3.workspace = true
+crossbeam-channel.workspace = true
 fastcdc.workspace = true
 filetime.workspace = true
 rmp-serde.workspace = true

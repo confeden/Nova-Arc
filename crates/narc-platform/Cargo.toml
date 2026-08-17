@@ -1,0 +1,16 @@
+[package]
+name = "narc-platform"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+description = "OS resource policy for Nova Arc: priorities, I/O hints, memory budget"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_System_SystemInformation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_ProcessStatus",
+    "Win32_System_IO",
+] }

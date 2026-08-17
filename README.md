@@ -25,9 +25,11 @@ Planned on top of that:
 - **Familiar formats** — pack/unpack zip & 7z, unpack rar.
 - **GUI** with file list, icons and previews; "open from archive in
   Explorer" with automatic temp cleanup and write-back.
-- **Polite resource usage** — all cores, but at below-normal priority;
-  bounded memory (weak PCs must at least extract); GPU acceleration is being
-  researched (nvCOMP/CUDA).
+- **Polite resource usage** — packing uses every core at below-normal CPU,
+  memory and I/O priority, inside a memory budget that adapts to how loaded
+  the machine already is (`--memory 512M`, `--eco`, `-j`). Extraction needs
+  ~10 MiB of RAM regardless of archive size, so weak PCs can always unpack.
+  GPU acceleration is being researched (nvCOMP/CUDA).
 - **No telemetry, no ads, no analytics. Ever.**
 
 ## Try it
@@ -37,7 +39,7 @@ cargo build --release
 target/release/narc create photos.narc D:/Photos
 target/release/narc list photos.narc
 target/release/narc add photos.narc D:/Photos      # re-save: only changes are written
-target/release/narc extract photos.narc -o out
+target/release/narc extract photos.narc -o out   # refuses to overwrite; --force / --skip-existing
 target/release/narc info photos.narc               # shows reclaimable dead space
 target/release/narc compact photos.narc
 ```
@@ -46,6 +48,7 @@ target/release/narc compact photos.narc
 
 - `crates/narc-core` — the NARC format library ([format spec](docs/format.md))
 - `crates/narc-cli` — the `narc` command-line tool
+- `crates/narc-platform` — OS resource policy (priorities, I/O hints, limits)
 - `docs/research/` — technology research the design decisions are based on
 
 ## License

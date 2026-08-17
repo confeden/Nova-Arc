@@ -3,7 +3,8 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
-use narc_core::{AddStats, Archive, Overwrite, Tier};
+use narc_core::{AddStats, Archive, Overwrite, PackOptions, Tier};
+use narc_platform::PriorityMode;
 
 #[derive(Parser)]
 #[command(
@@ -14,6 +15,38 @@ use narc_core::{AddStats, Archive, Overwrite, Tier};
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
+
+    /// Worker threads for packing (default: all logical cores). Extraction
+    /// is I/O bound and stays single-threaded unless this is set.
+    #[arg(short = 'j', long, global = true)]
+    threads: Option<usize>,
+
+    /// Memory budget, e.g. 512M or 2G (default: adapts to free RAM)
+    #[arg(long, global = true, value_parser = parse_size)]
+    memory: Option<u64>,
+
+    /// Idle priority and EcoQoS: slowest, gentlest on laptops
+    #[arg(long, global = true, conflicts_with = "full")]
+    eco: bool,
+
+    /// Normal priority, no throttling: benchmarks and idle machines
+    #[arg(long, global = true)]
+    full: bool,
+}
+
+/// Parse a size with an optional K/M/G suffix.
+fn parse_size(s: &str) -> Result<u64, String> {
+    let t = s.trim();
+    let (num, mult) = match t.chars().last() {
+        Some('k') | Some('K') => (&t[..t.len() - 1], 1024),
+        Some('m') | Some('M') => (&t[..t.len() - 1], 1024 * 1024),
+        Some('g') | Some('G') => (&t[..t.len() - 1], 1024 * 1024 * 1024),
+        _ => (t, 1),
+    };
+    num.trim()
+        .parse::<u64>()
+        .map(|v| v * mult)
+        .map_err(|_| format!("invalid size {s:?} (try 512M or 2G)"))
 }
 
 #[derive(ValueEnum, Clone, Copy)]
@@ -83,20 +116,6 @@ enum Cmd {
     Info { archive: PathBuf },
 }
 
-/// Run below normal priority so heavy (de)compression never makes the
-/// system laggy. Applies to the whole process and all worker threads.
-fn lower_process_priority() {
-    #[cfg(windows)]
-    {
-        use windows_sys::Win32::System::Threading::{
-            GetCurrentProcess, SetPriorityClass, BELOW_NORMAL_PRIORITY_CLASS,
-        };
-        unsafe {
-            SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS);
-        }
-    }
-}
-
 fn human(n: u64) -> String {
     const U: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
     let mut v = n as f64;
@@ -109,6 +128,14 @@ fn human(n: u64) -> String {
         format!("{n} B")
     } else {
         format!("{v:.1} {}", U[i])
+    }
+}
+
+/// Peak working set, so users (and benchmarks) can see that packing really
+/// stays inside its memory budget.
+fn report_peak() {
+    if let Some(p) = narc_platform::peak_memory() {
+        println!("Peak RAM: {}", human(p));
     }
 }
 
@@ -130,6 +157,7 @@ fn report_add(s: &AddStats, t: Instant) {
     if s.symlinks_skipped > 0 {
         println!("Skipped {} symlink(s)", s.symlinks_skipped);
     }
+    report_peak();
     for w in &s.warnings {
         eprintln!("warning: {w}");
     }
@@ -137,7 +165,19 @@ fn report_add(s: &AddStats, t: Instant) {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    lower_process_priority();
+    // All cores, but out of the user's way: below-normal CPU and memory
+    // priority, low-priority bulk I/O, and a memory budget that adapts to
+    // how loaded the machine already is.
+    narc_platform::apply_process_policy(match (cli.eco, cli.full) {
+        (true, _) => PriorityMode::Eco,
+        (_, true) => PriorityMode::Full,
+        _ => PriorityMode::Background,
+    });
+    let pack = |level: Level| PackOptions {
+        tier: level.into(),
+        threads: cli.threads.unwrap_or(0),
+        memory_budget: cli.memory.unwrap_or(0),
+    };
     match cli.cmd {
         Cmd::Create {
             archive,
@@ -146,7 +186,7 @@ fn main() -> Result<()> {
         } => {
             let t = Instant::now();
             let mut a = Archive::create(&archive)?;
-            let s = a.add_paths(&inputs, level.into())?;
+            let s = a.add_paths(&inputs, &pack(level))?;
             report_add(&s, t);
         }
         Cmd::Add {
@@ -156,7 +196,7 @@ fn main() -> Result<()> {
         } => {
             let t = Instant::now();
             let mut a = Archive::open_rw(&archive)?;
-            let s = a.add_paths(&inputs, level.into())?;
+            let s = a.add_paths(&inputs, &pack(level))?;
             report_add(&s, t);
         }
         Cmd::Extract {
@@ -178,7 +218,7 @@ fn main() -> Result<()> {
                 (_, true) => Overwrite::Skip,
                 _ => Overwrite::Fail,
             };
-            let s = a.extract(&output, sel, policy)?;
+            let s = a.extract_with(&output, sel, policy, &pack(Level::Normal))?;
             println!(
                 "Extracted {} file(s), {} in {:.1}s",
                 s.files,
@@ -188,6 +228,7 @@ fn main() -> Result<()> {
             if s.skipped_existing > 0 {
                 println!("Kept {} existing file(s)", s.skipped_existing);
             }
+            report_peak();
             for w in &s.warnings {
                 eprintln!("warning: {w}");
             }

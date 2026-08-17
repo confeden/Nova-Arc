@@ -20,6 +20,18 @@ impl Tier {
             Tier::Max => 19,
         }
     }
+
+    /// Memory one compression worker holds on top of its chunk buffers,
+    /// dominated by the zstd match tables. Measured on 4 MiB chunks (see
+    /// test/bench.sh): ~2 MiB at level 3, ~37 MiB at 12, ~50 MiB at 19.
+    /// Used to decide how many workers fit in the memory budget.
+    pub fn worker_memory(self) -> u64 {
+        match self {
+            Tier::Fast => 4 * 1024 * 1024,
+            Tier::Normal => 40 * 1024 * 1024,
+            Tier::Max => 56 * 1024 * 1024,
+        }
+    }
 }
 
 const TRIAL_SAMPLE: usize = 64 * 1024;
