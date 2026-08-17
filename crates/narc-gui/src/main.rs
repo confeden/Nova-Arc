@@ -345,6 +345,20 @@ fn remove_entries(app: AppHandle, archive: String, paths: Vec<String>) {
 /// Archive path passed on the command line, if any.
 struct StartupArchive(Option<String>);
 
+/// Pick the archive out of the command line.
+///
+/// A single quoted path is the normal case, but callers routinely forget the
+/// quotes and a path like `D:\Nova Arc\a.narc` then arrives as two arguments,
+/// so the whole tail is tried as one path before giving up.
+fn archive_from_args(args: Vec<String>) -> Option<String> {
+    let is_archive = |s: &str| s.to_lowercase().ends_with(".narc") && Path::new(s).is_file();
+    if let Some(hit) = args.iter().find(|a| is_archive(a)) {
+        return Some(hit.clone());
+    }
+    let joined = args.join(" ");
+    is_archive(&joined).then_some(joined)
+}
+
 #[tauri::command]
 fn startup_archive(startup: State<'_, StartupArchive>) -> Option<String> {
     startup.0.clone()
@@ -373,9 +387,7 @@ fn main() {
     // association) opens that archive on startup. The frontend pulls it once
     // it is ready, rather than us pushing an event that could arrive before
     // its listeners exist.
-    let open_arg = std::env::args()
-        .nth(1)
-        .filter(|a| a.to_lowercase().ends_with(".narc"));
+    let open_arg = archive_from_args(std::env::args().skip(1).collect());
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())

@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
@@ -33,10 +33,40 @@ type OpProgress = {
 
 type OpResult = { op: string; ok: boolean; message: string; details: string[] };
 
+/** Outside the app (plain browser, `npm run dev`) there is no Rust side, so
+ *  the UI runs on sample data. That makes layout work a page reload instead of
+ *  a full rebuild, and keeps the real code path untouched. */
+const IN_APP = "__TAURI_INTERNALS__" in window;
+
+const DEMO: ArchiveInfo = {
+  path: "D:/demo/пример.narc",
+  generation: 3,
+  files: 4,
+  chunks: 7,
+  file_len: 2_411_235,
+  live_bytes: 2_400_000,
+  reclaimable: 4_200_000,
+  total_size: 21_233_664,
+  entries: [
+    { path: "проект/src/main.rs", size: 18_233, stored: 3_120, mtime: 1_755_400_000, solid: true },
+    { path: "проект/очень/длинный/путь/который/должен/обрезаться/а/не/ломать/таблицу/файл.txt", size: 2_048, stored: 512, mtime: 1_755_300_000, solid: true },
+    { path: "фото/DSC_0001.jpg", size: 6_200_000, stored: 6_190_000, mtime: 1_700_000_000, solid: false },
+    { path: "bin/tool.exe", size: 15_013_383, stored: 2_400_000, mtime: 0, solid: false },
+  ],
+};
+
+async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
+  if (IN_APP) return tauriInvoke<T>(cmd, args);
+  if (cmd === "machine_info") return { cores: 8, memory_total: null, budget: 5 << 30 } as T;
+  if (cmd === "open_archive" || cmd === "startup_archive") return DEMO as T;
+  return null as T;
+}
+
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 
 const el = {
   rows: $<HTMLTableSectionElement>("rows"),
+  filter: $<HTMLInputElement>("filter"),
   empty: $<HTMLDivElement>("empty"),
   summary: $<HTMLElement>("summary"),
   status: $<HTMLSpanElement>("status"),
@@ -52,6 +82,7 @@ const el = {
 const state = {
   archive: "" as string,
   entries: [] as Entry[],
+  filter: "",
   selected: new Set<string>(),
   sortKey: "path" as keyof Entry,
   sortAsc: true,
@@ -77,19 +108,36 @@ function when(unix: number): string {
   return `${p(d.getDate())}.${p(d.getMonth() + 1)}.${d.getFullYear()} ${p(d.getHours())}:${p(d.getMinutes())}`;
 }
 
-/** A file-type glyph. Deliberately text: shell icons come later, and an
- *  archiver that stalls its list waiting for icon extraction is worse than
- *  one that shows the list instantly. */
-function glyph(path: string): string {
+/** File-type icons as inline SVG rather than emoji: emoji depend on the
+ *  system emoji font, render at inconsistent sizes and pick up colour
+ *  fringing at 14 px, while these are crisp and follow the theme colour. */
+const ICONS: Record<string, string> = {
+  image: "M3 4h14v12H3zM3 13l4-4 3 3 3-4 4 5",
+  audio: "M8 14V5l7-2v9M8 14a2 2 0 1 1-3 1.7A2 2 0 0 1 8 14m7-2a2 2 0 1 1-3 1.7A2 2 0 0 1 15 12",
+  video: "M3 5h11v10H3zM14 8l4-2v8l-4-2",
+  archive: "M4 3h12v14H4zM10 3v5M8 8h4M9 11h2v3H9z",
+  exe: "M10 3l6 3v5c0 3-2.6 5-6 6-3.4-1-6-3-6-6V6zM7 10l2 2 4-4",
+  doc: "M5 2h7l4 4v12H5zM12 2v4h4M8 11h6M8 14h6",
+  code: "M7 6 3 10l4 4M13 6l4 4-4 4",
+  generic: "M4 3h12v14H4zM7 7h6M7 10h6M7 13h4",
+};
+
+function iconKind(path: string): keyof typeof ICONS {
   const ext = path.slice(path.lastIndexOf(".") + 1).toLowerCase();
-  if (/^(jpg|jpeg|png|gif|bmp|webp|heic|avif|tif|tiff|svg)$/.test(ext)) return "🖼";
-  if (/^(mp3|flac|wav|ogg|m4a|aac|opus)$/.test(ext)) return "🎵";
-  if (/^(mp4|mkv|avi|mov|webm|wmv)$/.test(ext)) return "🎬";
-  if (/^(zip|7z|rar|gz|xz|bz2|zst|narc)$/.test(ext)) return "🗜";
-  if (/^(exe|dll|so|dylib|msi|sys)$/.test(ext)) return "⚙";
-  if (/^(pdf|doc|docx|odt|rtf|txt|md)$/.test(ext)) return "📄";
-  if (/^(rs|c|h|cpp|py|js|ts|java|go|cs|json|toml|yaml|yml|xml|html|css|sh)$/.test(ext)) return "📝";
-  return "📦";
+  if (/^(jpg|jpeg|png|gif|bmp|webp|heic|avif|tif|tiff|svg|dds|tga)$/.test(ext)) return "image";
+  if (/^(mp3|flac|wav|ogg|m4a|aac|opus|mid)$/.test(ext)) return "audio";
+  if (/^(mp4|mkv|avi|mov|webm|wmv|m4v)$/.test(ext)) return "video";
+  if (/^(zip|7z|rar|gz|xz|bz2|zst|narc|tar|cab|iso)$/.test(ext)) return "archive";
+  if (/^(exe|dll|so|dylib|msi|sys|bin|elf)$/.test(ext)) return "exe";
+  if (/^(pdf|doc|docx|odt|rtf|txt|md|log)$/.test(ext)) return "doc";
+  if (/^(rs|c|h|hpp|cpp|py|js|ts|tsx|java|go|cs|rb|php|json|toml|yaml|yml|xml|html|css|sh|ps1|bat)$/.test(ext))
+    return "code";
+  return "generic";
+}
+
+function icon(path: string): string {
+  const d = ICONS[iconKind(path)];
+  return `<svg class="ico" viewBox="0 0 20 20" aria-hidden="true"><path d="${d}"/></svg>`;
 }
 
 function setBusy(busy: boolean, text?: string) {
@@ -136,8 +184,13 @@ function renderSummary(info: ArchiveInfo) {
   ].join("");
 }
 
+function visibleEntries(): Entry[] {
+  const q = state.filter.trim().toLowerCase();
+  return q ? state.entries.filter((e) => e.path.toLowerCase().includes(q)) : state.entries;
+}
+
 function renderRows() {
-  const rows = [...state.entries].sort((a, b) => {
+  const rows = [...visibleEntries()].sort((a, b) => {
     const k = state.sortKey;
     const va = a[k];
     const vb = b[k];
@@ -149,18 +202,34 @@ function renderRows() {
       const sel = state.selected.has(e.path) ? " class='sel'" : "";
       const checked = state.selected.has(e.path) ? " checked" : "";
       return `<tr${sel} data-path="${escapeHtml(e.path)}">
-        <td class="col-check"><input type="checkbox"${checked} /></td>
-        <td><span class="name"><span class="ico">${glyph(e.path)}</span>${escapeHtml(e.path)}${
-          e.solid ? ' <span class="solid">в блоке</span>' : ""
-        }</span></td>
-        <td class="col-size">${human(e.size)}</td>
-        <td class="col-size">${human(e.stored)}</td>
-        <td class="col-date">${when(e.mtime)}</td>
+        <td><input type="checkbox"${checked} /></td>
+        <td title="${escapeHtml(e.path)}"><span class="name">${icon(e.path)}<span class="text">${escapeHtml(
+          e.path,
+        )}</span>${e.solid ? '<span class="solid">в блоке</span>' : ""}</span></td>
+        <td class="num">${human(e.size)}</td>
+        <td class="num">${human(e.stored)}</td>
+        <td class="num">${when(e.mtime)}</td>
       </tr>`;
     })
     .join("");
   el.rows.innerHTML = html;
-  el.empty.classList.toggle("hidden", state.entries.length > 0);
+  el.empty.classList.toggle("hidden", rows.length > 0);
+  if (state.entries.length > 0 && rows.length === 0) {
+    el.empty.querySelector(".empty-title")!.textContent = "Ничего не найдено";
+    el.empty.querySelectorAll("p").forEach((p, i) => {
+      p.textContent = i === 0 ? "Под фильтр не подходит ни один файл." : "";
+    });
+  }
+  // Show which column is sorted, so the header is never ambiguous.
+  document.querySelectorAll("th.sortable").forEach((th) => {
+    const key = (th as HTMLElement).dataset.sort;
+    const label = (th as HTMLElement).dataset.label ?? th.textContent!.replace(/[ ↑↓]+$/, "");
+    (th as HTMLElement).dataset.label = label;
+    th.innerHTML =
+      key === state.sortKey
+        ? `${label} <span class="arrow">${state.sortAsc ? "↑" : "↓"}</span>`
+        : label;
+  });
 }
 
 function escapeHtml(s: string): string {
@@ -179,6 +248,7 @@ async function loadArchive(path: string) {
     state.entries = info.entries;
     state.selected.clear();
     el.checkAll.checked = false;
+    el.filter.disabled = false;
     renderSummary(info);
     renderRows();
     refreshButtons();
@@ -275,9 +345,16 @@ $("btn-remove").addEventListener("click", async () => {
   await invoke("remove_entries", { archive: state.archive, paths });
 });
 
+el.filter.addEventListener("input", () => {
+  state.filter = el.filter.value;
+  renderRows();
+});
+
 el.checkAll.addEventListener("change", () => {
   state.selected.clear();
-  if (el.checkAll.checked) for (const e of state.entries) state.selected.add(e.path);
+  // Selecting "all" means all *visible* rows: with a filter on, anything else
+  // would silently act on files the user cannot see.
+  if (el.checkAll.checked) for (const e of visibleEntries()) state.selected.add(e.path);
   renderRows();
   refreshButtons();
 });
@@ -382,6 +459,10 @@ void (async () => {
   refreshButtons();
   // Opened with a path argument (double-click a .narc, or the shell
   // association)? Pull it now that listeners and state are ready.
-  const startup = await invoke<string | null>("startup_archive");
-  if (startup) await loadArchive(startup);
+  try {
+    const startup = IN_APP ? await invoke<string | null>("startup_archive") : DEMO.path;
+    if (startup) await loadArchive(startup);
+  } catch (e) {
+    setStatus(`Не удалось открыть переданный архив: ${e}`, true);
+  }
 })();

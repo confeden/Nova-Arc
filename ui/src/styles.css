@@ -2,46 +2,63 @@
   --bg: #16191d;
   --bg-2: #1d2126;
   --bg-3: #24292f;
+  --bg-hover: #1b2026;
   --line: #2f353d;
   --fg: #e6e9ed;
   --dim: #9aa4b1;
   --accent: #2f9e9e;
   --accent-2: #38bdbd;
-  --warn: #d98b3a;
-  --err: #d9534f;
+  --sel: #1e3536;
+  --err: #e0645f;
   font-family: "Segoe UI", system-ui, sans-serif;
   font-size: 14px;
   color-scheme: dark;
 }
 
-* { box-sizing: border-box; }
+* {
+  box-sizing: border-box;
+  min-width: 0; /* so flex/grid children may shrink instead of overflowing */
+}
 
+html,
 body {
+  height: 100%;
   margin: 0;
-  height: 100vh;
-  display: grid;
-  grid-template-rows: auto auto 1fr auto;
+}
+
+/* Flex column with `min-height: 0` on the scrolling child is what keeps the
+   footer pinned to the bottom and the table inside its own area. */
+body {
+  display: flex;
+  flex-direction: column;
   background: var(--bg);
   color: var(--fg);
   overflow: hidden;
   user-select: none;
 }
 
+/* --- toolbar --------------------------------------------------------------- */
+
 .bar {
+  flex: 0 0 auto;
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 10px 12px;
+  gap: 14px;
+  padding: 9px 12px;
   background: var(--bg-2);
   border-bottom: 1px solid var(--line);
-  flex-wrap: wrap;
+  overflow: hidden;
 }
 
-.brand {
-  font-weight: 600;
-  letter-spacing: 0.5px;
-  color: var(--accent-2);
-  margin-right: 6px;
+.group {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+}
+.group.grow {
+  flex: 1 1 auto;
+  min-width: 80px;
 }
 
 .btn {
@@ -51,16 +68,48 @@ body {
   border-radius: 6px;
   padding: 6px 12px;
   cursor: pointer;
+  white-space: nowrap;
 }
-.btn:hover:not(:disabled) { border-color: var(--accent); }
-.btn:disabled { opacity: 0.45; cursor: default; }
-.btn.primary { background: var(--accent); border-color: var(--accent); color: #06231f; font-weight: 600; }
-.btn.primary:hover { background: var(--accent-2); }
+.btn:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+.btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+.btn.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #06231f;
+  font-weight: 600;
+}
+.btn.primary:hover {
+  background: var(--accent-2);
+}
 
-.sep { width: 1px; height: 22px; background: var(--line); }
-.spacer { flex: 1; }
+.input {
+  width: 100%;
+  background: var(--bg-3);
+  color: var(--fg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 6px 10px;
+}
+.input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+.input:disabled {
+  opacity: 0.4;
+}
 
-.field { display: flex; align-items: center; gap: 6px; color: var(--dim); }
+.field {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--dim);
+  white-space: nowrap;
+}
 .field select {
   background: var(--bg-3);
   color: var(--fg);
@@ -69,7 +118,10 @@ body {
   padding: 5px 8px;
 }
 
+/* --- summary --------------------------------------------------------------- */
+
 .summary {
+  flex: 0 0 auto;
   display: flex;
   gap: 18px;
   flex-wrap: wrap;
@@ -78,56 +130,195 @@ body {
   border-bottom: 1px solid var(--line);
   color: var(--dim);
 }
-.summary b { color: var(--fg); font-weight: 600; }
+.summary b {
+  color: var(--fg);
+  font-weight: 600;
+}
 
-main { overflow: auto; position: relative; }
+/* --- table ---------------------------------------------------------------- */
 
-table { width: 100%; border-collapse: collapse; }
+main {
+  flex: 1 1 auto;
+  min-height: 0;
+  position: relative;
+  display: flex;
+}
+
+.table-wrap {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  table-layout: fixed; /* long names ellipsize instead of stretching columns */
+}
+
+col.c-check {
+  width: 36px;
+}
+col.c-size {
+  width: 110px;
+}
+col.c-date {
+  width: 150px;
+}
+
 thead th {
   position: sticky;
   top: 0;
+  z-index: 1;
   background: var(--bg-2);
   text-align: left;
   font-weight: 600;
   padding: 8px 10px;
   border-bottom: 1px solid var(--line);
-  cursor: pointer;
   white-space: nowrap;
 }
-thead th.col-check { cursor: default; width: 34px; }
-tbody td { padding: 5px 10px; border-bottom: 1px solid #202429; white-space: nowrap; }
-tbody tr:hover { background: #1b2026; }
-tbody tr.sel { background: #1e3536; }
-.col-size, .col-date { text-align: right; width: 120px; color: var(--dim); }
-.col-date { width: 160px; }
-.name { display: flex; align-items: center; gap: 8px; }
-.ico { width: 16px; text-align: center; opacity: 0.85; }
-.solid { color: var(--dim); font-size: 11px; border: 1px solid var(--line); border-radius: 4px; padding: 0 4px; }
+th.sortable {
+  cursor: pointer;
+}
+th.sortable:hover {
+  color: var(--accent-2);
+}
+th.num,
+td.num {
+  text-align: right;
+}
+th .arrow {
+  color: var(--accent-2);
+  font-size: 11px;
+}
+
+tbody td {
+  padding: 5px 10px;
+  border-bottom: 1px solid #202429;
+  overflow: hidden;
+  white-space: nowrap;
+}
+/* Ellipsis belongs to the text cells only: on the checkbox cell the browser
+   clips its own ellipsis to a couple of pixels, which reads as a stray dot. */
+tbody td:not(:first-child) {
+  text-overflow: ellipsis;
+}
+tbody td.num {
+  color: var(--dim);
+}
+tbody tr:hover {
+  background: var(--bg-hover);
+}
+tbody tr.sel {
+  background: var(--sel);
+}
+
+.name {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  overflow: hidden;
+}
+.name .text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  direction: ltr;
+}
+svg.ico {
+  flex: 0 0 auto;
+  width: 16px;
+  height: 16px;
+  fill: none;
+  stroke: var(--dim);
+  stroke-width: 1.4;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+tr:hover svg.ico,
+tr.sel svg.ico {
+  stroke: var(--accent-2);
+}
+.solid {
+  flex: 0 0 auto;
+  color: var(--dim);
+  font-size: 11px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 0 4px;
+}
+
+/* --- empty state ---------------------------------------------------------- */
 
 .empty {
   position: absolute;
   inset: 0;
   display: grid;
-  place-content: center;
+  place-items: center;
+  pointer-events: none;
+  padding: 24px;
+}
+.empty-card {
   text-align: center;
   color: var(--dim);
-  pointer-events: none;
+  max-width: 420px;
 }
-.empty.hidden, .hidden { display: none; }
-.dim { color: var(--dim); }
+.empty-title {
+  color: var(--fg);
+  font-size: 17px;
+  margin-bottom: 6px;
+}
+.empty p {
+  margin: 4px 0;
+}
+
+.hidden {
+  display: none !important;
+}
+.dim {
+  color: var(--dim);
+}
+.nowrap {
+  white-space: nowrap;
+}
+
+/* --- status bar ----------------------------------------------------------- */
 
 .status {
+  flex: 0 0 auto;
   display: flex;
   align-items: center;
   gap: 12px;
   padding: 8px 14px;
   background: var(--bg-2);
   border-top: 1px solid var(--line);
+  overflow: hidden;
 }
-.status.err { color: var(--err); }
+.status-text {
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.status.err .status-text {
+  color: var(--err);
+}
 
-.progress { width: 240px; height: 8px; background: var(--bg-3); border-radius: 999px; overflow: hidden; }
-.progress > div { height: 100%; width: 0; background: var(--accent); transition: width 0.12s linear; }
+.progress {
+  flex: 0 0 auto;
+  width: 200px;
+  height: 8px;
+  background: var(--bg-3);
+  border-radius: 999px;
+  overflow: hidden;
+}
+.progress > div {
+  height: 100%;
+  width: 0;
+  background: var(--accent);
+  transition: width 0.12s linear;
+}
+
+/* --- context menu --------------------------------------------------------- */
 
 .menu {
   position: fixed;
@@ -135,8 +326,9 @@ tbody tr.sel { background: #1e3536; }
   border: 1px solid var(--line);
   border-radius: 8px;
   padding: 4px;
-  box-shadow: 0 8px 24px #0008;
+  box-shadow: 0 8px 24px #0009;
   z-index: 10;
+  min-width: 190px;
 }
 .menu button {
   display: block;
@@ -145,10 +337,22 @@ tbody tr.sel { background: #1e3536; }
   background: none;
   border: 0;
   color: var(--fg);
-  padding: 7px 14px;
+  padding: 7px 12px;
   border-radius: 5px;
   cursor: pointer;
+  white-space: nowrap;
 }
-.menu button:hover { background: var(--accent); color: #06231f; }
+.menu button:hover {
+  background: var(--accent);
+  color: #06231f;
+}
 
-body.busy { cursor: progress; }
+body.busy {
+  cursor: progress;
+}
+
+/* Scrollbars that match the theme instead of the default light ones. */
+* {
+  scrollbar-color: #3a424c var(--bg);
+  scrollbar-width: thin;
+}

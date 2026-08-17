@@ -8,61 +8,79 @@
   </head>
   <body>
     <header class="bar">
-      <div class="brand">Nova&nbsp;Arc</div>
-      <button id="btn-open" class="btn">Открыть архив…</button>
-      <button id="btn-new" class="btn primary">Создать архив…</button>
-      <span class="sep"></span>
-      <button id="btn-extract" class="btn" disabled>Распаковать…</button>
-      <button id="btn-add" class="btn" disabled>Добавить…</button>
-      <button id="btn-remove" class="btn" disabled>Удалить</button>
-      <button id="btn-compact" class="btn" disabled>Уплотнить</button>
-      <span class="spacer"></span>
-      <label class="field">
-        Сжатие
-        <select id="level">
-          <option value="fast">быстро</option>
-          <option value="normal" selected>обычно</option>
-          <option value="max">максимум</option>
-        </select>
-      </label>
-      <label class="field">
-        Память
-        <select id="memory">
-          <option value="0" selected>авто</option>
-          <option value="256">256 МБ</option>
-          <option value="512">512 МБ</option>
-          <option value="1024">1 ГБ</option>
-          <option value="4096">4 ГБ</option>
-        </select>
-      </label>
+      <div class="group">
+        <button id="btn-open" class="btn" title="Открыть существующий архив">Открыть</button>
+        <button id="btn-new" class="btn primary" title="Создать новый архив">Создать</button>
+      </div>
+      <div class="group">
+        <button id="btn-extract" class="btn" disabled title="Распаковать выделенное или весь архив">Распаковать</button>
+        <button id="btn-add" class="btn" disabled title="Добавить файлы в архив">Добавить</button>
+        <button id="btn-remove" class="btn" disabled title="Удалить выделенное из архива">Удалить</button>
+        <button id="btn-compact" class="btn" disabled title="Убрать из архива освободившееся место">Уплотнить</button>
+      </div>
+      <div class="group grow">
+        <input id="filter" class="input" type="search" placeholder="Фильтр" disabled />
+      </div>
+      <div class="group">
+        <label class="field" title="Сильнее — меньше размер, но дольше">
+          <span>Сжатие</span>
+          <select id="level">
+            <option value="fast">быстро</option>
+            <option value="normal" selected>обычно</option>
+            <option value="max">максимум</option>
+          </select>
+        </label>
+        <label class="field" title="Ограничение памяти на упаковку">
+          <span>Память</span>
+          <select id="memory">
+            <option value="0" selected>авто</option>
+            <option value="256">256 МБ</option>
+            <option value="512">512 МБ</option>
+            <option value="1024">1 ГБ</option>
+            <option value="2048">2 ГБ</option>
+            <option value="4096">4 ГБ</option>
+          </select>
+        </label>
+      </div>
     </header>
 
     <section id="summary" class="summary hidden"></section>
 
-    <main>
-      <table id="table">
-        <thead>
-          <tr>
-            <th class="col-check"><input type="checkbox" id="check-all" /></th>
-            <th class="col-name" data-sort="path">Имя</th>
-            <th class="col-size" data-sort="size">Размер</th>
-            <th class="col-size" data-sort="stored">В архиве</th>
-            <th class="col-date" data-sort="mtime">Изменён</th>
-          </tr>
-        </thead>
-        <tbody id="rows"></tbody>
-      </table>
+    <main id="main">
+      <div class="table-wrap">
+        <table id="table">
+          <colgroup>
+            <col class="c-check" />
+            <col class="c-name" />
+            <col class="c-size" />
+            <col class="c-size" />
+            <col class="c-date" />
+          </colgroup>
+          <thead>
+            <tr>
+              <th><input type="checkbox" id="check-all" title="Выделить всё" /></th>
+              <th class="sortable" data-sort="path">Имя</th>
+              <th class="sortable num" data-sort="size">Размер</th>
+              <th class="sortable num" data-sort="stored">В архиве</th>
+              <th class="sortable num" data-sort="mtime">Изменён</th>
+            </tr>
+          </thead>
+          <tbody id="rows"></tbody>
+        </table>
+      </div>
       <div id="empty" class="empty">
-        <p>Откройте архив <b>.narc</b> или создайте новый.</p>
-        <p class="dim">Файлы и папки можно перетащить прямо в это окно.</p>
+        <div class="empty-card">
+          <div class="empty-title">Здесь пока пусто</div>
+          <p>Откройте архив <b>.narc</b> или создайте новый.</p>
+          <p class="dim">Файлы и папки можно перетащить прямо в это окно.</p>
+        </div>
       </div>
     </main>
 
     <footer class="status">
       <div id="progress-wrap" class="progress hidden"><div id="progress"></div></div>
-      <span id="status">Готово</span>
-      <span class="spacer"></span>
-      <span id="machine" class="dim"></span>
+      <span id="status" class="status-text">Готово</span>
+      <span id="machine" class="dim nowrap"></span>
     </footer>
 
     <div id="menu" class="menu hidden">
