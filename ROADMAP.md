@@ -62,6 +62,12 @@
   `Tier::worker_memory()` (fast 4, normal 40, max 56 MiB).
 - Chunk hash = blake3(uncompressed)[..16]; serves dedup AND extract integrity.
   Dead (unreferenced) chunk records stay in manifest as dedup sources until compact.
+- PPMd7 order (10) and pool formula (32x chunk, cap 64 MiB) are FORMAT
+  CONSTANTS - not stored per chunk, so changing them breaks old archives.
+  Order 10 measured better than 12/16 on 4 MiB chunks: a model restart when
+  the pool runs out costs more than a deeper model gains.
+- LZMA2 presets 6..9 differ only in dictionary size, which we override with
+  the 4 MiB chunk cap, so max raises nice_len instead (xz -e style).
 - Codec ids: 0=store, 1=zstd, 2=LZMA2, 3=PPMd7. Filter ids: 0=none,
   1=BCJ x86, 2..=33=delta(id-1). Per-chunk raw fallback if the result is not
   smaller — and then the filter byte MUST be cleared too.
