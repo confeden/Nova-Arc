@@ -1,0 +1,21 @@
+[workspace]
+resolver = "2"
+members = ["crates/narc-core", "crates/narc-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+repository = "https://github.com/confeden/Nova-Arc"
+
+[workspace.dependencies]
+anyhow = "1"
+blake3 = "1"
+clap = { version = "4", features = ["derive"] }
+fastcdc = "3"
+filetime = "0.2"
+rmp-serde = "1"
+serde = { version = "1", features = ["derive"] }
+tempfile = "3"
+walkdir = "2"
+windows-sys = { version = "0.60", features = ["Win32_System_Threading", "Win32_Foundation"] }
+zstd = "0.13"

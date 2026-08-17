@@ -1,0 +1,22 @@
+[package]
+name = "narc-core"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+description = "Core library for the NARC archive format (Nova Arc)"
+
+[dependencies]
+anyhow.workspace = true
+blake3.workspace = true
+fastcdc.workspace = true
+filetime.workspace = true
+rmp-serde.workspace = true
+serde.workspace = true
+tempfile.workspace = true
+walkdir.workspace = true
+zstd.workspace = true
+
+[dev-dependencies]
+blake3.workspace = true
+filetime.workspace = true
+tempfile.workspace = true
