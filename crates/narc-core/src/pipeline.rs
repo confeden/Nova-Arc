@@ -18,6 +18,7 @@
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{Seek, SeekFrom, Write};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex};
 
 use anyhow::{anyhow, bail, Result};
@@ -152,10 +153,24 @@ struct Done {
     charge: u64,
 }
 
+/// How often the governor re-reads how much memory the machine has left.
+const GOVERNOR_INTERVAL: std::time::Duration = std::time::Duration::from_millis(400);
+
 /// Counting semaphore over bytes in flight, with an abort path so a failing
 /// writer can never leave the reader blocked forever.
+///
+/// The limit is not fixed. Packing starts with a fraction of the budget and
+/// the governor raises it while the machine has memory to spare, lowering it
+/// when free memory runs short. Claiming the whole budget up front would make
+/// the archiver the reason another program starts swapping; growing into it
+/// gradually keeps us out of the way while still using what is there.
 struct Budget {
-    limit: u64,
+    /// Current cap on bytes in flight.
+    limit: AtomicU64,
+    /// Ceiling the governor may never exceed (the resolved budget).
+    hard: u64,
+    /// Floor, so at least one chunk always fits and progress is guaranteed.
+    floor: u64,
     state: Mutex<BudgetState>,
     cv: Condvar,
 }
@@ -166,15 +181,24 @@ struct BudgetState {
 }
 
 impl Budget {
-    fn new(limit: u64) -> Self {
+    fn new(hard: u64) -> Self {
+        let hard = hard.max(WORKER_CHUNK_BYTES);
         Budget {
-            limit: limit.max(1),
+            // Start at a quarter: enough to fill the workers, small enough that
+            // a short job never grabs the whole budget.
+            limit: AtomicU64::new((hard / 4).max(WORKER_CHUNK_BYTES)),
+            hard,
+            floor: WORKER_CHUNK_BYTES,
             state: Mutex::new(BudgetState {
                 used: 0,
                 aborted: false,
             }),
             cv: Condvar::new(),
         }
+    }
+
+    fn limit(&self) -> u64 {
+        self.limit.load(Ordering::Relaxed)
     }
 
     /// Reserve `n` bytes, blocking while the pipeline is full. A single chunk
@@ -186,7 +210,7 @@ impl Budget {
             if st.aborted {
                 return false;
             }
-            if st.used == 0 || st.used + n <= self.limit {
+            if st.used == 0 || st.used + n <= self.limit() {
                 st.used += n;
                 return true;
             }
@@ -205,6 +229,35 @@ impl Budget {
         st.aborted = true;
         st.used = 0;
         self.cv.notify_all();
+    }
+
+    /// Adjust the cap from how much memory the machine has free. Growth is
+    /// gradual (an eighth of the ceiling at a time) and retreat is immediate
+    /// (halving), because being slow to give memory back is what users feel.
+    fn govern(&self) {
+        let Some(m) = narc_platform::memory_status() else {
+            // Without a reading, open up to the ceiling rather than stay
+            // throttled forever.
+            self.limit.store(self.hard, Ordering::Relaxed);
+            self.cv.notify_all();
+            return;
+        };
+        let tight = (m.total / 10).max(1 << 30); // 10% of RAM, at least 1 GiB
+        let roomy = (m.total / 5).max(2 << 30); // 20% of RAM, at least 2 GiB
+        let cur = self.limit();
+        let next = if m.available < tight {
+            (cur / 2).max(self.floor)
+        } else if m.available > roomy {
+            (cur + self.hard / 8).min(self.hard)
+        } else {
+            cur
+        };
+        if next != cur {
+            self.limit.store(next, Ordering::Relaxed);
+            // Waiters blocked against the old, smaller cap must re-check.
+            let _guard = self.state.lock().expect("budget mutex poisoned");
+            self.cv.notify_all();
+        }
     }
 }
 
@@ -230,6 +283,10 @@ where
     let (job_tx, job_rx) = bounded::<Job>(workers * 2);
     let (done_tx, done_rx) = bounded::<Result<Done>>(workers * 2);
 
+    // The governor lives as long as the packing run and is asked to stop
+    // through this flag, so it cannot outlive the borrowed budget.
+    let running = AtomicBool::new(true);
+
     std::thread::scope(|scope| -> Result<PackOutput> {
         for _ in 0..workers {
             let job_rx: Receiver<Job> = job_rx.clone();
@@ -238,6 +295,16 @@ where
         }
         drop(job_rx);
         drop(done_tx);
+
+        scope.spawn({
+            let (budget, running) = (&budget, &running);
+            move || {
+                while running.load(Ordering::Relaxed) {
+                    std::thread::sleep(GOVERNOR_INTERVAL);
+                    budget.govern();
+                }
+            }
+        });
 
         let writer = scope.spawn({
             let budget = &budget;
@@ -260,6 +327,7 @@ where
         let written = writer
             .join()
             .map_err(|_| anyhow!("writer thread panicked"))?;
+        running.store(false, Ordering::Relaxed);
         produced?;
         written
     })

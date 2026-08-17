@@ -773,8 +773,16 @@ impl Archive {
         let after = tmp.as_file_mut().metadata()?.len();
 
         drop(file); // close the original handle before replacing (Windows)
-        tmp.persist(&path)
-            .map_err(|e| anyhow::anyhow!("compaction failed: {}", e.error))?;
+        // Keep the archive's own identity: replacing in place preserves its
+        // permissions, attributes and creation time, where persisting the
+        // temporary file over it would carry the temp file's ACL instead.
+        let (tmp_file, tmp_path) = tmp.keep().map_err(|e| anyhow::anyhow!("{}", e.error))?;
+        drop(tmp_file);
+        let swapped = narc_platform::replace_file(&tmp_path, &path);
+        if swapped.is_err() {
+            let _ = fs::remove_file(&tmp_path);
+        }
+        swapped.context("cannot replace the archive with the compacted copy")?;
         #[cfg(unix)]
         {
             // Make the directory entry itself durable.

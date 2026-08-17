@@ -62,9 +62,13 @@ mod imp {
     use std::fs::File;
     use std::os::windows::io::AsRawHandle;
 
+    use std::os::windows::ffi::OsStrExt;
+
     use windows_sys::Win32::Storage::FileSystem::{
-        FileIoPriorityHintInfo, IoPriorityHintLow, LockFileEx, SetFileInformationByHandle,
-        FILE_IO_PRIORITY_HINT_INFO, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY,
+        FileIoPriorityHintInfo, IoPriorityHintLow, LockFileEx, ReplaceFileW,
+        SetFileInformationByHandle, FILE_IO_PRIORITY_HINT_INFO, LOCKFILE_EXCLUSIVE_LOCK,
+        LOCKFILE_FAIL_IMMEDIATELY, REPLACEFILE_IGNORE_ACL_ERRORS,
+        REPLACEFILE_IGNORE_MERGE_ERRORS,
     };
     use windows_sys::Win32::System::IO::OVERLAPPED;
     use windows_sys::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
@@ -174,6 +178,39 @@ mod imp {
         }
     }
 
+    /// Replace `dst` with `src` in one step, keeping the destination's
+    /// identity: its ACLs, attributes and creation time survive, and readers
+    /// never see a moment where the archive is missing.
+    ///
+    /// A plain rename would work too, but it carries the *temporary* file's
+    /// security descriptor over the archive, quietly changing who can read it.
+    pub fn replace_file(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+        let wide = |p: &std::path::Path| {
+            p.as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect::<Vec<u16>>()
+        };
+        let (s, d) = (wide(src), wide(dst));
+        // SAFETY: both strings are NUL-terminated UTF-16 for the duration of
+        // the call; the remaining arguments are the documented "no backup,
+        // ignore merge errors" form.
+        let ok = unsafe {
+            ReplaceFileW(
+                d.as_ptr(),
+                s.as_ptr(),
+                std::ptr::null(),
+                REPLACEFILE_IGNORE_MERGE_ERRORS | REPLACEFILE_IGNORE_ACL_ERRORS,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
     pub fn peak_memory() -> Option<u64> {
         let mut c: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
         c.cb = size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
@@ -244,6 +281,39 @@ mod imp {
         }
     }
 
+    /// Replace `dst` with `src` in one step, keeping the destination's
+    /// identity: its ACLs, attributes and creation time survive, and readers
+    /// never see a moment where the archive is missing.
+    ///
+    /// A plain rename would work too, but it carries the *temporary* file's
+    /// security descriptor over the archive, quietly changing who can read it.
+    pub fn replace_file(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+        let wide = |p: &std::path::Path| {
+            p.as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect::<Vec<u16>>()
+        };
+        let (s, d) = (wide(src), wide(dst));
+        // SAFETY: both strings are NUL-terminated UTF-16 for the duration of
+        // the call; the remaining arguments are the documented "no backup,
+        // ignore merge errors" form.
+        let ok = unsafe {
+            ReplaceFileW(
+                d.as_ptr(),
+                s.as_ptr(),
+                std::ptr::null(),
+                REPLACEFILE_IGNORE_MERGE_ERRORS | REPLACEFILE_IGNORE_ACL_ERRORS,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
     pub fn peak_memory() -> Option<u64> {
         None
     }
@@ -261,6 +331,12 @@ pub fn lower_io_priority(file: &File) {
 
 pub fn memory_status() -> Option<MemoryStatus> {
     imp::memory_status()
+}
+
+/// Atomically replace `dst` with `src`, preserving the destination's
+/// permissions and attributes where the platform supports it.
+pub fn replace_file(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    imp::replace_file(src, dst)
 }
 
 /// Try to take the archive's writer lock. Returns false when another process
