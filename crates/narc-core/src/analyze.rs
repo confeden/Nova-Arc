@@ -26,17 +26,88 @@ impl Tier {
         }
     }
 
+    /// FastCDC parameters: (min, avg, max) chunk size.
+    ///
+    /// The chunk is the compression unit, so its size is a direct ratio knob:
+    /// measured on Silesia with LZMA2, chunking at 4 MiB costs 1 percentage
+    /// point against 64 MiB chunks (24.0% vs 23.0%). It is also the edit
+    /// granularity — changing a byte rewrites its chunk — so fast and normal
+    /// stay small and only max trades edit cost for ratio.
+    /// FastCDC caps these at min 1 MiB / avg 4 MiB / max 16 MiB, so the max
+    /// tier takes the largest chunking the algorithm allows.
+    pub fn cdc(self) -> (u32, u32, u32) {
+        match self {
+            Tier::Fast | Tier::Normal => (256 * 1024, 1024 * 1024, 4 * 1024 * 1024),
+            Tier::Max => (1024 * 1024, 4 * 1024 * 1024, 16 * 1024 * 1024),
+        }
+    }
+
+    /// Target size of a solid block of small files. The bigger it is, the more
+    /// the compressor can exploit similarity between files: measured on 5707
+    /// source files, 8 MiB blocks give 9.9% and 32 MiB blocks 7.9%. The cost
+    /// is that editing one member rewrites the whole block.
+    pub fn solid_block(self) -> usize {
+        match self {
+            Tier::Fast => 4 * 1024 * 1024,
+            Tier::Normal => 16 * 1024 * 1024,
+            Tier::Max => 32 * 1024 * 1024,
+        }
+    }
+
+    /// Files at or above this size are chunked on their own instead of going
+    /// into a solid block, so extracting one does not decompress a whole block.
+    pub fn solid_max_file(self) -> u64 {
+        match self {
+            Tier::Fast | Tier::Normal => 256 * 1024,
+            Tier::Max => 1024 * 1024,
+        }
+    }
+
+    /// Codecs to try for a unit the analyzer classified as compressible.
+    ///
+    /// Fast and normal trust the analyzer's single choice. Max runs a
+    /// tournament and keeps the smallest result, because no static rule wins:
+    /// measured on 32 MiB units, PPMd7 beats LZMA2 by 13-24% on prose, wiki
+    /// text and database records, while LZMA2 beats PPMd7 by 16% on binaries
+    /// and by 10-20% on solid blocks of source code.
+    pub fn candidates(self, first: Codec) -> Vec<(Codec, u8)> {
+        if self != Tier::Max || first == Codec::Store {
+            return vec![(first, 0)];
+        }
+        let mut out = vec![(Codec::Lzma2, 0)];
+        out.extend(
+            crate::codec::PPMD7_ORDERS
+                .iter()
+                .map(|&o| (Codec::Ppmd7, o)),
+        );
+        out
+    }
+
     /// Memory one compression worker holds on top of its chunk buffers,
-    /// dominated by the codec's match tables. Measured on 4 MiB chunks (see
-    /// test/bench.sh): ~2 MiB for zstd level 3, ~37 MiB for level 12, ~50 MiB
-    /// for level 19; the max tier also runs LZMA2 (4 MiB dictionary, ~10x
-    /// dictionary for the encoder) and PPMd, so it reserves more.
+    /// dominated by the codec's tables. Measured: ~2 MiB for zstd level 3,
+    /// ~37 MiB for level 12. LZMA2's bt4 match finder costs ~11x its
+    /// dictionary, which equals the chunk size, and PPMd7's model pool is 8x
+    /// the chunk capped at 256 MiB — at the max tier those dominate.
     /// Used to decide how many workers fit in the memory budget.
     pub fn worker_memory(self) -> u64 {
         match self {
             Tier::Fast => 4 * 1024 * 1024,
             Tier::Normal => 40 * 1024 * 1024,
-            Tier::Max => 96 * 1024 * 1024,
+            // 32 MiB unit: LZMA2 tables ~370 MiB, PPMd7 pool 256 MiB. They run
+            // one after another in the tournament, so the larger one governs.
+            Tier::Max => 384 * 1024 * 1024,
+        }
+    }
+
+    /// The chunking geometry this tier would create a new archive with.
+    pub fn geometry(self) -> crate::manifest::Geometry {
+        let (chunk_min, chunk_avg, chunk_max) = self.cdc();
+        crate::manifest::Geometry {
+            chunk_min,
+            chunk_avg,
+            chunk_max,
+            solid_block: self.solid_block() as u64,
+            solid_max_file: self.solid_max_file(),
         }
     }
 }

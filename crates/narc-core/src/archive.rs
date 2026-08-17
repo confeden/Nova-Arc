@@ -28,15 +28,19 @@ use crate::manifest::{Block, ChunkRec, FileEntry, Manifest};
 use crate::paths;
 use crate::pipeline::{self, PackOptions};
 
-pub const MIN_CHUNK: u32 = 256 * 1024;
-pub const AVG_CHUNK: u32 = 1024 * 1024;
-pub const MAX_CHUNK: u32 = 4 * 1024 * 1024;
+/// Largest compression unit any tier produces (see `Tier::cdc` and
+/// `Tier::solid_block`). Used for the plausibility checks that keep a hostile
+/// manifest from driving allocations, and for the memory model.
+pub const MAX_CHUNK: u32 = 32 * 1024 * 1024;
 
 const HEAD_SAMPLE: usize = 64 * 1024;
 
 /// Upper bound on a stored chunk. Compression can expand incompressible data
 /// slightly, hence the headroom; anything beyond is a corrupt manifest.
 const MAX_STORED_CHUNK: u64 = MAX_CHUNK as u64 * 2;
+
+/// Upper bound on a solid block, for the same reason.
+const MAX_STORED_BLOCK: u64 = MAX_CHUNK as u64 * 2;
 
 /// How many footer candidates to try before declaring an archive corrupt.
 /// Each retry means "this footer's manifest did not verify"; a handful covers
@@ -202,6 +206,19 @@ impl Archive {
             bail!("archive opened read-only");
         }
         let mut stats = AddStats::default();
+        // Chunk boundaries must stay compatible with what is already in the
+        // archive, or nothing deduplicates; only the compression method
+        // follows the tier the user asked for now.
+        let geom = *self
+            .manifest
+            .geometry
+            .get_or_insert_with(|| opts.tier.geometry());
+        if geom != opts.tier.geometry() {
+            stats.warnings.push(format!(
+                "archive was created with {} KiB average chunks; keeping that geometry so unchanged data still deduplicates",
+                geom.chunk_avg / 1024
+            ));
+        }
 
         // Collect the work list first: small files are packed last, grouped
         // by extension, so the compressor sees similar data back to back.
@@ -248,9 +265,9 @@ impl Archive {
                 }
             }
         }
-        let (mut small, big): (Vec<_>, Vec<_>) = work
-            .into_iter()
-            .partition(|(_, _, len)| *len < SOLID_MAX_FILE);
+        let solid_max = geom.solid_max_file;
+        let (mut small, big): (Vec<_>, Vec<_>) =
+            work.into_iter().partition(|(_, _, len)| *len < solid_max);
         // Group key = extension: .rs with .rs, .png with .png. Sorting by it
         // is what makes a solid block compress well.
         small.sort_by(|a, b| {
@@ -261,6 +278,7 @@ impl Archive {
 
         let mut ctx = AddCtx {
             tier: opts.tier,
+            geom,
             base: u32::try_from(self.manifest.chunks.len())
                 .context("archive chunk count exceeds format limit")?,
             block_base: u32::try_from(self.manifest.blocks.len())
@@ -287,15 +305,7 @@ impl Archive {
             for (disk, rel, _) in &big {
                 ctx.add_file(sub, disk, rel.clone(), &mut stats)?;
             }
-            let mut group = String::new();
             for (disk, rel, _) in &small {
-                let key = solid_group_key(rel);
-                // A block holds one file type only; flush when the type
-                // changes so a mixed block never dilutes the model.
-                if key != group {
-                    ctx.flush_solid(sub, &mut stats)?;
-                    group = key;
-                }
                 ctx.add_small_file(sub, disk, rel.clone(), &mut stats)?;
             }
             ctx.flush_solid(sub, &mut stats)?;
@@ -418,7 +428,14 @@ impl Archive {
             }
         }
 
-        let workers = opts.extract_workers().min(work.len().max(1));
+        // LZMA2 and PPMd7 make extraction CPU-bound; zstd/store leave it
+        // I/O-bound. Which one this archive is decides the thread count.
+        let slow_codecs = self
+            .manifest
+            .chunks
+            .iter()
+            .any(|c| matches!(c.codec, 2 | 3));
+        let workers = opts.extract_workers(slow_codecs).min(work.len().max(1));
         let counters = Mutex::new((0usize, 0u64, 0usize)); // files, bytes, skipped
         let failure: Mutex<Option<anyhow::Error>> = Mutex::new(None);
         let stop = AtomicBool::new(false);
@@ -615,6 +632,7 @@ impl Archive {
             files: Vec::with_capacity(old.files.len()),
             chunks: Vec::new(),
             blocks: Vec::new(),
+            geometry: old.geometry,
         };
         let mut remap: HashMap<u32, u32> = HashMap::new();
         let mut block_remap: HashMap<u32, u32> = HashMap::new();
@@ -724,7 +742,7 @@ impl BlockCache {
                 .blocks
                 .get(block_idx as usize)
                 .context("corrupt manifest: block index out of range")?;
-            if block.size > SOLID_BLOCK as u64 * 2 {
+            if block.size > MAX_STORED_BLOCK {
                 bail!("corrupt manifest: implausible solid block size");
             }
             let mut data = Vec::with_capacity(block.size as usize);
@@ -810,16 +828,6 @@ fn extract_one(
     Ok(Some(written))
 }
 
-/// Files below this size are packed into solid blocks instead of being
-/// chunked individually: on their own they are far too small for a
-/// compressor to learn anything, and each would cost a chunk record.
-pub const SOLID_MAX_FILE: u64 = 256 * 1024;
-
-/// Target size of a solid block. Small enough that replacing one file inside
-/// it rewrites only a few MB (the whole point of NARC), large enough for the
-/// compressor to exploit similarity across files.
-pub const SOLID_BLOCK: usize = 8 * 1024 * 1024;
-
 /// Grouping key for solid blocks: the extension, lowercased. Sorting small
 /// files by it puts .rs next to .rs and .png next to .png.
 fn solid_group_key(rel: &str) -> String {
@@ -846,6 +854,7 @@ struct SolidBuilder {
 /// appends chunks in submission order.
 struct AddCtx {
     tier: Tier,
+    geom: crate::manifest::Geometry,
     base: u32,
     block_base: u32,
     dedup: HashMap<[u8; 16], u32>,
@@ -866,7 +875,8 @@ impl AddCtx {
         stats: &mut AddStats,
     ) -> Result<()> {
         let data = fs::read(disk).with_context(|| format!("cannot read {}", disk.display()))?;
-        if self.solid.buf.len() + data.len() > SOLID_BLOCK && !self.solid.buf.is_empty() {
+        let target = self.geom.solid_block as usize;
+        if self.solid.buf.len() + data.len() > target * 2 && !self.solid.buf.is_empty() {
             self.flush_solid(sub, stats)?;
         }
         let meta = fs::metadata(disk)?;
@@ -878,11 +888,28 @@ impl AddCtx {
             block: None, // filled in by flush_solid
         };
         let offset = self.solid.buf.len() as u64;
+        let cut = blake3::hash(&data);
         self.solid.buf.extend_from_slice(&data);
         self.solid.members.push((entry, offset));
         self.note_case_collision(&rel, stats);
         stats.bytes_in += data.len() as u64;
         stats.files += 1;
+
+        // Content-defined block boundary: end the block here with probability
+        // `size / target`, so blocks average the target size while the
+        // decision depends on nothing but this file's own hash and length.
+        //
+        // That independence is the whole point. A boundary rule that looked at
+        // the accumulated buffer size would move every later boundary as soon
+        // as one file changed length, so re-saving a tree after a one-line
+        // edit rewrote every block — measured at 17 MiB of growth. Now only
+        // the edited file's own block changes; the rest stay byte-identical
+        // and deduplicate away.
+        let h = u64::from_le_bytes(cut.as_bytes()[..8].try_into().expect("blake3 is 32 bytes"));
+        let size = self.solid.members.last().map_or(0, |(e, _)| e.size);
+        if h % (target as u64) < size || self.solid.buf.len() >= target * 2 {
+            self.flush_solid(sub, stats)?;
+        }
         Ok(())
     }
 
@@ -896,23 +923,32 @@ impl AddCtx {
         let plan = analyze::plan(&buf[..buf.len().min(HEAD_SAMPLE)], self.tier);
         let block_size = buf.len() as u64;
 
+        // The block is one compression unit, not a stream to be re-chunked:
+        // splitting it would hide exactly the cross-file redundancy it exists
+        // to expose (measured: 8 MiB blocks re-chunked at 4 MiB give 9.9% on
+        // a source tree, compressed whole at 32 MiB they give 7.9%).
         let mut chunk_ids = Vec::new();
-        for chunk in StreamCDC::new(std::io::Cursor::new(buf), MIN_CHUNK, AVG_CHUNK, MAX_CHUNK) {
-            let data = chunk.context("chunking solid block")?.data;
-            let mut key = [0u8; 16];
-            key.copy_from_slice(&blake3::hash(&data).as_bytes()[..16]);
-            if let Some(&idx) = self.dedup.get(&key) {
-                stats.bytes_deduped += data.len() as u64;
+        let mut key = [0u8; 16];
+        key.copy_from_slice(&blake3::hash(&buf).as_bytes()[..16]);
+        match self.dedup.get(&key) {
+            Some(&idx) => {
+                stats.bytes_deduped += block_size;
                 chunk_ids.push(idx);
-                continue;
             }
-            let local = sub.submit_filtered(data, key, plan.codec, plan.filter.id())?;
-            let idx = self
-                .base
-                .checked_add(local)
-                .context("archive chunk count exceeds format limit")?;
-            self.dedup.insert(key, idx);
-            chunk_ids.push(idx);
+            None => {
+                let local = sub.submit_filtered(
+                    buf,
+                    key,
+                    self.tier.candidates(plan.codec),
+                    plan.filter.id(),
+                )?;
+                let idx = self
+                    .base
+                    .checked_add(local)
+                    .context("archive chunk count exceeds format limit")?;
+                self.dedup.insert(key, idx);
+                chunk_ids.push(idx);
+            }
         }
 
         let block_idx = self
@@ -984,7 +1020,12 @@ impl AddCtx {
             // compression pipeline. Memory stays bounded by the pipeline's
             // budget regardless of file size.
             let reader = std::io::Cursor::new(head).chain(BufReader::new(f));
-            for result in StreamCDC::new(reader, MIN_CHUNK, AVG_CHUNK, MAX_CHUNK) {
+            let (min, avg, max) = (
+                self.geom.chunk_min,
+                self.geom.chunk_avg,
+                self.geom.chunk_max,
+            );
+            for result in StreamCDC::new(reader, min, avg, max) {
                 let chunk = result.with_context(|| format!("reading {}", disk.display()))?;
                 let data = chunk.data;
                 let unpacked_len = data.len() as u64;
@@ -997,7 +1038,12 @@ impl AddCtx {
                     chunk_ids.push(idx);
                     continue;
                 }
-                let local = sub.submit_filtered(data, key, plan.codec, plan.filter.id())?;
+                let local = sub.submit_filtered(
+                    data,
+                    key,
+                    self.tier.candidates(plan.codec),
+                    plan.filter.id(),
+                )?;
                 let idx = self
                     .base
                     .checked_add(local)
@@ -1075,7 +1121,12 @@ fn read_packed(reader: &mut &File, rec: &ChunkRec, file_len: u64) -> Result<Vec<
 
 /// Decompress a chunk and check it against the hash recorded in the manifest.
 fn verify_chunk(rec: &ChunkRec, packed: &[u8]) -> Result<Vec<u8>> {
-    let mut data = codec::decompress(Codec::from_id(rec.codec)?, packed, rec.unpacked as usize)?;
+    let mut data = codec::decompress(
+        Codec::from_id(rec.codec)?,
+        packed,
+        rec.unpacked as usize,
+        rec.param,
+    )?;
     // Undo the pre-compression transform before checking the hash: the hash
     // was taken over the original bytes, so it also proves the filter round
     // -tripped exactly.

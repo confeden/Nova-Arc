@@ -34,6 +34,11 @@ const BASE_BYTES: u64 = 32 * 1024 * 1024;
 /// Chunk buffers a worker holds while compressing (input + output).
 const WORKER_CHUNK_BYTES: u64 = 2 * crate::archive::MAX_CHUNK as u64;
 
+/// PPMd7's suballocator pool, allocated by the decoder as well as the
+/// encoder. It dominates per-worker memory whenever an archive contains PPMd
+/// chunks (see `codec::PPMD7_MEM_MAX`).
+const PPMD_POOL_BYTES: u64 = 64 * 1024 * 1024;
+
 #[derive(Clone, Copy, Debug)]
 pub struct PackOptions {
     pub tier: Tier,
@@ -83,18 +88,28 @@ impl PackOptions {
         (workers, in_flight)
     }
 
-    /// Workers for extraction. Default is 1 **on purpose**: with zstd,
-    /// unpacking is bound by file creation and disk I/O, not by the CPU
-    /// (measured: 5751 small files take 1.0 s on one thread and 2.5 s on
-    /// eight, because parallel writers fight over NTFS directory metadata and
-    /// turn sequential reads into seeks). An explicit `-j` is still honoured,
-    /// and the default should become "all cores" once slow-decoding codecs
-    /// (LZMA/PPMd) land and decompression becomes the bottleneck.
+    /// Workers for extraction, which depends entirely on what the archive is
+    /// made of — hence `slow_codecs`, meaning it contains LZMA2 or PPMd7
+    /// chunks.
     ///
-    /// Memory per worker is one packed plus one unpacked chunk, so extraction
-    /// stays in the low tens of MB regardless of archive size.
-    pub fn extract_workers(&self) -> usize {
-        if self.threads == 0 {
+    /// With zstd/store only, unpacking is bound by file creation and disk
+    /// I/O, and extra threads make it *slower*: 5751 small files take 1.0 s
+    /// on one thread and 2.5 s on eight, because parallel writers fight over
+    /// NTFS directory metadata and turn sequential reads into seeks. So the
+    /// default there is a single worker.
+    ///
+    /// PPMd7 decodes at ~20 MB/s per thread, which makes extraction CPU-bound
+    /// instead: the same corpus at the max tier takes 19.6 s on one thread and
+    /// 7.5 s on eight. So slow archives get every core the memory budget
+    /// allows — PPMd7's model pool is 64 MiB per worker, which is the term
+    /// that matters on a small budget.
+    pub fn extract_workers(&self, slow_codecs: bool) -> usize {
+        let cores = if self.threads == 0 {
+            narc_platform::logical_cores()
+        } else {
+            self.threads
+        };
+        if !slow_codecs && self.threads == 0 {
             return 1;
         }
         let budget = narc_platform::memory_budget(if self.memory_budget == 0 {
@@ -102,8 +117,13 @@ impl PackOptions {
         } else {
             Some(self.memory_budget)
         });
-        let by_mem = (budget.saturating_sub(BASE_BYTES) / WORKER_CHUNK_BYTES).max(1) as usize;
-        self.threads.min(by_mem).max(1)
+        let per_worker = if slow_codecs {
+            PPMD_POOL_BYTES + WORKER_CHUNK_BYTES
+        } else {
+            WORKER_CHUNK_BYTES
+        };
+        let by_mem = (budget.saturating_sub(BASE_BYTES) / per_worker).max(1) as usize;
+        cores.min(by_mem).max(1)
     }
 }
 
@@ -112,8 +132,9 @@ struct Job {
     seq: u64,
     data: Vec<u8>,
     hash: [u8; 16],
-    /// Codec chosen by the analysis phase for the owning file.
-    codec: Codec,
+    /// Codecs to try, with their per-codec parameter. More than one means the
+    /// max tier's tournament: compress with each, keep the smallest.
+    candidates: Vec<(Codec, u8)>,
     /// Reversible transform to apply before compressing (0 = none).
     filter: u8,
     /// Bytes charged to the memory budget for this chunk.
@@ -124,6 +145,7 @@ struct Done {
     seq: u64,
     payload: Vec<u8>,
     codec: Codec,
+    param: u8,
     filter: u8,
     unpacked: u64,
     hash: [u8; 16],
@@ -252,16 +274,16 @@ pub struct Submitter<'a> {
 impl Submitter<'_> {
     /// Hand a chunk to the pipeline; returns its index within this run.
     pub fn submit(&mut self, data: Vec<u8>, hash: [u8; 16], codec: Codec) -> Result<u32> {
-        self.submit_filtered(data, hash, codec, 0)
+        self.submit_filtered(data, hash, vec![(codec, 0)], 0)
     }
 
-    /// As [`Self::submit`], but applying a reversible filter before
-    /// compression (see `crate::filters`).
+    /// As [`Self::submit`], but with a reversible filter (see
+    /// `crate::filters`) and a list of codecs to try.
     pub fn submit_filtered(
         &mut self,
         data: Vec<u8>,
         hash: [u8; 16],
-        codec: Codec,
+        candidates: Vec<(Codec, u8)>,
         filter: u8,
     ) -> Result<u32> {
         // Input plus a worst-case output buffer of the same size.
@@ -274,7 +296,7 @@ impl Submitter<'_> {
             seq,
             data,
             hash,
-            codec,
+            candidates,
             filter,
             charge,
         };
@@ -311,7 +333,7 @@ fn worker_loop(rx: Receiver<Job>, tx: Sender<Result<Done>>, level: i32) {
 }
 
 fn compress_job(
-    comp: Option<&mut zstd::bulk::Compressor<'_>>,
+    mut comp: Option<&mut zstd::bulk::Compressor<'_>>,
     job: Job,
     level: i32,
 ) -> Result<Done> {
@@ -319,7 +341,7 @@ fn compress_job(
         seq,
         mut data,
         hash,
-        codec,
+        candidates,
         filter,
         charge,
     } = job;
@@ -327,29 +349,42 @@ fn compress_job(
     // Filters are reversible transforms that make the data more compressible;
     // the chunk hash covers the ORIGINAL bytes, so it is computed before this.
     crate::filters::Filter::from_id(filter)?.apply(&mut data);
-    let packed = match codec {
-        Codec::Store => None,
-        // The per-worker zstd context is reused across chunks; allocating one
-        // per chunk would dominate the cost of small chunks.
-        Codec::Zstd => match comp {
-            Some(c) => Some(c.compress(&data)?),
-            None => Some(codec::compress(Codec::Zstd, level, &data)?),
-        },
-        other => Some(codec::compress(other, level, &data)?),
-    };
+
+    // Try every candidate and keep the smallest result. With one candidate
+    // this is just "compress"; with several it is the max tier's tournament,
+    // which trades encode time for ratio because no static rule picks the
+    // right codec for arbitrary data.
+    let mut best: Option<(Codec, u8, Vec<u8>)> = None;
+    for (codec, param) in candidates {
+        let packed = match codec {
+            Codec::Store => break,
+            // The per-worker zstd context is reused across chunks; allocating
+            // one per chunk would dominate the cost of small chunks.
+            Codec::Zstd => match comp.as_deref_mut() {
+                Some(c) => c.compress(&data)?,
+                None => codec::compress(Codec::Zstd, level, param, &data)?,
+            },
+            other => codec::compress(other, level, param, &data)?,
+        };
+        if best.as_ref().is_none_or(|(_, _, b)| packed.len() < b.len()) {
+            best = Some((codec, param, packed));
+        }
+    }
+
     // Never let "compression" grow a chunk, and drop the filter with it: a
     // stored chunk is the original bytes, so no transform must be recorded.
-    let (codec, filter, payload) = match packed {
-        Some(p) if p.len() < data.len() => (codec, filter, p),
+    let (codec, param, filter, payload) = match best {
+        Some((c, p, packed)) if packed.len() < data.len() => (c, p, filter, packed),
         _ => {
             crate::filters::Filter::from_id(filter)?.unapply(&mut data);
-            (Codec::Store, 0, data)
+            (Codec::Store, 0, 0, data)
         }
     };
     Ok(Done {
         seq,
         payload,
         codec,
+        param,
         filter,
         unpacked,
         hash,
@@ -385,6 +420,7 @@ fn writer_loop(file: &mut File, rx: Receiver<Result<Done>>, budget: &Budget) -> 
                 packed: d.payload.len() as u64,
                 unpacked: d.unpacked,
                 codec: d.codec.id(),
+                param: d.param,
                 filter: d.filter,
                 hash: d.hash,
             });

@@ -25,6 +25,29 @@ pub struct Manifest {
     /// stream, so the compressor can find redundancy *between* them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub blocks: Vec<Block>,
+    /// How this archive cuts data into chunks, fixed when it was created.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub geometry: Option<Geometry>,
+}
+
+/// Chunking geometry — a property of the *archive*, not of a single
+/// operation.
+///
+/// Deduplication only works when identical data lands on identical chunk
+/// boundaries, so an archive created at one compression tier and later added
+/// to at another must keep cutting the same way. Otherwise every unchanged
+/// file looks new: measured, re-adding an untouched 28 MiB tree at a
+/// different tier stored all of it again and deduplicated nothing.
+///
+/// The compression *method* is free to differ per operation — dedup keys are
+/// content hashes, not codec output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Geometry {
+    pub chunk_min: u32,
+    pub chunk_avg: u32,
+    pub chunk_max: u32,
+    pub solid_block: u64,
+    pub solid_max_file: u64,
 }
 
 /// A solid block is just a byte stream, chunked like any file. Files stored
@@ -58,6 +81,11 @@ pub struct ChunkRec {
     pub packed: u64,
     pub unpacked: u64,
     pub codec: u8,
+    /// Codec-specific setting the decoder must know: PPMd7's model order.
+    /// Zero means "the codec's default", which is also what pre-parameter
+    /// archives contain.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub param: u8,
     /// Reversible transform applied before compression (see `filters`).
     /// 0 = none, which is the common case, so it stays out of the manifest.
     #[serde(default, skip_serializing_if = "is_zero")]

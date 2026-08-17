@@ -37,18 +37,34 @@ impl Codec {
     }
 }
 
-pub fn compress(codec: Codec, level: i32, data: &[u8]) -> Result<Vec<u8>> {
+/// `param` carries codec-specific settings that the decoder must know and
+/// that are cheaper to store per chunk than to fix for all time: for PPMd7 it
+/// is the model order (measurements show no single order wins - order 10 is
+/// better on prose and database records, order 16 on XML and source). Codecs
+/// that need nothing ignore it.
+pub fn compress(codec: Codec, level: i32, param: u8, data: &[u8]) -> Result<Vec<u8>> {
     match codec {
         Codec::Store => Ok(data.to_vec()),
         Codec::Zstd => Ok(zstd::bulk::compress(data, level)?),
         Codec::Lzma2 => lzma2_compress(level, data),
-        Codec::Ppmd7 => ppmd7_compress(data),
+        Codec::Ppmd7 => ppmd7_compress(ppmd7_order(param), data),
     }
 }
 
-pub fn decompress(codec: Codec, data: &[u8], unpacked_len: usize) -> Result<Vec<u8>> {
+/// Returns exactly `unpacked_len` bytes or an error — callers size buffers and
+/// slice solid blocks from that number, so a payload that disagrees with the
+/// manifest must not come back as a short or long buffer.
+pub fn decompress(codec: Codec, data: &[u8], unpacked_len: usize, param: u8) -> Result<Vec<u8>> {
     match codec {
-        Codec::Store => Ok(data.to_vec()),
+        // A stored chunk is its own payload, so the length is the only thing
+        // there is to check; the other codecs get the check for free from the
+        // output buffer they are made to fill.
+        Codec::Store => {
+            if data.len() != unpacked_len {
+                bail!("decompressed chunk size mismatch");
+            }
+            Ok(data.to_vec())
+        }
         Codec::Zstd => {
             let out = zstd::bulk::decompress(data, unpacked_len)?;
             if out.len() != unpacked_len {
@@ -57,7 +73,7 @@ pub fn decompress(codec: Codec, data: &[u8], unpacked_len: usize) -> Result<Vec<
             Ok(out)
         }
         Codec::Lzma2 => lzma2_decompress(data, unpacked_len),
-        Codec::Ppmd7 => ppmd7_decompress(data, unpacked_len),
+        Codec::Ppmd7 => ppmd7_decompress(ppmd7_order(param), data, unpacked_len),
     }
 }
 
@@ -66,7 +82,7 @@ pub fn decompress(codec: Codec, data: &[u8], unpacked_len: usize) -> Result<Vec<
 /// Dictionary ceiling. A chunk never exceeds `archive::MAX_CHUNK`, so a wider
 /// window cannot match anything extra; it only grows the encoder's match
 /// tables (bt4 costs ~11x the dictionary) and the decoder's ring buffer.
-const LZMA2_DICT_MAX: u32 = crate::archive::MAX_CHUNK;
+const LZMA2_DICT_MAX: u32 = 64 * 1024 * 1024;
 
 /// A bare LZMA2 stream carries the LZMA props byte but *not* the dictionary
 /// size, and spending a byte per chunk to store it is not worth it. Both sides
@@ -100,13 +116,21 @@ fn lzma2_dict_size(unpacked_len: usize) -> u32 {
 /// parser pick worse paths on record-structured data with noisy fields, where
 /// it cost 18%. `xz -9` and 7-Zip's `-mx9` both stay at nice_len 64 too.
 fn lzma2_options(level: i32, unpacked_len: usize) -> Lzma2Options {
-    let mut opts = Lzma2Options::with_preset(match level.clamp(1, 22) {
+    let level = level.clamp(1, 22);
+    let mut opts = Lzma2Options::with_preset(match level {
         1..=2 => 1,
         3..=5 => 2,
         6..=8 => 4,
         9..=11 => 5,
         _ => 6,
     });
+    // Presets 7..9 differ from 6 only in dictionary size, which we override
+    // anyway, so the max tier buys its extra effort the way `xz -e` does: by
+    // searching out to the longest match LZMA can encode. Measured on Silesia
+    // slices, that is worth 0.2-1 percentage point.
+    if level >= 18 {
+        opts.lzma_options.nice_len = 273;
+    }
     opts.lzma_options.dict_size = lzma2_dict_size(unpacked_len);
     opts
 }
@@ -137,14 +161,27 @@ fn lzma2_decompress(data: &[u8], unpacked_len: usize) -> Result<Vec<u8>> {
 /// inside a 4 MiB chunk costs far more than a higher order gains: measured on
 /// three 4 MiB samples of real text, order 10 beat zstd-19 on all of them
 /// (-3.5%, -19.6%, -8.0%) while order 12 and 16 each lost on one by 5-6%.
-const PPMD7_ORDER: u32 = 10;
+const PPMD7_ORDER_DEFAULT: u8 = 10;
+
+/// Orders worth trying. No single one wins: measured on 32 MiB units, order 10
+/// is 3-5% better on prose, wiki text and database records, order 16 is 5-8%
+/// better on XML and source code.
+pub const PPMD7_ORDERS: [u8; 2] = [10, 16];
+
+/// PPMd7 accepts orders 2..=64; a manifest is untrusted input, so clamp
+/// instead of trusting it, and treat 0 as "the default" for chunks written
+/// before the parameter existed.
+fn ppmd7_order(param: u8) -> u32 {
+    let o = if param == 0 { PPMD7_ORDER_DEFAULT } else { param };
+    o.clamp(2, 64) as u32
+}
 
 /// Suballocator pool ceiling — the memory a PPMd7 worker holds on top of its
 /// chunk buffers, and the number `Tier::worker_memory()` needs. 64 MiB is
 /// where a full 4 MiB chunk stops restarting the model; below it the ratio
 /// falls off a cliff (48 MiB was 9% worse on one sample), above it nothing
 /// changes.
-const PPMD7_MEM_MAX: u32 = 64 << 20;
+const PPMD7_MEM_MAX: u32 = 256 << 20;
 
 /// Pool for a chunk of `unpacked_len` bytes: 32x the data, which is where the
 /// output stops changing at every size measured, so small chunks neither pay
@@ -156,17 +193,17 @@ fn ppmd7_mem_size(unpacked_len: usize) -> u32 {
         .clamp(1 << 20, PPMD7_MEM_MAX as u64) as u32
 }
 
-fn ppmd7_compress(data: &[u8]) -> Result<Vec<u8>> {
-    let mut enc = Ppmd7Encoder::new(Vec::new(), PPMD7_ORDER, ppmd7_mem_size(data.len()))?;
+fn ppmd7_compress(order: u32, data: &[u8]) -> Result<Vec<u8>> {
+    let mut enc = Ppmd7Encoder::new(Vec::new(), order, ppmd7_mem_size(data.len()))?;
     enc.write_all(data)?;
     // No end marker: the manifest carries the exact unpacked length, so the
     // marker would only add bytes to every chunk.
     Ok(enc.finish(false)?)
 }
 
-fn ppmd7_decompress(data: &[u8], unpacked_len: usize) -> Result<Vec<u8>> {
+fn ppmd7_decompress(order: u32, data: &[u8], unpacked_len: usize) -> Result<Vec<u8>> {
     let mut out = vec![0u8; unpacked_len];
-    let mut dec = Ppmd7Decoder::new(data, PPMD7_ORDER, ppmd7_mem_size(unpacked_len))?;
+    let mut dec = Ppmd7Decoder::new(data, order, ppmd7_mem_size(unpacked_len))?;
     dec.read_exact(&mut out)?;
     Ok(out)
 }
@@ -288,8 +325,8 @@ mod tests {
     }
 
     fn round_trip(codec: Codec, level: i32, data: &[u8]) -> Vec<u8> {
-        let packed = compress(codec, level, data).expect("compress failed");
-        let out = decompress(codec, &packed, data.len()).expect("decompress failed");
+        let packed = compress(codec, level, 0, data).expect("compress failed");
+        let out = decompress(codec, &packed, data.len(), 0).expect("decompress failed");
         assert_eq!(out, data, "{codec:?} level {level} did not round-trip");
         packed
     }
@@ -379,8 +416,8 @@ mod tests {
         let data = text(300 * 1024);
         for codec in ALL {
             for level in LEVELS {
-                let a = compress(codec, level, &data).unwrap();
-                let b = compress(codec, level, &data).unwrap();
+                let a = compress(codec, level, 0, &data).unwrap();
+                let b = compress(codec, level, 0, &data).unwrap();
                 assert_eq!(a, b, "{codec:?} level {level} is not deterministic");
             }
         }
@@ -392,19 +429,19 @@ mod tests {
     fn corrupted_input_errors() {
         let data = text(200 * 1024);
         for codec in [Codec::Zstd, Codec::Lzma2, Codec::Ppmd7] {
-            let packed = compress(codec, 12, &data).unwrap();
+            let packed = compress(codec, 12, 0, &data).unwrap();
 
             let truncated = &packed[..packed.len() / 2];
             assert!(
-                decompress(codec, truncated, data.len()).is_err(),
+                decompress(codec, truncated, data.len(), 0).is_err(),
                 "{codec:?} accepted a truncated payload"
             );
             assert!(
-                decompress(codec, &random(packed.len()), data.len()).is_err(),
+                decompress(codec, &random(packed.len()), data.len(), 0).is_err(),
                 "{codec:?} accepted a random payload"
             );
             assert!(
-                decompress(codec, &[], data.len()).is_err(),
+                decompress(codec, &[], data.len(), 0).is_err(),
                 "{codec:?} accepted an empty payload"
             );
 
@@ -414,8 +451,33 @@ mod tests {
             let mut flipped = packed.clone();
             let last = flipped.len() - 1;
             flipped[last] ^= 0x80;
-            if let Ok(out) = decompress(codec, &flipped, data.len()) {
+            if let Ok(out) = decompress(codec, &flipped, data.len(), 0) {
                 assert_eq!(out.len(), data.len());
+            }
+        }
+    }
+
+    /// `unpacked_len` comes from the manifest, which an attacker controls
+    /// independently of the payload. Whatever it says, the buffer handed back
+    /// must be exactly that long or the call must fail: `extract_one` slices a
+    /// solid block with lengths taken from the same manifest, so a codec that
+    /// quietly returned a different amount would hand one file another file's
+    /// bytes. Store is the one that has to be told, having no output buffer of
+    /// its own to be sized by.
+    #[test]
+    fn decompress_returns_exactly_the_declared_length() {
+        let data = text(50 * 1024);
+        for codec in ALL {
+            let packed = compress(codec, 12, 0, &data).unwrap();
+            for claim in [0, 1, data.len() - 1, data.len() + 1, 4 * data.len()] {
+                if let Ok(out) = decompress(codec, &packed, claim, 0) {
+                    assert_eq!(
+                        out.len(),
+                        claim,
+                        "{codec:?} returned {} bytes for a declared {claim}",
+                        out.len()
+                    );
+                }
             }
         }
     }
@@ -426,9 +488,9 @@ mod tests {
     #[test]
     fn strong_codecs_beat_zstd_on_text() {
         let data = text(CHUNK);
-        let zstd = compress(Codec::Zstd, 19, &data).unwrap().len();
-        let lzma2 = compress(Codec::Lzma2, 19, &data).unwrap().len();
-        let ppmd = compress(Codec::Ppmd7, 19, &data).unwrap().len();
+        let zstd = compress(Codec::Zstd, 19, 0, &data).unwrap().len();
+        let lzma2 = compress(Codec::Lzma2, 19, 0, &data).unwrap().len();
+        let ppmd = compress(Codec::Ppmd7, 19, 0, &data).unwrap().len();
         assert!(lzma2 < zstd, "lzma2 {lzma2} >= zstd19 {zstd}");
         assert!(ppmd < zstd, "ppmd7 {ppmd} >= zstd19 {zstd}");
     }
@@ -445,10 +507,10 @@ mod tests {
             for codec in [Codec::Zstd, Codec::Lzma2, Codec::Ppmd7] {
                 for level in LEVELS {
                     let t = Instant::now();
-                    let packed = compress(codec, level, &data).unwrap();
+                    let packed = compress(codec, level, 0, &data).unwrap();
                     let enc = t.elapsed();
                     let t = Instant::now();
-                    let out = decompress(codec, &packed, data.len()).unwrap();
+                    let out = decompress(codec, &packed, data.len(), 0).unwrap();
                     let dec = t.elapsed();
                     assert_eq!(out, data);
                     let mb = data.len() as f64 / (1024.0 * 1024.0);
