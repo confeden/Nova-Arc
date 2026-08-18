@@ -60,12 +60,11 @@
 - Commit = manifest write → fsync → footer write → fsync (the barrier is
   required: without it a valid footer can point at a torn manifest).
 - Footer self-hash covers its own absolute offset, so a `.narc` stored inside
-  another archive cannot be mistaken for a commit. Readers verify the
-  manifest of each footer candidate and resume the backward scan on failure
-  (≤64 candidates).
+  another archive cannot be mistaken for a commit. Readers verify each footer
+  candidate's manifest and resume the backward scan on failure (≤64).
 - Packing invariant: the writer appends chunks in submission order, so the
-  reader predicts each chunk index as `base + submission index` and builds
-  file entries without waiting for compression.
+  reader predicts each index as `base + submission index` and builds file
+  entries without waiting for compression.
 - PROGRESS CONTRACT (`Progress`, `Phase`, `archive::Reporter`). `bytes_done` =
   source bytes whose work is FINISHED, fed by the writer; `bytes_read` = what
   the reader took off disk, up to a whole in-flight budget ahead. Monotone,
@@ -75,57 +74,52 @@
   pipeline, or the reader sleeps in `Budget::acquire` holding it and stalls the
   writer. Throttling lives in core (only core knows the totals); clocks live in
   the GUI — do NOT add a timer thread to core.
-- Memory model: `budget ≈ 32 MiB base + workers × (zstd tables + 8 MiB) +
-  queued chunks`; workers are capped by the budget, then in-flight bytes are
-  capped by the workers. zstd table cost measured per tier in
-  `Tier::worker_memory()` (fast 4, normal 40, max 56 MiB).
+- Memory model: `budget ≈ 32 MiB base + workers × (tables + 8 MiB) + queued`;
+  workers capped by the budget, then in-flight bytes capped by the workers.
+  Table cost per tier in `Tier::worker_memory()` (fast 4, normal 40, max 56).
 - Chunk hash = blake3(uncompressed)[..16]; serves dedup AND extract integrity.
-  Dead (unreferenced) chunk records stay in manifest as dedup sources until compact.
+  Dead chunk records stay in the manifest as dedup sources until compact.
 - PPMd7 order (10) and pool formula (32x chunk, cap 64 MiB) are FORMAT
-  CONSTANTS - not stored per chunk, so changing them breaks old archives.
-  Order 10 measured better than 12/16 on 4 MiB chunks: a model restart when
-  the pool runs out costs more than a deeper model gains.
-- LZMA2 presets 6..9 differ only in dictionary size, which we override with
-  the 4 MiB chunk cap, so max raises nice_len instead (xz -e style).
+  CONSTANTS — not stored per chunk, so changing them breaks old archives. Order
+  10 beat 12/16 on 4 MiB chunks: a pool-exhaustion restart costs more than
+  depth gains.
+- LZMA2 presets 6..9 differ only in dictionary size, which we override with the
+  chunk cap, so max raises nice_len instead (xz -e style).
 - Codec ids: 0=store, 1=zstd, 2=LZMA2, 3=PPMd7. Filter ids: 0=none, 1=BCJ x86,
   2..=33=delta(id-1), 34=deflate (preflate 0.7.x, also PDF), 35=JPEG (lepton
   0.5.x), 36=x86 branch-target split (narc's own). A NEW id must never be added
   by widening the delta range — `2..=MAX_DELTA_ID => Delta(id - 1)` would have
   made 34 decode as Delta(33), silently. Per-chunk raw fallback if the result is
   not smaller, and then the filter byte MUST be cleared too.
-- Fixed order: pack = filter → compress; unpack = decompress → unfilter.
-  Chunk hash covers the ORIGINAL bytes, so dedup and integrity are
-  filter-independent (and the hash check also proves the filter round-tripped).
-- BCJ always runs with start_offset 0, never the chunk's file position:
+- Fixed order: pack = filter → compress; unpack = decompress → unfilter. The
+  chunk hash covers the ORIGINAL bytes, so dedup and integrity are
+  filter-independent, and the hash check proves the filter round-tripped.
+- BCJ always runs with start_offset 0, never the chunk's file position —
   position-dependent output would break dedup. Cost: one unconverted
-  instruction per chunk boundary.
+  instruction per boundary.
 - Solid blocks: files < `Geometry::chunked_from` (256 KiB fast/normal, 1 MiB
   MAX) are sorted by extension, concatenated into `Geometry::unit` streams
   (4/16/32 MiB) and compressed as ONE unit; a FileEntry then holds one `Extent`
   into it. Block size is bounded ON PURPOSE: editing one member rewrites one
   block. Boundaries are content-defined per file with a hard flush at 2x target,
   so realized blocks run LARGER than target, never smaller.
-- A content-defined cut may only fire at or above HALF the target. The low tail
-  of the exponential size distribution is pure loss, and it also made boundaries
-  LESS stable: an edit changes the item's hash, so an unguarded cut can appear
-  or vanish and shift everything after it. MEASURED both ways.
+- A content-defined cut may only fire at or above HALF the target: the low tail
+  is pure loss, and it also made boundaries LESS stable — an edit changes the
+  item's hash, so an unguarded cut can appear or vanish. MEASURED both ways.
 - A unit's codec+filter come from a BYTE-MAJORITY VOTE of the per-file verdicts,
   never from the unit's head sample (`Packer::unit_plan`). One sub-4 KiB `.flac`
   sorted ahead of `.go` made the head sample say "already compressed" and 8.36
   MB of source was stored raw. Only a unit with NO voters reads the head.
-- REALIZED unit geometry, `NARC_UNIT_TRACE` on test/corpus at max (113.41 MiB,
-  5751 files): only 6 units; plain mean 18.90 MiB, size-weighted 41.42 MiB; 79%
-  of the bytes in units >= 16 MiB. The cut rule is uniform (fast tier: 17 hash
-  cuts vs 18.6 expected). So "units land in the 4-16 MiB penalty band" is FALSE.
-- Two-phase pipeline: phase 1 `analyze::plan()` (format magic → content class
-  → trial compress) returns codec+filter; phase 2 per-chunk compression.
-  Tiers: fast=zstd3, normal=zstd12, max=LZMA2/PPMd7 by class.
-- `HEAD_SAMPLE` = 1 MiB, and the size is load-bearing: deflate leaves matches
-  megabytes apart, so a zip written at level 1 reads as +0.02% (noise) on a
-  64 KiB zstd sample and −25.6% on a 1 MiB one. The bytes cost nothing —
-  `add_file` chains the head in front of the file. Sub-tests keep their own caps
-  (`TRIAL_SAMPLE` 64 KiB; the delta detector MUST stay capped, it runs one
-  entropy pass per candidate distance).
+- REALIZED unit geometry (`NARC_UNIT_TRACE`, test/corpus at max, 5751 files):
+  6 units, size-weighted mean 41.42 MiB, 79% of bytes in units >= 16 MiB. The
+  cut rule is uniform. So "units land in the 4-16 MiB penalty band" is FALSE.
+- Two-phase pipeline: `analyze::plan()` (magic → class → trial compress) gives
+  codec+filter, then per-chunk compression. fast=zstd3, normal=zstd12,
+  max=LZMA2/PPMd7 by class.
+- `HEAD_SAMPLE` = 1 MiB, load-bearing: deflate leaves matches megabytes apart,
+  so a level-1 zip reads as +0.02% on a 64 KiB sample and −25.6% on a 1 MiB one.
+  Free — `add_file` chains the head in front of the file. Sub-tests keep their
+  caps (`TRIAL_SAMPLE` 64 KiB; the delta detector MUST stay capped).
 - Precompressed magic does NOT mean store — it is a claim about the FORMAT, not
   the bytes, and storing on it alone cost 1.12 MB on a 4.93 MiB corpus. A 1 MiB
   zstd-1 trial must save >= 1%, which separates cleanly: compressible deflate
@@ -134,7 +128,7 @@
   manifest in RAM. Keep it that way — weak-PC extraction is a hard requirement.
 - Archive paths: relative, UTF-8, '/'-separated; `paths::sanitize` on extract
   rejects traversal/absolute/drive/ADS/reserved-device/trailing-dot names.
-- Owner's machine: 32 GB RAM (often half used), RTX 5060 Ti 8 GB, Windows 11.
+  Owner's machine: 32 GB RAM, RTX 5060 Ti 8 GB, Windows 11, 8 logical cores.
 
 ## Gotchas
 
@@ -157,13 +151,14 @@
 - Windows: pass a path with spaces to the exe in QUOTES or Start-Process
   -ArgumentList splits it and argv[1] is truncated (this fooled a GUI test).
 - .cmd launchers mangle Cyrillic (OEM codepage); use a BOM'd .ps1 instead.
+- `zpaqfranz x ... -to DIR` needs a TRAILING SLASH or it reads the target as a
+  single output file, refuses, and a benchmark records the refusal as the
+  decode time. Cost an hour of "zpaqfranz decodes in 0.07 s".
 - zstd already shrinks its window to the source size, so capping WindowLog
   for 4 MiB chunks changes nothing; per-worker memory is match tables.
 - A formatter hook rewrites files after every Write/Edit in this repo.
-- zstd/blake3 crates build C via MSVC — fine here, but keep pure-Rust
-  fallbacks in mind for exotic targets.
-- GitHub repo confeden/Nova-Arc pre-existed with a 2-line README initial
-  commit; local main is based on it.
+- zstd/blake3 crates build C via MSVC — fine here; pure-Rust fallbacks only
+  matter for exotic targets.
 - git global identity: user.name "Brent", email confeden@cryptolab.net.
 
 ## Resource policy (decided, from research 09)
@@ -183,32 +178,51 @@
 ## Compression design (measured, v0.6 max tier)
 
 - No single codec wins: PPMd7 beats LZMA2 13-24% on prose/wiki/db-records,
-  LZMA2 beats PPMd7 16% on binaries and 10-20% on source blocks. So MAX runs
-  a per-unit tournament (LZMA2 + PPMd7 orders 10 & 16), keeps the smallest.
-  Fast/normal trust the analyzer's single pick.
+  LZMA2 beats PPMd7 16% on binaries and 10-20% on source. MAX runs a per-unit
+  tournament (LZMA2 + PPMd7 orders 10 & 16); fast/normal trust the analyzer.
 - Chunk size = compression unit = edit granularity. fast/normal 256K/1M/4M;
-  max 1M/4M/16M (FastCDC hard-caps max at 16 MiB). Bigger = better ratio,
-  costlier edits. Solid block target: 4/16/32 MiB by tier.
+  max 1M/4M/16M (FastCDC caps max at 16 MiB). Solid target 4/16/32 MiB by tier.
 - Solid block boundaries are content-defined PER FILE (cut prob = size/target
-  from the file's own blake3), so one file changing size never shifts other
-  boundaries. A size-accumulator rule cost 17 MiB growth for a 1-line edit.
-- Measured vs 7-Zip 26.02, CURRENT build (re-measure when a filter lands; these
-  drifted twice already): Silesia (202 MiB) narc max 43,674,657 B / 75 s vs
-  7z -mx9 ~47 MiB / 49 s — narc AHEAD. Source tree (113.41 MiB): narc 9,292,017 B
-  vs 7z 9,131,720 B → +160,297 B (+1.8%), from +767,040 B before the cut floor.
-- Cut floor + byte-majority verdict, measured on test/corpus when they landed:
-  fast −7.6% with its one-line-edit cost halved, normal −0.2%, max −4.0%,
-  Silesia −0.3% — every axis improved or held. The fast-tier win is the VOTE
-  (the floor ALONE made fast 5.1 MB worse, by enlarging one stored-raw unit);
-  max is the floor.
+  from the file's own blake3). A size-accumulator rule cost 17 MiB for a
+  one-line edit, because one file's length shifted every later boundary.
+- WHERE WE ACTUALLY STAND, measured on this machine against five references
+  (`test/bench-std.sh`; binaries in `D:/Programs/compressors`). narc max is
+  clearly AHEAD of the LZ family and clearly BEHIND the CM family:
+  · enwik8  narc 22,466,101 / 71.7 s · zpaqfranz -m5 19,625,056 (−12.6%) ·
+    kanzi -l9 20,035,684 (−10.8%) · 7z -mx9 24,799,487 (+10.4%) · xz 24,831,656
+  · Silesia narc 43,674,657 / 54.9 s · zpaqfranz -m5 39,865,713 (−8.7%) ·
+    kanzi -l9 41,857,930 (−4.2%) · 7z -mx9 48,688,268 (+11.5%) · xz 48,449,928
+  · enwik9  narc 195,010,922 / 238.9 s · zpaqfranz -m5 168,590,780 (−13.5%) ·
+    kanzi -l9 173,379,111 (−11.1%) · 7z -mx9 210,604,386 (+8.0%). Decode: narc
+    160.8 s vs 7z 2.7 s — PPMd7 on a gigabyte of text.
+  · Source tree: narc 9,292,017 vs 7z 9,131,720 → +1.8%.
+- PPMd7 AS THE TEXT CODEC IS DOMINATED, measured on enwik8: kanzi -l9 is 10.8%
+  SMALLER (20,035,684 vs 22,466,101), 5.5x faster to compress (13.1 s vs 71.7 s)
+  AND faster to decompress (13.3 s vs 18.3 s). Not a ratio-for-time trade — it
+  loses on all three axes at once. The remaining unknown is model memory, which
+  is the thing to measure before replacing it.
+- CORRECTION, and the old claim is now dead: narc max is NOT faster than 7-Zip.
+  MEASURED Silesia 54.9 s vs 7z 44.4 s, enwik8 71.7 s vs 43.3 s. The "6.8 s vs
+  49 s" figure predates the tournament and big units and must not be requoted.
+- The DECODE advantage is real but DATA-DEPENDENT, and the difference is which
+  codec the tournament picks. Silesia (mostly LZMA2): narc 6.5 s vs kanzi -l9
+  50.5 s — 7.7x faster. enwik8 (PPMd7 wins): narc 18.3 s vs kanzi 13.3 s —
+  SLOWER, and kanzi is also 10.8% smaller there. PPMd is symmetric, so on text
+  it costs us both axes at once. That is an argument for a CM text codec, not
+  against one: we are already paying CM's decode price without its ratio.
+- kanzi -l7 is the point worth staring at: Silesia 47,308,780 B in 6.15 s —
+  roughly 7-Zip's ratio at seven times its speed. That is the fast tier's bar.
+- Cut floor + byte-majority verdict, on test/corpus when they landed: fast
+  −7.6% with its edit cost halved, normal −0.2%, max −4.0%, Silesia −0.3%. The
+  fast-tier win is the VOTE (the floor ALONE made fast 5.1 MB worse); max is
+  the floor.
 - Edit cost at max is ~4.7 MiB and ~40 s, NOT the "0.4-1 s / ~98 KiB" of the
-  old small-block era: the edited file lives in a 30-60 MB unit. Cheap edits are
-  now a fast/normal-tier property (0.73 / 3.30 MiB). Do not quote the old number.
-- Gap decomposition, measured BEFORE the floor (767,040 B): 81% sat in files
-  >= 256 KiB, and 54% of the WHOLE gap came from ONE cut splitting a 22.57 MiB
-  run of near-duplicate .exe builds — which is exactly what the floor fixed.
-  narc's own manifest is 91-92 KB (12%), real cost rather than noise; the
-  remaining 171 KB was the class flush, tried and REVERTED (Negative knowledge).
+  small-block era: the edited file lives in a 30-60 MB unit. Cheap edits are now
+  a fast/normal-tier property (0.73 / 3.30 MiB).
+- Gap decomposition BEFORE the floor (767,040 B): 81% in files >= 256 KiB, and
+  54% of the WHOLE gap from ONE cut splitting a 22.57 MiB run of near-duplicate
+  .exe builds — what the floor fixed. The manifest is 91-92 KB (12%), real cost;
+  the last 171 KB was the class flush, tried and REVERTED.
 - MANIFEST CODEC: a manifest of 128 KiB or more is offered to LZMA2 and the
   smaller result wins. MEASURED on the 5751-file source tree (682,799 B raw):
   zstd 9 92,043 B · zstd 19 84,565 B · LZMA2 74,690 B (−18.9%). Every archive
@@ -218,8 +232,8 @@
   byte being a chunk control — so there is no format field and every manifest
   ever written still decodes. Front-coding the paths would save another 7,663 B;
   not done, it is a real format change.
-- Small-file path anchor: narc's own encoder is 0.24% BETTER than liblzma -9e on
-  identical boundaries, so its LZMA2 parameters are not a loss.
+- narc's own encoder is 0.24% BETTER than liblzma -9e on identical boundaries,
+  so its LZMA2 parameters are not the problem.
 - Max-tier tournament on a source tree: LZMA2 wins 5 of 6 units = 99.94% of
   stored bytes; PPMd7 order 10 won one 35 KB unit, order 16 never won.
 - Diagnostics: `NARC_UNIT_TRACE=<file>` logs one line per unit as it is built
@@ -239,28 +253,22 @@
   68.6% .dll) + `test/ff-{dll,ja,rest}`. Probes live in `test/probe-preflate`
   (own crate, outside the workspace) and round-trip what they measure.
 - MIN_STREAM = 64 bytes, MEASURED; the first guess of 4096 cost 15 percentage
-  points (4096 −23.6% · 1024 −34.9% · 256 −38.4% · 64 −38.6%). "A correction
-  record cannot pay for itself on 2 KB" is true per FILE and false inside a
-  unit, where a thousand plaintexts compress against each other.
-- SHIPPED and measured end to end. Deflate corpus: narc 4,047,424 B →
-  **2,414,283 B (−40.4%)**, 7z -mx9 4,047,465 B — better than the probe
-  predicted, because PPMd7 wins the tournament on the recovered plaintexts.
-  Byte-exact on all 28 files; peak RAM 152 MiB at `--memory 256M`.
-- JPEG (lepton, filter id 35) SHIPPED. test/photos, 6 camera-sized JPEGs /
-  16.5 MiB: raw 17,324,730 B · 7z -mx9 17,289,234 B (−0.20%) ·
-  **narc 13,990,872 B (−19.24%), i.e. −19.1% against 7-Zip**. Byte-exact
-  extraction on every file. This is the family-archive case: photographs are
-  the bulk of it and the one thing every archiver gives up on.
-  · The stored payload is the LEPTON FORM ITSELF, not a codec's output. Lepton
-    is already entropy-coded and neither LZMA2 nor PPMd7 ever beat it, so
-    `compress_job` now keeps the smallest of {codec over filtered, filtered
-    verbatim, original}. A Store record carrying a filter is new; it is safe
-    because `filtered` records the coded length and an old reader rejects
-    filter id 35 rather than guessing.
+  points. "A correction record cannot pay for itself on 2 KB" is true per FILE
+  and false inside a unit, where a thousand plaintexts compress together.
+- SHIPPED. Deflate corpus: narc 4,047,424 → **2,414,283 B (−40.4%)**, 7z -mx9
+  4,047,465 B. Byte-exact on all 28 files; peak RAM 152 MiB at `--memory 256M`.
+- JPEG (lepton, id 35) SHIPPED. test/photos, 6 camera JPEGs / 16.5 MiB: raw
+  17,324,730 · 7z -mx9 17,289,234 (−0.20%) · **narc 13,990,872 B (−19.1% vs
+  7-Zip)**. Byte-exact on every file. Photographs are the bulk of a family
+  archive and the one thing every archiver gives up on.
+  · The stored payload is the LEPTON FORM ITSELF, not a codec's output — it is
+    already entropy-coded and no codec ever beat it, so `compress_job` keeps the
+    smallest of {codec over filtered, filtered verbatim, original}. A Store
+    record carrying a filter is new and safe: `filtered` records the coded
+    length, and an old reader rejects id 35 rather than guessing.
   · Lepton settings are a FORMAT CONSTANT for id 35, like PPMd7's order and
     pool: `compat_lepton_vector_write`, single-threaded. Its 16386-pixel limit
-    means gallery panoramas are not transformed (an 83.8 MB Commons panorama was
-    refused; narc could not have given it one unit anyway).
+    means gallery panoramas are not transformed.
   · Cost: lepton is slow, ~0.8 MB/s per thread.
 - PDF SHIPPED, reusing filter id 34 (it is deflate; nothing about the format
   changed). test/pdfs, 8,536,741 B: narc max 7,626,464 → **5,290,810 B
@@ -278,25 +286,20 @@
     was the reason it was deferred and it was WRONG: a stream's bytes are found
     the same way either way, and a wrong range cannot corrupt anything — preflate
     must consume exactly what it is handed, and the packer round-trips the unit.
-  · Rules the scanner earns its correctness from: `stream` must follow `>>`;
-    `/Filter`'s FIRST name must be `/FlateDecode` (`[/ASCII85Decode
-    /FlateDecode]` is text on disk); `/Length` needs whitespace after it or
-    `/Length1` — a Type 1 font's segment size — is read as the length; an
-    indirect `/Length 9 0 R` falls back to `endstream`, and a MISSING
-    `endstream` stops the whole scan.
+  · Scanner rules: `stream` must follow `>>`; `/Filter`'s FIRST name must be
+    `/FlateDecode`; `/Length` needs whitespace after it or `/Length1` (a Type 1
+    font segment size) is read as the length; an indirect `/Length 9 0 R` falls
+    back to `endstream`, and a MISSING `endstream` stops the whole scan.
   · EVERY per-candidate backward scan needs a FLOOR at the previous candidate's
     end, not just a window. With a fixed 16 KiB lookback, `%PDF-` + `>>stream`
-    repeated clears both cheap gates and matches neither `obj` nor `/Filter`, so
-    both sweeps ran in full: ~4096 comparisons per input byte, MEASURED 2.9 s
-    per MiB and 47 s for 16 MiB, against 45 ms for 16 MiB of real PDF. The magic
-    alone is the entry ticket, so this was minutes of a packing worker for
-    nothing. The floor makes it linear (16 MiB: 47 s → 0.012 s) and is also
-    STRICTER — a dictionary cannot begin inside the stream before it.
+    repeated matched neither `obj` nor `/Filter`, so both sweeps ran in full:
+    MEASURED 47 s for 16 MiB against 45 ms of real PDF, and the magic alone is
+    the entry ticket. The floor makes it linear (47 s → 0.012 s) and is STRICTER
+    — a dictionary cannot begin inside the stream before it.
   · Measured coverage: 74.1% of corpus bytes are FlateDecode, 72.6% of them
     modelled, and the recovered plaintext is **5.96x** the deflate it replaces.
-  · Diagnostics: `test/probe-preflate --bin pdfscan <dir>` (per file: streams,
-    coverage, modelling rate, plaintext) and `--bin pdfhostile` (the timing
-    above, so the floor cannot silently regress).
+  · Diagnostics: `test/probe-preflate --bin pdfscan` (streams, coverage,
+    modelling rate) and `--bin pdfhostile` (the timing above).
 - Installed-program corpus (test/firefox, 341.7 MiB, 68.6% .dll, 28% omni.ja):
   7z -mx9 87,566,439 B, narc 95,721,462 B → **+9.3%, narc's weakest case**.
   Roundtrip byte-exact. Findings from it:
@@ -305,46 +308,36 @@
     units with no BCJ at all. It is now cast per CHUNK (`Packer::current` +
     `place`), worth 506,834 B here.
   · The gap is ALL x86: .dll +11.8%, omni.ja +0.1%, everything else −6.2%.
-  · SOLIDITY IS NOT THE CAUSE, on the 234.3 MiB DLL set with LZMA2 -9e: solid
-    + BCJ 70,463,272 B · 64 MiB units + BCJ 71,410,491 · 32 MiB 72,082,105 ·
-    no filter 72,509,466. Unit geometry costs 1.3%, in-place BCJ is worth only
-    2.8% here, and 7-Zip sits 8.7% BELOW the solid-with-BCJ number: the
-    difference is the FILTER, not the block size.
+  · SOLIDITY IS NOT THE CAUSE (234.3 MiB DLL set, LZMA2 -9e): solid+BCJ
+    70,463,272 B · 64 MiB units 71,410,491 · 32 MiB 72,082,105 · no filter
+    72,509,466. Geometry costs 1.3%, in-place BCJ is worth 2.8%, and 7-Zip sits
+    8.7% BELOW solid-with-BCJ: the difference is the FILTER, not the size.
   · 7-Zip's advantage is BCJ2: it routes the 4-byte call/jump targets into
     separate streams so high-entropy addresses stop interrupting the code.
     CORRECTION to research 16, which listed BCJ2 as "the other free one" —
     `lzma-rust2` 0.19 ships a BCJ2 **decoder only**, so encoding means writing
     the transform. narc's private container needs no 7z compatibility.
-  · SHIPPED as filter id 36, narc's own transform (no external version to pin).
-    Firefox 95,721,462 → **93,467,847 B (−2.4%)**, source tree 9,507,025 →
-    **9,309,370 B (−2.1%)**, Silesia −14,744 B; photos and the deflate corpus
-    unchanged. Gap to 7-Zip: Firefox +9.3% → **+6.7%**, source tree +4.1% →
-    **+1.9%**. Byte-exact roundtrip on all of them.
+  · SHIPPED as filter id 36, narc's own transform. Firefox 95,721,462 →
+    **93,467,847 B (−2.4%)**, source tree → **9,309,370 B (−2.1%)**, Silesia
+    −14,744 B. Gap to 7-Zip: Firefox +9.3% → **+6.7%**, source +4.1% → +1.9%.
   · THE RULE, and three that measured worse. Take a site when the absolute
-    target lands INSIDE the buffer (68,893,556 B at 64 MiB units). No test at
-    all: 68,994,337 B. liblzma's position-independent top-byte-is-00-or-FF test:
-    72,488,469 B — WORSE than not splitting, because at a 64 MiB unit the
-    addresses land in 0..64M and the top byte is 0x01-0x03. Gating on
-    displacement magnitude: 69.5-71.1 MB at reaches of 1-16 MiB, all worse.
-    The width of the accepted range is what matters, and the unit size bounds
-    it. PRICED, answer no: on the DLL set, 32 MiB units cost +1.7%, 128 MiB buys
-    −1.1%, and 256 MiB — the whole corpus in one unit, no editability at all —
-    buys −4.0% while still sitting 2.8% above 7-Zip. Unit size is a WEAK lever;
-    the residual is the filter's decision quality (BCJ2 learns a probability per
-    site, this applies a fixed test), and the rest is the solidity narc
-    deliberately trades away for cheap edits.
-  · Concatenating the split's three streams into one unit buffer, which is what
-    narc does, costs NOTHING against compressing them separately (−0.01%), so
-    one codec per unit is no handicap here.
+    target lands INSIDE the buffer: 68,893,556 B at 64 MiB units, vs 68,994,337
+    with no test, 72,488,469 with liblzma's top-byte-is-00-or-FF test (WORSE
+    than not splitting — at 64 MiB the addresses land in 0..64M and the top byte
+    is 0x01-0x03), and 69.5-71.1 MB gating on displacement magnitude. The WIDTH
+    of the accepted range is what matters, and the unit size bounds it. Unit
+    size PRICED and rejected: 128 MiB buys −1.1%, 256 MiB (no editability at
+    all) −4.0% and still 2.8% above 7-Zip. The residual is the filter's decision
+    quality — BCJ2 learns a probability per site, this applies a fixed test.
+  · Concatenating the split's three streams into one unit buffer costs NOTHING
+    against compressing them separately (−0.01%).
   · The site COUNT is in the header and is load-bearing: the decoder walks a
     stream the displacement bytes are gone from, so at the tail it finds one
     opcode more than the encoder did.
   · Per-unit LZMA lc/lp/pb — MEASURED AND REJECTED. Worth 1.2% on the target
-    stream alone, but on whole units of real data the best of six parameter sets
-    beats the default by 0.13% (source), 0.04% (dll), 0.16% (omni.ja) and 0.01%
-    (jpeg). The 4-byte-record win does not generalise, and the target stream
-    cannot get its own parameters without splitting the unit into two coder
-    streams. The free `param` byte stays free.
+    stream alone, but on whole units the best of six parameter sets beats the
+    default by 0.01-0.16%. It does not generalise, and the target stream cannot
+    get its own parameters without splitting the unit into two coder streams.
 - HOW IT IS WIRED, and these are FORMAT RULES, not implementation detail.
   `ChunkRec.filtered` (0 = "same as unpacked") is the length the CODEC produced;
   `unpacked` keeps its one meaning forever, the ORIGINAL length that `hash`
@@ -362,15 +355,13 @@
   the transformed form may not exceed `MAX_CODED_CHUNK` (256 MiB), charged as
   the pieces are BUILT and checked again before any decode allocation, so a
   bomb drives memory at neither end.
-  · THE CODED-LENGTH BOUND BELONGS IN `compress_job`, beside `filtered = data
-    .len()`, and nowhere else. Only that line knows the number that reaches the
-    manifest, and `verify_chunk` REFUSES a coded length above the cap — so an
-    unchecked one is an archive narc writes and then cannot extract, found when
-    the source is gone. Per-filter budgets do not substitute: `deflate_encode`
-    charged plaintexts and corrections but not the container's own bytes, which
-    `encode` also emits, so an ordinary ~57 MiB PDF cleared a 256 MiB budget and
-    produced more than 256 MiB. Both are fixed; the second is now belt to the
-    first's braces.
+  · THE CODED-LENGTH BOUND BELONGS IN `compress_job`, beside `filtered =
+    data.len()`, and nowhere else: only that line knows the number that reaches
+    the manifest, and `verify_chunk` REFUSES a coded length above the cap — an
+    unchecked one is an archive narc writes and cannot extract. Per-filter
+    budgets do not substitute: `deflate_encode` charged plaintexts but not the
+    container bytes `encode` also emits, so a ~57 MiB PDF cleared a 256 MiB
+    budget and produced more.
   · Never size a Vec from a count a payload claims. `decode` bailed correctly on
     an implausible stream count but had already reserved for it, and one record
     costs ~96 bytes of parsed structure against three bytes of header — 32x, out
@@ -412,10 +403,9 @@
 ## Negative knowledge
 
 - Ordering files by content similarity instead of by name — research 16 called
-  it "the strongest surviving item"; MEASURED at −0.07% on 33 Windows DLLs
-  (min-hash sketches, greedy nearest-neighbour chaining, narc's own 64 MiB
-  units). Files of one extension are already adjacent, and a unit is mostly one
-  or two large files, so which of them share a unit barely moves anything.
+  it "the strongest surviving item"; MEASURED at −0.07% on 33 Windows DLLs.
+  Files of one extension are already adjacent, and a unit is mostly one or two
+  large files, so which of them share a unit barely moves anything.
 - Per-unit LZMA lc/lp/pb — 0.01 to 0.16% on real units. See Recompression.
 - PPMd var.I (`ppmd-rust` ships `Ppmd8Encoder`, research 15 called it a free
   fourth codec) — MEASURED and REJECTED. On 1-24 MiB of real source text it is
@@ -423,16 +413,14 @@
   2,211,670). It also has a live bug: `RestoreMethod::CutOff` SEGFAULTS at 16 MiB
   with a 256 MiB pool, reproducible with `test/probe-preflate --bin ppmd8min`.
   Do not add it to the tournament on the strength of the literature.
-- Firefox's `omni.ja` is NOT recompressible: it parses as a zip (2584 and 5311
-  entries) but every entry is method 0, stored — Mozilla keeps it uncompressed
-  so the browser can mmap it at startup. There is no deflate to undo, which is
-  why narc and 7-Zip land within 0.1% of each other on it. Detecting zips by a
-  tail EOCD scan would find these files and gain nothing.
+- Firefox's `omni.ja` is NOT recompressible: it parses as a zip but every entry
+  is method 0, stored — Mozilla keeps it uncompressed so the browser can mmap it
+  at startup. No deflate to undo, which is why narc and 7-Zip land within 0.1%
+  of each other. A tail-EOCD zip scan would find these files and gain nothing.
 - Shared/trained dictionaries at creation time — MEASURED NET LOSS at 32 MiB
-  units (7.88% -> 7.60% before charging the dictionary's own storage; research
-  10 measured 100.0-100.8% of the no-dictionary total). A dictionary is a
-  SUBSTITUTE for solidity, not an addition. Only the append path (units created
-  after `create`) is worth revisiting: -21% to -31% there.
+  units (100.0-100.8% of the no-dictionary total). A dictionary SUBSTITUTES for
+  solidity rather than adding to it. Only the append path (units created after
+  `create`) is worth revisiting: -21% to -31% there.
 - Alphabet/numeral-system transforms — folklore in front of a modern codec.
   MEASURED: frequency remapping 0.0%, RLE ~1%, MTF +202% (catastrophic),
   sparse packing 0.4% for zstd. Only base64-undo is real (-28%).
@@ -443,12 +431,11 @@
   into 246 units (median 1.4 KiB) and costs 1.8 MiB. Only files >= 4 KiB may
   trigger a class split.
 - Letting a class change slide until the unit is half the target — TRIED AND
-  REVERTED: looked like a 171 KB win in a fixed-codec counterfactual, cost
-  +1,002,157 B at max and +598,383 B on Silesia in the real packer. THE LESSON,
-  which invalidates any future fixed-codec counterfactual: one LZMA2 chain for
-  everything cannot see what a mixed unit gives up — one codec and one filter
-  per stream, so no BCJ on the exe bytes and no tournament per class. Voting the
-  codec by bytes does NOT rescue it; one winner cannot filter two classes.
+  REVERTED: a 171 KB win in a fixed-codec counterfactual cost +1,002,157 B at
+  max and +598,383 B on Silesia in the real packer. THE LESSON invalidates any
+  future fixed-codec counterfactual: one LZMA2 chain cannot see what a mixed
+  unit gives up, because a unit has ONE codec and ONE filter. Voting by bytes
+  does not rescue it — one winner cannot filter two classes.
 - Creating RAR archives is legally impossible (RARLAB license); only
   extraction via unrar is allowed. Plan pack: zip/7z/narc; unpack adds rar.
 - `PROCESS_MODE_BACKGROUND_BEGIN` — drops I/O and memory priority to Very Low
@@ -484,8 +471,20 @@
 
 ## Owner decisions
 
-- Language: Rust. Open repo `confeden/Nova-Arc`; do NOT add a LICENSE file
-  yet (owner will choose later). Zero telemetry/ads/analytics — ever.
+- Language: Rust PREFERRED, not required. Owner-set: the GUI must be Rust and
+  as much else as practical, but a codec may be C/C++ behind FFI if Rust has no
+  usable implementation — do NOT reject an algorithm for want of a Rust crate.
+  Open repo `confeden/Nova-Arc`; no LICENSE file yet (owner will choose).
+  Zero telemetry/ads/analytics — ever. `.gitignore` is NOT tracked; the rules
+  live in `.git/info/exclude` (owner's decision) — do not re-add the file.
+- BENCHMARK SET is plural, not just 7-Zip: 7z -mx9, xz -9e, brotli -q11,
+  kanzi -l7/-l9 (CM), zpaqfranz -m4/-m5 (CM). Binaries in
+  `D:/Programs/compressors`. Corpora must be STANDARD (enwik8, enwik9, Silesia)
+  so our sizes sit next to published ones; improvised corpora only for the
+  recompression differentiator. Harness: `test/bench-std.sh`.
+- Speed budget: not much slower than 7z -mx9. This DISQUALIFIES cmix, paq8px,
+  nncp and every LLM compressor by construction, not by taste. They stay as a
+  CEILING reference — how much redundancy is left — never as a target.
 - Chat with owner in Russian; code, docs/ and CLI output in English. EXCEPTIONS,
   both owner-set: README.md and CHANGELOG.md are RUSSIAN. GUI ships RU too.
 - CHANGELOG.md: `# История изменений`, `## [X.Y.Z]` newest first, flat bullets
@@ -504,8 +503,8 @@
 ## Open issues
 
 - Not preserved yet: empty dirs, symlinks, NTFS attrs/ADS, ACLs.
-- Manifest fully in RAM (fine ≤ ~1 TB archives); paged index only if needed.
-- Long-path (>260 chars) handling on Windows untested.
+- Manifest fully in RAM (fine ≤ ~1 TB); paged index only if needed. Long paths
+  (>260 chars) on Windows untested.
 - Solid-block members are read whole into RAM at pack time (fs::read), so a
   block costs up to 8 MiB extra outside the pipeline budget.
 - No trained dictionaries; no MP3/audio recompression.
@@ -514,12 +513,11 @@
   feature and takes the ordinary already-compressed path.
 - `--eco`/`--full`/EcoQoS paths are built but not measured under load; the
   "no lag" claim is unverified (research 09 §10 has the methodology).
-- Progress granularity at max is bounded by the unit count and cannot be fixed
-  in the reporter: test/corpus is ~6 units, they compress in PARALLEL, so between
-  two completions there is genuinely no finished work to report. Measured
-  residual silence: ~38 s of a ~70 s pack. The UI answers it with elapsed time,
-  the block counter and a pulse, not with a moving bar. Finer would mean
-  reporting per tournament candidate (3 per unit) — not built.
+- Progress granularity at max is bounded by the UNIT COUNT and cannot be fixed
+  in the reporter: ~6 units compress in PARALLEL, so between two completions
+  there is genuinely no finished work to report (~38 s of a ~70 s pack). The UI
+  answers with elapsed time, a block counter and a pulse. Finer would mean
+  reporting per tournament candidate — not built.
 
 ## Plans
 
@@ -531,23 +529,22 @@ v0.7 recompression — deflate id 34, JPEG id 35, x86 split id 36, PDF · GUI
 The standing direction is the owner's: beat 7-Zip where it has NOTHING, rather
 than out-tune LZMA. Remaining, in measured order of value:
 
-1. More formats where the competition stores bytes verbatim. PDF proved the
-   pattern generalises past the container formats. Left: PDF images
-   (`/DCTDecode` streams are whole JPEGs — route them to lepton, which is
-   already wired), MP3/audio (modest, no live open library), and zips whose
-   local-header magic does not start the file (omni.ja-style; see Negative
-   knowledge for why that one specific case gains nothing).
-2. zip/7z unpack + zip pack (sevenz-rust2), rar unpack (unrar); one `narc` UX
-   over foreign formats.
-3. GUI: shell icons/thumbnails via IShellItemImageFactory (research 06/07),
-   .narc association + installer, in-archive folder tree, RU localization.
-4. Decompression speed at max: PPMd7 units decode slowly. A libbsc/BWT branch
-   was the owner's proposal for closing ratio and decode time at once.
-5. Front-coded manifest paths (worth 7,663 B on a 5751-file tree). A real
-   format change, and the cheap manifest win (LZMA2) is already taken.
-6. Later: GPU experiments (nvCOMP/GDeflate, research 08), encryption
-   (XChaCha20-Poly1305), Explorer shell integration (research 07), installers,
-   Linux/macOS/Android ports.
+1. Byte-plane split for detected 16-bit data. MEASURED -10..-11% on x-ray and
+   mr, free at decode, ~150 lines. The only measured, unbuilt item left.
+2. More formats where the competition stores bytes verbatim — the cheapest and
+   most exclusive win we have. Next: PDF images (`/DCTDecode` streams are whole
+   JPEGs and lepton is already wired), then audio.
+3. Replace PPMd7 on text. It is dominated on all three axes (see Current state).
+   Measure the ratio-vs-model-memory curve on kanzi -l8 vs -l9 FIRST — that one
+   experiment decides whether a CM tier is viable at all, and costs no code.
+   Rust is not required for the codec: FFI to a C implementation is allowed.
+4. Executable modelling (BCJ2-class, section splitting) — 51% of the remaining
+   headroom to paq8px on Silesia, five times images and tables combined.
+5. zip/7z unpack + zip pack (sevenz-rust2), rar unpack (unrar).
+6. GUI: shell icons/thumbnails (research 06/07), .narc association + installer,
+   in-archive folder tree, RU localization.
+7. Later: GPU experiments (research 08), encryption (XChaCha20-Poly1305),
+   Explorer integration, installers, Linux/macOS/Android ports.
 
 NOT on this list, and deliberately: bigger units to buy solidity on executables,
 and BCJ2-style per-site probability. Both PRICED and rejected — see Recompression.
