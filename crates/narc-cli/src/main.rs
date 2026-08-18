@@ -110,10 +110,34 @@ enum Cmd {
         #[arg(required = true)]
         paths: Vec<String>,
     },
+    /// Rename or move an entry or a whole folder inside the archive.
+    /// Touches only the index - the data is never re-read or re-compressed.
+    #[command(visible_alias = "mv")]
+    Rename {
+        archive: PathBuf,
+        from: String,
+        to: String,
+    },
     /// Rewrite the archive dropping dead data
     Compact { archive: PathBuf },
     /// Show archive statistics
-    Info { archive: PathBuf },
+    Info {
+        archive: PathBuf,
+        /// Also dump one line per compression unit: size, codec, file types.
+        /// Unit size and codec choice are what an archive's ratio is made of.
+        #[arg(long)]
+        units: bool,
+    },
+}
+
+fn codec_name(c: u8) -> &'static str {
+    match c {
+        0 => "store",
+        1 => "zstd",
+        2 => "lzma2",
+        3 => "ppmd7",
+        _ => "unknown",
+    }
 }
 
 fn human(n: u64) -> String {
@@ -260,12 +284,22 @@ fn main() -> Result<()> {
                 println!("Removed {n} item(s). Run 'narc compact' to reclaim space.");
             }
         }
+        Cmd::Rename { archive, from, to } => {
+            let t = Instant::now();
+            let mut a = Archive::open_rw(&archive)?;
+            let n = a.rename(&from, &to)?;
+            println!(
+                "Renamed {n} entr{} in {:.3}s (index only, no data rewritten)",
+                if n == 1 { "y" } else { "ies" },
+                t.elapsed().as_secs_f64()
+            );
+        }
         Cmd::Compact { archive } => {
             let a = Archive::open_rw(&archive)?;
             let (before, after) = a.compact()?;
             println!("Compacted: {} -> {}", human(before), human(after));
         }
-        Cmd::Info { archive } => {
+        Cmd::Info { archive, units } => {
             let a = Archive::open_ro(&archive)?;
             let i = a.info();
             println!("Generation:   {}", i.generation);
@@ -287,19 +321,29 @@ fn main() -> Result<()> {
                 );
             }
             if !i.by_codec.is_empty() {
-                let name = |c: u8| match c {
-                    0 => "store",
-                    1 => "zstd",
-                    2 => "lzma2",
-                    3 => "ppmd7",
-                    _ => "unknown",
-                };
                 let parts: Vec<String> = i
                     .by_codec
                     .iter()
-                    .map(|(c, b)| format!("{} {}", name(*c), human(*b)))
+                    .map(|(c, b)| format!("{} {}", codec_name(*c), human(*b)))
                     .collect();
                 println!("Stored by:    {}", parts.join(", "));
+            }
+            if units {
+                println!("\n#idx\tunpacked\tpacked\tcodec\tparam\tfilter\tfiles\texts\ttop_ext");
+                for u in a.units() {
+                    println!(
+                        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                        u.idx,
+                        u.unpacked,
+                        u.packed,
+                        codec_name(u.codec),
+                        u.param,
+                        u.filter,
+                        u.files,
+                        u.distinct_exts,
+                        u.top_ext
+                    );
+                }
             }
         }
     }

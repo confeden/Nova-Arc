@@ -26,6 +26,7 @@ use crossbeam_channel::{bounded, Receiver, Sender};
 
 use crate::analyze::Tier;
 use crate::codec::{self, Codec};
+use crate::filters::Applied;
 use crate::manifest::ChunkRec;
 
 /// Memory the process needs before any packing work: manifest, buffers,
@@ -35,10 +36,15 @@ const BASE_BYTES: u64 = 32 * 1024 * 1024;
 /// Chunk buffers a worker holds while compressing (input + output).
 const WORKER_CHUNK_BYTES: u64 = 2 * crate::archive::MAX_CHUNK as u64;
 
-/// PPMd7's suballocator pool, allocated by the decoder as well as the
-/// encoder. It dominates per-worker memory whenever an archive contains PPMd
-/// chunks (see `codec::PPMD7_MEM_MAX`).
-const PPMD_POOL_BYTES: u64 = 64 * 1024 * 1024;
+/// PPMd7's suballocator pool, allocated by the DECODER as well as the encoder.
+///
+/// This must be `codec::PPMD7_MEM_MAX`, not a smaller guess. `ppmd7_mem_size`
+/// asks for 32x the unit and clamps at 256 MiB, so every max-tier unit of 8 MiB
+/// or more takes the full ceiling. It said 64 MiB, which let
+/// `extract_workers` spawn four times as many workers as the memory budget
+/// actually allows — measured, extracting a max-tier archive peaked at 960 MiB
+/// against a model that expected a quarter of that.
+const PPMD_POOL_BYTES: u64 = crate::codec::PPMD7_MEM_MAX as u64;
 
 #[derive(Clone, Copy, Debug)]
 pub struct PackOptions {
@@ -148,7 +154,10 @@ struct Done {
     codec: Codec,
     param: u8,
     filter: u8,
+    /// Original bytes, before any filter. What the hash covers.
     unpacked: u64,
+    /// What the codec actually saw; 0 when the filter preserved length.
+    filtered: u64,
     hash: [u8; 16],
     charge: u64,
 }
@@ -267,13 +276,44 @@ pub struct PackOutput {
     pub bytes_stored: u64,
 }
 
+/// Running totals of what has actually reached the archive, reported by the
+/// writer as units are committed.
+///
+/// This is the only honest measure of packing progress. The reader runs ahead
+/// by the whole in-flight budget — up to 1 GiB of charge, so ~512 MiB of source
+/// at the max tier — and then sleeps in [`Budget::acquire`], so anything the
+/// reader can count says "read", not "done". The writer is also the one thread
+/// still working while the reader sleeps, which is exactly when a UI needs to
+/// hear something.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StoredTick {
+    /// Original bytes of every unit committed so far.
+    pub unpacked: u64,
+    /// Compressed bytes appended to the archive so far.
+    pub packed: u64,
+    /// Units committed so far. On a source tree the max tier makes only ~6
+    /// units and compresses them in parallel, so nothing lands for tens of
+    /// seconds — a count of blocks is the only thing that explains the silence.
+    pub units: u64,
+}
+
+/// Called by the writer thread after each batch of units is committed. Must be
+/// cheap: the writer is the pipeline's serialization point, so a slow callback
+/// throttles the whole run.
+pub type StoredFn<'a> = &'a (dyn Fn(StoredTick) + Send + Sync);
+
 /// Runs the worker/writer threads for the duration of `produce`.
 ///
 /// `produce` is called on the current thread with a submitter; every
 /// `submit` returns the index the chunk will have in `PackOutput::chunks`
 /// (relative to this run), available immediately even though the chunk has
 /// not been compressed or written yet.
-pub fn pack_with<F>(file: &mut File, opts: &PackOptions, produce: F) -> Result<PackOutput>
+pub fn pack_with<F>(
+    file: &mut File,
+    opts: &PackOptions,
+    on_stored: Option<StoredFn>,
+    produce: F,
+) -> Result<PackOutput>
 where
     F: FnOnce(&mut Submitter) -> Result<()>,
 {
@@ -308,7 +348,7 @@ where
 
         let writer = scope.spawn({
             let budget = &budget;
-            move || writer_loop(file, done_rx, budget)
+            move || writer_loop(file, done_rx, budget, on_stored)
         });
 
         let mut submitter = Submitter {
@@ -340,6 +380,13 @@ pub struct Submitter<'a> {
 }
 
 impl Submitter<'_> {
+    /// How many units have been handed to the pipeline so far. Together with
+    /// the writer's committed count this is the honest shape of the work: at
+    /// the max tier a whole tree is a handful of units.
+    pub fn submitted(&self) -> u64 {
+        self.next_seq
+    }
+
     /// Hand a chunk to the pipeline; returns its index within this run.
     pub fn submit(&mut self, data: Vec<u8>, hash: [u8; 16], codec: Codec) -> Result<u32> {
         self.submit_filtered(data, hash, vec![(codec, 0)], 0)
@@ -416,7 +463,70 @@ fn compress_job(
     let unpacked = data.len() as u64;
     // Filters are reversible transforms that make the data more compressible;
     // the chunk hash covers the ORIGINAL bytes, so it is computed before this.
-    crate::filters::Filter::from_id(filter)?.apply(&mut data);
+    //
+    // A filter may change the length, and then two different numbers matter:
+    // `unpacked` stays the original length forever (the hash and the extents
+    // are expressed in it) while the codec works on, and the decoder must be
+    // told, the filtered length.
+    let f = crate::filters::Filter::from_id(filter)?;
+    let mut original: Option<Vec<u8>> = None;
+    if f.changes_length() {
+        // A rebuilt buffer cannot be turned back by undoing it in place, so the
+        // original has to survive for the store fallback and for the round-trip
+        // check below.
+        original = Some(data.clone());
+    }
+    // A filter that cannot do its job is not an error: the analyzer proposes a
+    // transform from a file's magic, and a container whose streams preflate
+    // cannot model simply gets stored the ordinary way. Aborting the whole
+    // operation over one unit would be absurd.
+    let applied = match f.apply(&mut data) {
+        Ok(a) => a,
+        Err(_) => {
+            let data = original.take().unwrap_or(data);
+            return plain(seq, data, hash, charge, unpacked, candidates, comp, level);
+        }
+    };
+    let filtered = data.len() as u64;
+    // The coded length is what a reader must hand the codec, and `verify_chunk`
+    // REFUSES anything above `MAX_CODED_CHUNK`. Writing one anyway produces an
+    // archive narc cannot extract — the worst outcome an archiver has, because
+    // the source may be gone by the time anyone finds out. Each filter bounding
+    // its own output is not enough: only this line knows the number that ends
+    // up in the manifest, so it is checked here for every filter that exists or
+    // ever will. Deflate is the one that can reach it — a PDF recovers ~6x its
+    // own size in plaintext.
+    if filtered > crate::archive::MAX_CODED_CHUNK {
+        // Recovering the original is the same two cases as the store fallback
+        // below, and it is spelled out rather than assumed: an in-place filter
+        // cannot reach this bound today, but "cannot" is not a thing to store
+        // bytes on.
+        match applied {
+            Applied::InPlace => f.unapply(&mut data)?,
+            Applied::Rebuilt => {
+                data = original
+                    .take()
+                    .expect("a rebuilt filter keeps the original")
+            }
+        }
+        return plain(seq, data, hash, charge, unpacked, candidates, comp, level);
+    }
+
+    // Bit-exact or nothing. A transform that builds a new representation has to
+    // prove it can rebuild the original BEFORE the archive keeps it — a
+    // recompression bug must never produce an archive that cannot be extracted.
+    // The in-place filters skip this: they are their own inverse and the chunk
+    // hash already proves it on every extract.
+    if applied == Applied::Rebuilt {
+        let mut check = data.clone();
+        let ok = f.unapply(&mut check).is_ok() && original.as_deref().is_some_and(|o| check == o);
+        if !ok {
+            let data = original
+                .take()
+                .expect("a rebuilt filter keeps the original");
+            return plain(seq, data, hash, charge, unpacked, candidates, comp, level);
+        }
+    }
 
     // Try every candidate and keep the smallest result. With one candidate
     // this is just "compress"; with several it is the max tier's tournament,
@@ -439,14 +549,42 @@ fn compress_job(
         }
     }
 
-    // Never let "compression" grow a chunk, and drop the filter with it: a
-    // stored chunk is the original bytes, so no transform must be recorded.
-    let (codec, param, filter, payload) = match best {
-        Some((c, p, packed)) if packed.len() < data.len() => (c, p, filter, packed),
-        _ => {
-            crate::filters::Filter::from_id(filter)?.unapply(&mut data);
-            (Codec::Store, 0, 0, data)
+    // Three things could be kept, and the smallest wins as long as it beats the
+    // ORIGINAL length — not the filtered one, or a filter that expands 2 MB of
+    // zip into 20 MB of plaintext and compresses it back to 2.5 MB would "win"
+    // while making the archive bigger.
+    //
+    // The middle candidate — the filtered form stored verbatim — exists for
+    // lepton: its output is already entropy-coded, so LZMA2 and PPMd7 spend
+    // seconds on it and gain nothing (measured: neither ever beat the lepton
+    // blob). A STORED payload that is filtered rather than original is new, and
+    // it is safe because the coded length is recorded beside it and a reader too
+    // old to know the filter rejects the id outright instead of guessing.
+    let coded = best.as_ref().map_or(usize::MAX, |(_, _, p)| p.len());
+    let bare = if applied == Applied::Rebuilt {
+        data.len()
+    } else {
+        usize::MAX
+    };
+    if coded.min(bare) as u64 >= unpacked {
+        // Nothing beat the original bytes. Both the filter byte and the coded
+        // length must go back to "none", or a decoder sizes a Store payload
+        // from a length it does not have.
+        match applied {
+            Applied::InPlace => f.unapply(&mut data)?,
+            Applied::Rebuilt => {
+                data = original
+                    .take()
+                    .expect("a rebuilt filter keeps the original")
+            }
         }
+        return store(seq, data, hash, charge, unpacked);
+    }
+    let (codec, param, filter, filtered, payload) = if bare < coded {
+        (Codec::Store, 0, filter, filtered, data)
+    } else {
+        let (c, p, packed) = best.expect("a finite coded length means there was a candidate");
+        (c, p, filter, filtered, packed)
     };
     Ok(Done {
         seq,
@@ -455,19 +593,86 @@ fn compress_job(
         param,
         filter,
         unpacked,
+        // Recorded only when it differs, so every chunk narc wrote before this
+        // existed — and every chunk with an in-place filter — keeps a manifest
+        // byte-for-byte identical to what it had.
+        filtered: if filtered == unpacked { 0 } else { filtered },
         hash,
         charge,
     })
 }
 
-fn writer_loop(file: &mut File, rx: Receiver<Result<Done>>, budget: &Budget) -> Result<PackOutput> {
+/// Compress the original bytes with no filter at all — the path taken when a
+/// proposed transform does not apply or does not round-trip.
+#[allow(clippy::too_many_arguments)]
+fn plain(
+    seq: u64,
+    data: Vec<u8>,
+    hash: [u8; 16],
+    charge: u64,
+    unpacked: u64,
+    candidates: Vec<(Codec, u8)>,
+    comp: Option<&mut zstd::bulk::Compressor<'_>>,
+    level: i32,
+) -> Result<Done> {
+    compress_job(
+        comp,
+        Job {
+            seq,
+            data,
+            hash,
+            candidates,
+            filter: 0,
+            charge,
+        },
+        level,
+    )
+    .map(|mut d| {
+        d.unpacked = unpacked;
+        d
+    })
+}
+
+/// Store the original bytes verbatim: no codec, no filter, no coded length.
+fn store(seq: u64, data: Vec<u8>, hash: [u8; 16], charge: u64, unpacked: u64) -> Result<Done> {
+    debug_assert_eq!(
+        data.len() as u64,
+        unpacked,
+        "a stored chunk is the original"
+    );
+    Ok(Done {
+        seq,
+        payload: data,
+        codec: Codec::Store,
+        param: 0,
+        filter: 0,
+        unpacked,
+        filtered: 0,
+        hash,
+        charge,
+    })
+}
+
+fn writer_loop(
+    file: &mut File,
+    rx: Receiver<Result<Done>>,
+    budget: &Budget,
+    on_stored: Option<StoredFn>,
+) -> Result<PackOutput> {
     let mut pending: BTreeMap<u64, Done> = BTreeMap::new();
     let mut next = 0u64;
     let mut chunks = Vec::new();
     let mut bytes_stored = 0u64;
+    // Work is finished when a unit has been COMPRESSED, not when its turn to be
+    // written comes up. Writing is a memcpy; compressing a 64 MiB unit at the
+    // max tier is three encode passes. Counting only written units made a unit
+    // that finished early but waited behind a slow predecessor invisible, and
+    // its report arrived in a burst with the others — measured as a 36 s silence
+    // followed by a jump from 48% to 100%.
+    let mut bytes_done = 0u64;
     let mut offset = file.seek(SeekFrom::End(0))?;
 
-    for item in rx.iter() {
+    for (received, item) in rx.iter().enumerate() {
         let done = match item {
             Ok(d) => d,
             Err(e) => {
@@ -475,6 +680,7 @@ fn writer_loop(file: &mut File, rx: Receiver<Result<Done>>, budget: &Budget) -> 
                 return Err(e);
             }
         };
+        bytes_done += done.unpacked;
         pending.insert(done.seq, done);
         // Write everything that has become contiguous: the archive layout
         // must follow submission order, not completion order.
@@ -490,12 +696,22 @@ fn writer_loop(file: &mut File, rx: Receiver<Result<Done>>, budget: &Budget) -> 
                 codec: d.codec.id(),
                 param: d.param,
                 filter: d.filter,
+                filtered: d.filtered,
                 hash: d.hash,
             });
             offset += d.payload.len() as u64;
             bytes_stored += d.payload.len() as u64;
             budget.release(d.charge);
             next += 1;
+        }
+        // Reported after the budget is released, so a slow listener can never
+        // delay backpressure. One call per completed unit bounds the rate.
+        if let Some(cb) = on_stored {
+            cb(StoredTick {
+                unpacked: bytes_done,
+                packed: bytes_stored,
+                units: received as u64 + 1,
+            });
         }
     }
     if !pending.is_empty() {

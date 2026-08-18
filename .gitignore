@@ -2,6 +2,11 @@
 /test/
 *.bak
 *.narc
+# ...except the compatibility fixtures. They are real archives written by an
+# older build, and the test that opens them is the only thing standing between
+# a change to the LZMA2 window or the PPMd7 pool and every existing archive
+# becoming undecodable. Ignoring them makes that test silently vacuous.
+!crates/narc-core/tests/fixtures/*.narc
 /ui/node_modules
 /ui/dist
 /crates/narc-gui/gen

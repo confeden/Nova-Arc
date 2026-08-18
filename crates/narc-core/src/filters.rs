@@ -29,13 +29,16 @@
 //! chunk; the alternative (stateful streaming across chunks) would make a
 //! chunk undecodable without its predecessor.
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 
 /// Largest delta distance the manifest byte can encode.
 pub const MAX_DELTA_DISTANCE: u8 = 32;
 
-/// Highest assigned filter id.
-const MAX_FILTER_ID: u8 = 1 + MAX_DELTA_DISTANCE;
+/// Highest id in the DELTA range. This must be split from "highest assigned
+/// id": the decode arm is `2..=MAX_DELTA_ID => Delta(id - 1)`, so widening it to
+/// cover a new filter would make that filter decode as a delta with a nonsense
+/// distance — a silent mis-decode rather than an error.
+const MAX_DELTA_ID: u8 = 1 + MAX_DELTA_DISTANCE;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Filter {
@@ -45,7 +48,42 @@ pub enum Filter {
     BcjX86,
     /// Byte-difference filter; the payload is the distance in bytes, 1..=32.
     Delta(u8),
+    /// Undo the deflate streams inside a container (zip, PNG, gzip, docx…),
+    /// keeping the record that rebuilds the original bitstream exactly.
+    ///
+    /// The only filter that changes length, and the only one that builds a new
+    /// buffer instead of mutating in place. Measured on a corpus of zips, PNGs
+    /// and gzips: 4,048,085 B of what narc stores today becomes 2,485,916 B,
+    /// −38.6%, in a place where 7-Zip can do nothing at all.
+    Deflate,
+    /// Re-encode a JPEG's quantized DCT coefficients with a context model
+    /// instead of its Huffman tables, keeping enough to rebuild the original
+    /// file bit for bit — padding bits, restart markers and trailing garbage
+    /// included.
+    ///
+    /// The one transform that helps photographs, which are the bulk of a family
+    /// archive and the case every archiver gives up on: measured on this
+    /// machine, 7-Zip -mx9 takes 0.78% off a set of camera JPEGs and narc 1.77%,
+    /// while lepton takes 15-21% off each file it accepts.
+    Jpeg,
+    /// Move x86 branch targets into their own stream. See `x86_split_encode`.
+    X86Split,
 }
+
+/// Filter id for JPEG recompression with lepton 0.5.x.
+const JPEG_LEPTON_0_5: u8 = 35;
+
+/// Filter id for x86 call/jump splitting. narc's own transform, so unlike ids
+/// 34 and 35 it pins no external library version.
+const X86_SPLIT: u8 = 36;
+
+/// Filter id for deflate recompression with preflate 0.7.x records.
+///
+/// The version is part of the id's meaning, not a detail: preflate's correction
+/// format is not guaranteed stable across releases, so `preflate-rs` is pinned
+/// exactly and an upgrade must spend a NEW id rather than change what this one
+/// decodes. Old decoders must stay callable forever.
+const DEFLATE_PREFLATE_0_7: u8 = 34;
 
 impl Filter {
     /// Checked constructor — the only way to build a `Delta` that is
@@ -67,7 +105,7 @@ impl Filter {
     ///
     /// Ids 34..=255 are unassigned; [`Filter::from_id`] rejects them, so an
     /// archive written by a newer version fails loudly instead of unpacking
-    /// garbage.
+    /// garbage. A new id must never be added by widening the delta range.
     ///
     /// A `Delta` distance outside 1..=32 is not representable, so it is
     /// clamped — by `id`, `apply` and `unapply` alike, so the stored byte can
@@ -77,6 +115,9 @@ impl Filter {
             Filter::None => 0,
             Filter::BcjX86 => 1,
             Filter::Delta(d) => 1 + clamp_distance(d as usize) as u8,
+            Filter::Deflate => DEFLATE_PREFLATE_0_7,
+            Filter::Jpeg => JPEG_LEPTON_0_5,
+            Filter::X86Split => X86_SPLIT,
         }
     }
 
@@ -84,28 +125,196 @@ impl Filter {
         match id {
             0 => Ok(Filter::None),
             1 => Ok(Filter::BcjX86),
-            2..=MAX_FILTER_ID => Ok(Filter::Delta(id - 1)),
+            2..=MAX_DELTA_ID => Ok(Filter::Delta(id - 1)),
+            DEFLATE_PREFLATE_0_7 => Ok(Filter::Deflate),
+            JPEG_LEPTON_0_5 => Ok(Filter::Jpeg),
+            X86_SPLIT => Ok(Filter::X86Split),
             other => bail!("unknown filter id {other} - archive was made by a newer version"),
         }
     }
 
-    /// Transform a chunk in place, before compression.
-    pub fn apply(self, data: &mut [u8]) {
+    /// Transform a chunk before compression.
+    ///
+    /// Returns what it did, because the caller has to know: on the store
+    /// fallback an [`Applied::InPlace`] filter MUST be undone to recover the
+    /// original bytes, and a filter that built a new buffer MUST NOT be — the
+    /// original is still sitting there untouched. One boolean cannot say both,
+    /// and getting it backwards stores the wrong bytes under the right hash.
+    pub fn apply(self, data: &mut Vec<u8>) -> Result<Applied> {
         match self {
-            Filter::None => {}
-            Filter::BcjX86 => bcj_x86_encode(data, 0),
-            Filter::Delta(d) => delta_encode(data, d as usize),
+            Filter::None => Ok(Applied::InPlace),
+            Filter::BcjX86 => {
+                bcj_x86_encode(data, 0);
+                Ok(Applied::InPlace)
+            }
+            Filter::Delta(d) => {
+                delta_encode(data, d as usize);
+                Ok(Applied::InPlace)
+            }
+            Filter::Deflate => {
+                *data = deflate_encode(data)?;
+                Ok(Applied::Rebuilt)
+            }
+            Filter::Jpeg => {
+                *data = jpeg_encode(data)?;
+                Ok(Applied::Rebuilt)
+            }
+            Filter::X86Split => {
+                *data = x86_split_encode(data)?;
+                Ok(Applied::Rebuilt)
+            }
         }
     }
 
-    /// Undo [`Filter::apply`] in place, after decompression.
-    pub fn unapply(self, data: &mut [u8]) {
+    /// Undo [`Filter::apply`], after decompression.
+    ///
+    /// Fallible because a transform that rebuilds data from a record can be
+    /// handed a corrupt or hostile one. The in-place transforms cannot fail and
+    /// say so by never returning `Err`.
+    pub fn unapply(self, data: &mut Vec<u8>) -> Result<()> {
         match self {
             Filter::None => {}
             Filter::BcjX86 => bcj_x86_decode(data, 0),
             Filter::Delta(d) => delta_decode(data, d as usize),
+            Filter::Deflate => *data = deflate_decode(data)?,
+            Filter::Jpeg => *data = jpeg_decode(data)?,
+            Filter::X86Split => *data = x86_split_decode(data)?,
+        }
+        Ok(())
+    }
+
+    /// Whether this filter can change the length of the buffer. Length-changing
+    /// filters are the only ones that need `ChunkRec::filtered`.
+    pub fn changes_length(self) -> bool {
+        match self {
+            Filter::None | Filter::BcjX86 | Filter::Delta(_) => false,
+            Filter::Deflate | Filter::Jpeg | Filter::X86Split => true,
         }
     }
+}
+
+/// What [`Filter::apply`] did to the buffer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Applied {
+    /// The buffer was mutated; undoing the filter restores the original.
+    InPlace,
+    /// The buffer was replaced with a different representation. The original
+    /// cannot be recovered by undoing in place — the caller must keep it.
+    Rebuilt,
+}
+
+/// The lepton settings are a FORMAT CONSTANT for filter id 35, exactly like
+/// PPMd7's order and pool size: they decide the bitstream, and none of them is
+/// stored per unit. `compat_lepton_vector_write` is the conservative preset —
+/// it is what the C++ implementation can also read, and its 16386-pixel limit
+/// simply means larger images are not transformed.
+fn lepton_features() -> lepton_jpeg::EnabledFeatures {
+    lepton_jpeg::EnabledFeatures::compat_lepton_vector_write()
+}
+
+/// Undo a JPEG's entropy coding. One thread: narc already runs a worker per
+/// unit, and a nested pool would multiply both threads and memory.
+fn jpeg_encode(data: &[u8]) -> Result<Vec<u8>> {
+    use std::io::Cursor;
+    let mut out = Vec::with_capacity(data.len());
+    lepton_jpeg::encode_lepton(
+        &mut Cursor::new(data),
+        &mut Cursor::new(&mut out),
+        &lepton_features(),
+        &lepton_jpeg::SingleThreadPool {},
+    )
+    .map_err(|e| anyhow::anyhow!("lepton cannot model this jpeg: {e}"))?;
+    Ok(out)
+}
+
+/// Rebuild the original JPEG, byte for byte.
+fn jpeg_decode(data: &[u8]) -> Result<Vec<u8>> {
+    use std::io::Cursor;
+    let mut out = Vec::new();
+    lepton_jpeg::decode_lepton(
+        &mut Cursor::new(data),
+        &mut out,
+        &lepton_features(),
+        &lepton_jpeg::SingleThreadPool {},
+    )
+    .map_err(|e| anyhow::anyhow!("cannot rebuild a jpeg: {e}"))?;
+    Ok(out)
+}
+
+/// Undo every deflate stream in the buffer, and lay the pieces out so they
+/// compress: container bytes, then all plaintexts, then all correction records.
+///
+/// A stream that preflate refuses is simply left as it is — the transform is
+/// per stream, and a container full of streams it cannot model still gains from
+/// the ones it can.
+fn deflate_encode(data: &[u8]) -> Result<Vec<u8>> {
+    use crate::deflate::{encode, find_streams, Piece};
+    let streams = find_streams(data);
+    if streams.is_empty() {
+        bail!("no deflate streams to undo");
+    }
+    // Undoing deflate is the one transform that can multiply its input, and a
+    // zip bomb multiplies it by a thousand. The result has to stay inside the
+    // bound the decoder enforces, or narc would write archives it refuses to
+    // read; and the packing memory budget charges for the unit, not for what a
+    // filter might grow it into.
+    let cap = crate::archive::MAX_CODED_CHUNK as usize;
+    // preflate verifies each stream itself; the caller then round-trips the
+    // whole buffer, which also covers this module's framing.
+    let cfg = preflate_rs::PreflateConfig {
+        verify_compression: false,
+        ..Default::default()
+    };
+    let mut parts = Vec::new();
+    // Charged as the pieces are built, not summed at the end: a PDF of ordinary
+    // technical prose recovers SIX times its own size in plaintext, out of
+    // hundreds of streams. Checking only after the loop would hold every one of
+    // them first, so the bound that exists to stop a bomb would be reached by
+    // allocating exactly what it forbids.
+    //
+    // Seeded with the container's own length, because `encode` emits the bytes
+    // no stream covers as well as the plaintexts, and a budget that forgets
+    // them lets the transformed form reach `cap + data.len()`. That is not a
+    // rounding error: the read side refuses a coded length above the cap, so
+    // the overrun is an archive narc writes and then cannot extract.
+    let mut total = data.len();
+    for s in &streams {
+        let raw = s.gather(data);
+        let Ok((res, plain)) = preflate_rs::preflate_whole_deflate_stream(&raw, &cfg) else {
+            continue;
+        };
+        if res.compressed_size != raw.len() {
+            continue;
+        }
+        total = total
+            .saturating_add(plain.text().len())
+            .saturating_add(res.corrections.len());
+        if total > cap {
+            bail!("undoing this container would exceed the coded-size bound");
+        }
+        parts.push(Piece {
+            pieces: s.pieces.clone(),
+            plain: plain.text().to_vec(),
+            corrections: res.corrections,
+        });
+    }
+    if parts.is_empty() {
+        bail!("preflate could not model any stream in this unit");
+    }
+    encode(data, &parts)
+}
+
+/// Rebuild the container exactly as it was.
+fn deflate_decode(data: &[u8]) -> Result<Vec<u8>> {
+    let d = crate::deflate::decode(data)?;
+    let mut rebuilt = Vec::with_capacity(d.streams.len());
+    for s in &d.streams {
+        rebuilt.push(
+            preflate_rs::recreate_whole_deflate_stream(s.plain, s.corrections)
+                .map_err(|e| anyhow::anyhow!("cannot rebuild a deflate stream: {e}"))?,
+        );
+    }
+    crate::deflate::rebuild(&d, &rebuilt)
 }
 
 /// Every entry point clamps the distance the same way, so an out-of-range
@@ -240,6 +449,182 @@ fn bcj_x86(data: &mut [u8], start_offset: u32, encode: bool) {
         data[i + 4] = if (dest >> 24) & 1 != 0 { 0xFF } else { 0x00 };
         i += 5;
     }
+}
+
+// -- x86 call/jump splitting (filter id 36) ----------------------------------
+
+/// Magic for the split form, so a truncated payload is refused before it can
+/// drive an allocation.
+const X86_MAGIC: &[u8; 4] = b"NX86";
+
+/// Is there a call/jump with a 32-bit displacement at `i`? Returns the offset
+/// of the displacement field within the instruction (1 for E8/E9, 2 for the
+/// two-byte conditional jumps).
+///
+/// Deliberately says nothing about whether the displacement itself fits: the
+/// decoder walks a stream those four bytes have been REMOVED from, so a test
+/// that looked at the remaining length would disagree with the encoder about
+/// the last instruction in the buffer. The site count in the header settles
+/// that instead.
+fn x86_site(buf: &[u8], i: usize) -> Option<usize> {
+    let b = *buf.get(i)?;
+    if b == 0xE8 || b == 0xE9 {
+        Some(1)
+    } else if b == 0x0F && matches!(buf.get(i + 1), Some(0x80..=0x8F)) {
+        Some(2)
+    } else {
+        None
+    }
+}
+
+/// Move x86 branch targets out of the code and into their own stream.
+///
+/// The in-place BCJ filter rewrites each displacement to an absolute address
+/// where it stands, which helps — but the four address bytes still sit between
+/// the instructions, and a match finder walking the code keeps tripping over
+/// them. MEASURED on 234.3 MiB of Firefox DLLs with LZMA2 -9e at narc's own
+/// 64 MiB units: in-place BCJ 71,410,491 B, this split 68,893,556 B (-3.5%).
+///
+/// This is 7-Zip's BCJ2 idea without its machinery. BCJ2 decides each site with
+/// a range-coded probability model and writes four streams; here the decision is
+/// the classical "does the absolute target land inside this buffer" test and the
+/// answers are one plain bit each, which LZMA2 then compresses to a third of
+/// their size. Two rules that sound better both measured worse: liblzma's
+/// position-independent top-byte test accepts almost nothing at a 64 MiB unit
+/// (72,488,469 B, worse than not splitting at all), and gating on the
+/// displacement magnitude instead lost 0.6-3.2% at every reach from 1 to 16 MiB.
+fn x86_split_encode(data: &[u8]) -> Result<Vec<u8>> {
+    let mut main = Vec::with_capacity(data.len());
+    let mut targets: Vec<u8> = Vec::new();
+    let mut flags: Vec<u8> = Vec::new();
+    let (mut acc, mut bit) = (0u8, 0u32);
+    let mut sites = 0u64;
+    let mut i = 0usize;
+    while i < data.len() {
+        let Some(off) = x86_site(data, i).filter(|off| i + off + 4 <= data.len()) else {
+            main.push(data[i]);
+            i += 1;
+            continue;
+        };
+        sites += 1;
+        let at = i + off;
+        let rel = i32::from_le_bytes(data[at..at + 4].try_into().expect("checked by x86_site"));
+        // The address is relative to this buffer, never to the file: a
+        // position-dependent transform would make identical bytes compress to
+        // different payloads and dedup would stop working.
+        let absolute = rel as i64 + at as i64 + 4;
+        let take = absolute >= 0 && absolute < data.len() as i64;
+        acc |= (take as u8) << bit;
+        bit += 1;
+        if bit == 8 {
+            flags.push(acc);
+            acc = 0;
+            bit = 0;
+        }
+        main.extend_from_slice(&data[i..at]);
+        if take {
+            // Big-endian, so the high bytes of nearby targets repeat.
+            targets.extend_from_slice(&(absolute as u32).to_be_bytes());
+        } else {
+            main.extend_from_slice(&data[at..at + 4]);
+        }
+        i = at + 4;
+    }
+    if bit > 0 {
+        flags.push(acc);
+    }
+    if targets.is_empty() {
+        bail!("no x86 branch targets to move");
+    }
+    let mut out = Vec::with_capacity(data.len() + 32);
+    out.extend_from_slice(X86_MAGIC);
+    for n in [
+        main.len() as u64,
+        targets.len() as u64,
+        flags.len() as u64,
+        sites,
+    ] {
+        out.extend_from_slice(&n.to_le_bytes());
+    }
+    out.extend_from_slice(&main);
+    out.extend_from_slice(&targets);
+    out.extend_from_slice(&flags);
+    Ok(out)
+}
+
+/// Put the branch targets back. Every length is checked against the buffer
+/// before anything is allocated: on this path the input is untrusted.
+fn x86_split_decode(data: &[u8]) -> Result<Vec<u8>> {
+    const HEAD: usize = 4 + 8 * 4;
+    if data.len() < HEAD || &data[..4] != X86_MAGIC {
+        bail!("not an x86-split payload");
+    }
+    let mut n = [0usize; 4];
+    for (k, slot) in n.iter_mut().enumerate() {
+        let at = 4 + k * 8;
+        *slot = u64::from_le_bytes(data[at..at + 8].try_into().expect("fixed width")) as usize;
+    }
+    let (main_len, targets_len, flags_len, sites) = (n[0], n[1], n[2], n[3]);
+    if sites > main_len
+        || flags_len != sites.div_ceil(8)
+        || targets_len % 4 != 0
+        || main_len
+            .checked_add(targets_len)
+            .and_then(|s| s.checked_add(flags_len))
+            .is_none_or(|s| s != data.len() - HEAD)
+    {
+        bail!("x86-split payload does not match its header");
+    }
+    let main = &data[HEAD..HEAD + main_len];
+    let targets = &data[HEAD + main_len..HEAD + main_len + targets_len];
+    let flags = &data[HEAD + main_len + targets_len..];
+
+    let mut out = Vec::with_capacity(main_len + targets_len);
+    let (mut t, mut fi, mut bit) = (0usize, 0usize, 0u32);
+    let mut seen = 0usize;
+    let mut j = 0usize;
+    while j < main.len() {
+        // The site count is what keeps the two sides in step at the tail, where
+        // the encoder may have found one opcode fewer than this scan does.
+        let Some(off) = x86_site(main, j).filter(|_| seen < sites) else {
+            out.push(main[j]);
+            j += 1;
+            continue;
+        };
+        seen += 1;
+        let flag = *flags.get(fi).context("x86-split flags ran out")?;
+        let take = (flag >> bit) & 1 == 1;
+        bit += 1;
+        if bit == 8 {
+            fi += 1;
+            bit = 0;
+        }
+        out.extend_from_slice(&main[j..j + off]);
+        j += off;
+        if take {
+            if t + 4 > targets.len() {
+                bail!("x86-split targets ran out");
+            }
+            let absolute =
+                u32::from_be_bytes(targets[t..t + 4].try_into().expect("fixed width")) as i64;
+            t += 4;
+            let rel = (absolute - out.len() as i64 - 4) as i32;
+            out.extend_from_slice(&rel.to_le_bytes());
+        } else {
+            if j + 4 > main.len() {
+                bail!("x86-split main stream ran out");
+            }
+            out.extend_from_slice(&main[j..j + 4]);
+            j += 4;
+        }
+    }
+    if t != targets.len() || seen != sites {
+        bail!(
+            "x86-split used {t} of {} target bytes and {seen} of {sites} sites",
+            targets.len()
+        );
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -382,7 +767,17 @@ mod tests {
         for id in 0..=33u8 {
             assert_eq!(Filter::from_id(id).unwrap().id(), id);
         }
-        for id in 34..=255u8 {
+        // 34 is deflate recompression, and the point of this line is that it is
+        // NOT a delta: the decode arm is `2..=MAX_DELTA_ID => Delta(id - 1)`, so
+        // adding a filter by widening that range would silently turn id 34 into
+        // Delta(33) and mis-decode every archive that used it.
+        assert_eq!(Filter::from_id(34).unwrap(), Filter::Deflate);
+        assert_eq!(Filter::Deflate.id(), 34);
+        assert_eq!(Filter::from_id(35).unwrap(), Filter::Jpeg);
+        assert_eq!(Filter::Jpeg.id(), 35);
+        assert_eq!(Filter::from_id(36).unwrap(), Filter::X86Split);
+        assert_eq!(Filter::X86Split.id(), 36);
+        for id in 37..=255u8 {
             assert!(Filter::from_id(id).is_err(), "id {id} must be rejected");
         }
     }
@@ -398,8 +793,8 @@ mod tests {
         // round-trips.
         let mut a = random_buf(7, 300);
         let mut b = a.clone();
-        Filter::Delta(0).apply(&mut a);
-        Filter::Delta(1).apply(&mut b);
+        Filter::Delta(0).apply(&mut a).unwrap();
+        Filter::Delta(1).apply(&mut b).unwrap();
         assert_eq!(a, b);
         assert_eq!(Filter::Delta(0).id(), Filter::Delta(1).id());
     }
@@ -413,8 +808,8 @@ mod tests {
                 for seed in 0..8u64 {
                     for original in [random_buf(seed, len), codeish_buf(seed ^ 0x5A5A, len)] {
                         let mut data = original.clone();
-                        filter.apply(&mut data);
-                        filter.unapply(&mut data);
+                        filter.apply(&mut data).unwrap();
+                        filter.unapply(&mut data).unwrap();
                         assert_eq!(data, original, "{filter:?} on {len} bytes, seed {seed}");
                     }
                 }
@@ -437,8 +832,8 @@ mod tests {
             for len in lens {
                 for original in degenerate_bufs(len) {
                     let mut data = original.clone();
-                    filter.apply(&mut data);
-                    filter.unapply(&mut data);
+                    filter.apply(&mut data).unwrap();
+                    filter.unapply(&mut data).unwrap();
                     // Not assert_eq!: a mismatch would dump four megabytes.
                     assert!(
                         data == original,
@@ -799,9 +1194,99 @@ mod stride_tests {
         let stride = detect_delta_stride(&data).expect("a table has a width");
         let f = Filter::delta(stride).unwrap();
         let mut work = data.clone();
-        f.apply(&mut work);
+        f.apply(&mut work).unwrap();
         assert_ne!(work, data, "the filter should change something");
-        f.unapply(&mut work);
+        f.unapply(&mut work).unwrap();
+        assert_eq!(work, data);
+    }
+}
+
+#[cfg(test)]
+mod x86_split_tests {
+    use super::*;
+
+    /// Machine-code-shaped bytes: instructions with real branch targets, some
+    /// data that merely contains 0xE8, and displacements that point outside the
+    /// buffer so both sides of the decision are exercised.
+    fn code(len: usize) -> Vec<u8> {
+        let mut v = Vec::with_capacity(len);
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        while v.len() < len {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            match seed % 5 {
+                0 => {
+                    // call to somewhere inside the buffer
+                    let here = v.len() as i64;
+                    let target = (seed >> 8) as i64 % len.max(1) as i64;
+                    v.push(0xE8);
+                    v.extend_from_slice(&((target - here - 5) as i32).to_le_bytes());
+                }
+                1 => {
+                    // conditional jump, two-byte opcode
+                    let here = v.len() as i64;
+                    let target = (seed >> 16) as i64 % len.max(1) as i64;
+                    v.push(0x0F);
+                    v.push(0x84);
+                    v.extend_from_slice(&((target - here - 6) as i32).to_le_bytes());
+                }
+                2 => {
+                    // a displacement that lands outside: must NOT be moved
+                    v.push(0xE9);
+                    v.extend_from_slice(&0x4000_0000i32.to_le_bytes());
+                }
+                _ => v.push((seed >> 24) as u8),
+            }
+        }
+        v.truncate(len);
+        v
+    }
+
+    #[test]
+    fn round_trips_and_moves_targets_out() {
+        for len in [1, 5, 6, 64, 4096, 300_000] {
+            let data = code(len);
+            let mut work = data.clone();
+            let applied = Filter::X86Split.apply(&mut work);
+            match applied {
+                Ok(a) => {
+                    assert_eq!(a, Applied::Rebuilt);
+                    Filter::X86Split.unapply(&mut work).unwrap();
+                    assert_eq!(work, data, "len {len}");
+                }
+                // A buffer with no branch at all has nothing to move.
+                Err(_) => assert_eq!(work, data),
+            }
+        }
+    }
+
+    #[test]
+    fn a_truncated_or_forged_payload_is_refused() {
+        let data = code(50_000);
+        let mut work = data.clone();
+        Filter::X86Split.apply(&mut work).unwrap();
+        for cut in [0, 4, 12, work.len() / 2, work.len() - 1] {
+            let mut bad = work[..cut].to_vec();
+            assert!(Filter::X86Split.unapply(&mut bad).is_err(), "cut {cut}");
+        }
+        let mut wrong = work.clone();
+        wrong[0] = b'X';
+        assert!(Filter::X86Split.unapply(&mut wrong).is_err());
+        // A header whose lengths do not add up must be refused, not trusted.
+        let mut lied = work.clone();
+        lied[4] = lied[4].wrapping_add(1);
+        assert!(Filter::X86Split.unapply(&mut lied).is_err());
+    }
+
+    #[test]
+    fn data_that_only_looks_like_code_still_round_trips() {
+        let mut data = vec![0xE8u8; 1000];
+        data.extend(std::iter::repeat_n(0x0Fu8, 1000));
+        let mut work = data.clone();
+        if Filter::X86Split.apply(&mut work).is_ok() {
+            Filter::X86Split.unapply(&mut work).unwrap();
+        }
         assert_eq!(work, data);
     }
 }

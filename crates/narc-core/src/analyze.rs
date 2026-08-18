@@ -146,10 +146,36 @@ pub enum Class {
     Executable,
     /// Human-readable or source text: PPMd models it best.
     Text,
+    /// A JPEG photograph. Entropy-coded, but reversibly: lepton re-codes the
+    /// DCT coefficients and rebuilds the file bit for bit.
+    Jpeg,
+    /// A container built out of deflate streams — zip, PNG, gzip, docx, jar.
+    /// Its bytes are entropy-coded, but reversibly so, which is the one case
+    /// where already-compressed data can still be shrunk a lot.
+    Deflate,
     Generic,
 }
 
 const TRIAL_SAMPLE: usize = 64 * 1024;
+
+/// Deciding whether already-compressed data is *really* finished needs range,
+/// not detail: deflate leaves matches that are megabytes apart.
+const PRECOMP_TRIAL: usize = 1024 * 1024;
+
+/// The verdict for data whose magic says it is already compressed, skipping the
+/// deflate-container path. Used when a container is too small to be given a unit
+/// of its own, which recompression requires.
+pub fn plan_precompressed(head: &[u8], tier: Tier) -> Plan {
+    if saves_at_least(head, PRECOMP_TRIAL, 1) {
+        Plan {
+            codec: general_codec(tier),
+            filter: Filter::None,
+            kind: Class::Precompressed,
+        }
+    } else {
+        Plan::STORE
+    }
+}
 
 /// Decide how to store data given its first bytes.
 pub fn plan(head: &[u8], tier: Tier) -> Plan {
@@ -162,13 +188,78 @@ pub fn plan(head: &[u8], tier: Tier) -> Plan {
             kind: Class::Generic,
         };
     }
+    // Checked before the general precompressed test, because these formats are
+    // the exception to it: their bytes are compressed, and undoing that is worth
+    // 38%. Detection is by MAGIC, never by scanning for streams — a zip's
+    // central directory lives at the END of the file, so a head sample would
+    // silently disable the whole feature for zips.
+    if is_jpeg(head) {
+        return Plan {
+            // The codec runs over lepton's output, which is already entropy
+            // coded; the pipeline keeps whichever is smaller, and measured, the
+            // bare lepton blob always is.
+            codec: general_codec(tier),
+            filter: Filter::Jpeg,
+            kind: Class::Jpeg,
+        };
+    }
+    if is_deflate_container(head) {
+        return Plan {
+            codec: general_codec(tier),
+            filter: Filter::Deflate,
+            kind: Class::Deflate,
+        };
+    }
     match classify(head) {
+        // The magic says "already entropy-coded", and for JPEG, MP4 or zstd
+        // that is the end of it. But it is a claim about the *format*, not
+        // about the bytes: a zip written at deflate level 1, or a PNG of a
+        // screenshot, still carries real redundancy. MEASURED on a 4.93 MiB
+        // corpus of zips, PNGs and gzips: storing on magic alone cost
+        // 5,167,845 B, while 7-Zip — which simply tries — reached 4,047,465 B,
+        // and plain per-file LZMA2 -9e reached 4,048,662 B. So the verdict has
+        // to be earned on a sample.
+        //
+        // The sample must be a megabyte, and this is the whole trick: at 64 KiB
+        // every one of these files looks like noise (+0.02%), while at 1 MiB the
+        // compressible ones separate cleanly — source.zip −25.6%, a screenshot
+        // PNG −3.9% — and genuinely finished data (7z output, random bytes, a
+        // fully-deflated docx) sits at +0.00..0.01%. A 1% bar has three orders
+        // of magnitude of margin, and the per-unit raw fallback catches the rest.
+        Class::Precompressed if saves_at_least(head, PRECOMP_TRIAL, 1) => Plan {
+            codec: general_codec(tier),
+            filter: Filter::None,
+            kind: Class::Precompressed,
+        },
         Class::Precompressed => Plan::STORE,
+        // `classify` never returns this — the deflate containers are matched by
+        // magic before the classifier runs — but the arm is real rather than
+        // unreachable!(), so a future classifier change cannot panic here.
+        Class::Deflate => Plan {
+            codec: general_codec(tier),
+            filter: Filter::Deflate,
+            kind: Class::Deflate,
+        },
+        // Same story as Class::Deflate: matched by magic before the classifier.
+        Class::Jpeg => Plan {
+            codec: general_codec(tier),
+            filter: Filter::Jpeg,
+            kind: Class::Jpeg,
+        },
         Class::Executable => Plan {
             codec: general_codec(tier),
             // Machine code is full of relative call targets; making them
             // absolute turns repeated calls into repeated byte patterns.
-            filter: Filter::BcjX86,
+            // At the max tier the targets also LEAVE the code stream, which
+            // measured 3.5% better than patching them in place on 234 MiB of
+            // Windows DLLs — the four address bytes stop interrupting matches.
+            // The cheaper tiers keep the in-place filter: splitting costs a
+            // second pass and they exist to be fast.
+            filter: if tier == Tier::Max {
+                Filter::X86Split
+            } else {
+                Filter::BcjX86
+            },
             kind: Class::Executable,
         },
         Class::Text => Plan {
@@ -200,7 +291,10 @@ pub fn plan(head: &[u8], tier: Tier) -> Plan {
                     kind: Class::Generic,
                 };
             }
-            match crate::filters::detect_delta_stride(head)
+            // Capped deliberately: the detector runs one entropy pass per
+            // candidate distance, so it is the one test whose cost scales with
+            // the sample. 64 KiB is plenty to see a record structure.
+            match crate::filters::detect_delta_stride(&head[..head.len().min(TRIAL_SAMPLE)])
                 .and_then(|d| Filter::delta(d).ok())
                 .filter(|f| pays_off(head, *f))
             {
@@ -243,7 +337,9 @@ fn pays_off(head: &[u8], filter: Filter) -> bool {
         return false;
     };
     let mut filtered = sample.to_vec();
-    filter.apply(&mut filtered);
+    if filter.apply(&mut filtered).is_err() {
+        return false;
+    }
     match zstd::bulk::compress(&filtered, 1) {
         // Require a clear win: a filter byte and a decode-side pass are not
         // worth a fraction of a percent.
@@ -254,9 +350,15 @@ fn pays_off(head: &[u8], filter: Filter) -> bool {
 
 /// Cheap check that data is worth compressing at all: 3% savings on a sample.
 fn compresses(head: &[u8]) -> bool {
-    let sample = &head[..head.len().min(TRIAL_SAMPLE)];
+    saves_at_least(head, TRIAL_SAMPLE, 3)
+}
+
+/// Does a fast trial compression of the first `cap` bytes save at least
+/// `percent`?
+fn saves_at_least(head: &[u8], cap: usize, percent: u64) -> bool {
+    let sample = &head[..head.len().min(cap)];
     match zstd::bulk::compress(sample, 1) {
-        Ok(c) => c.len() * 100 < sample.len() * 97,
+        Ok(c) => (c.len() as u64) * 100 < (sample.len() as u64) * (100 - percent),
         Err(_) => false,
     }
 }
@@ -272,6 +374,24 @@ fn classify(b: &[u8]) -> Class {
         return Class::Text;
     }
     Class::Generic
+}
+
+/// Containers whose payload is deflate, and which `crate::deflate` can find
+/// streams in. A format listed here that yields no stream just falls back to
+/// the ordinary path, so the list may be optimistic — a PDF whose streams are
+/// all JPEG images costs one wasted scan and nothing else.
+/// JPEG, by the SOI marker plus the first marker byte of a segment. Deliberately
+/// the same test `is_precompressed` uses, so the two cannot disagree about a
+/// file.
+pub fn is_jpeg(b: &[u8]) -> bool {
+    b.starts_with(&[0xFF, 0xD8, 0xFF])
+}
+
+pub fn is_deflate_container(b: &[u8]) -> bool {
+    b.starts_with(&[0x50, 0x4B, 0x03, 0x04])
+        || b.starts_with(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
+        || (b.len() > 3 && b[0] == 0x1F && b[1] == 0x8B && b[2] == 0x08)
+        || b.starts_with(b"%PDF-")
 }
 
 fn is_executable(b: &[u8]) -> bool {
@@ -345,11 +465,52 @@ fn is_precompressed(b: &[u8]) -> bool {
 mod tests {
     use super::*;
 
+    /// Pseudo-random bytes: no structure for any codec to find.
+    fn noise(n: usize) -> Vec<u8> {
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        (0..n)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                (seed >> 24) as u8
+            })
+            .collect()
+    }
+
+    /// A JPEG is proposed for recompression, not stored on sight. Whether the
+    /// transform survives is the pipeline's decision — it round-trips the unit
+    /// and falls back to storing when lepton cannot model the file, which is
+    /// what happens to this synthetic one.
     #[test]
-    fn jpeg_is_stored_verbatim() {
+    fn a_jpeg_is_offered_to_lepton() {
         let mut jpeg = vec![0xFF, 0xD8, 0xFF, 0xE0];
-        jpeg.extend(std::iter::repeat_n(0x5Au8, 1000));
-        assert_eq!(plan(&jpeg, Tier::Max), Plan::STORE);
+        jpeg.extend(noise(200_000));
+        let p = plan(&jpeg, Tier::Max);
+        assert_eq!(p.filter, Filter::Jpeg);
+        assert_eq!(p.kind, Class::Jpeg);
+        assert_ne!(p.codec, Codec::Store);
+    }
+
+    /// The magic is a claim about the format, not about the bytes. Data that
+    /// still compresses must not be stored just because it says "JPEG" — that
+    /// cost 1.12 MB on a 4.93 MiB corpus of zips and PNGs.
+    #[test]
+    fn precompressed_magic_does_not_excuse_compressible_bytes() {
+        // An mp3, so the test stays about the magic-versus-bytes rule rather
+        // than about the JPEG path.
+        let mut mp3 = b"ID3   ".to_vec();
+        mp3.extend(std::iter::repeat_n(0x5Au8, 200_000));
+        let p = plan(&mp3, Tier::Max);
+        assert_ne!(p.codec, Codec::Store);
+        assert_eq!(p.kind, Class::Precompressed);
+    }
+
+    #[test]
+    fn a_real_mp3_is_stored_verbatim() {
+        let mut mp3 = b"ID3   ".to_vec();
+        mp3.extend(noise(200_000));
+        assert_eq!(plan(&mp3, Tier::Max), Plan::STORE);
     }
 
     #[test]
@@ -360,13 +521,18 @@ mod tests {
         assert_eq!(plan(text.as_bytes(), Tier::Max).filter, Filter::None);
     }
 
+    /// Machine code gets an x86 filter, and WHICH one is a tier decision: max
+    /// moves the branch targets into a stream of their own (measured 3.5%
+    /// better on 234 MiB of Windows DLLs), the cheaper tiers patch them in
+    /// place because splitting costs a second pass.
     #[test]
-    fn executables_get_the_bcj_filter() {
+    fn executables_get_an_x86_filter() {
         let mut exe = b"MZ\x90\x00\x03\x00\x00\x00".to_vec();
         exe.extend(std::iter::repeat_n(0xE8u8, 500));
-        let p = plan(&exe, Tier::Max);
-        assert_eq!(p.filter, Filter::BcjX86);
-        assert_eq!(p.codec, Codec::Lzma2);
+        assert_eq!(plan(&exe, Tier::Max).filter, Filter::X86Split);
+        assert_eq!(plan(&exe, Tier::Max).codec, Codec::Lzma2);
+        assert_eq!(plan(&exe, Tier::Normal).filter, Filter::BcjX86);
+        assert_eq!(plan(&exe, Tier::Fast).filter, Filter::BcjX86);
     }
 
     #[test]

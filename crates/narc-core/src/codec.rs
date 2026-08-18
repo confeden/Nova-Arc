@@ -4,7 +4,7 @@ use anyhow::{bail, Result};
 use lzma_rust2::{Lzma2Options, Lzma2Reader, Lzma2Writer};
 use ppmd_rust::{Ppmd7Decoder, Ppmd7Encoder};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Codec {
     /// Raw bytes, no compression.
     Store,
@@ -172,7 +172,11 @@ pub const PPMD7_ORDERS: [u8; 2] = [10, 16];
 /// instead of trusting it, and treat 0 as "the default" for chunks written
 /// before the parameter existed.
 fn ppmd7_order(param: u8) -> u32 {
-    let o = if param == 0 { PPMD7_ORDER_DEFAULT } else { param };
+    let o = if param == 0 {
+        PPMD7_ORDER_DEFAULT
+    } else {
+        param
+    };
     o.clamp(2, 64) as u32
 }
 
@@ -181,7 +185,7 @@ fn ppmd7_order(param: u8) -> u32 {
 /// where a full 4 MiB chunk stops restarting the model; below it the ratio
 /// falls off a cliff (48 MiB was 9% worse on one sample), above it nothing
 /// changes.
-const PPMD7_MEM_MAX: u32 = 256 << 20;
+pub const PPMD7_MEM_MAX: u32 = 256 << 20;
 
 /// Pool for a chunk of `unpacked_len` bytes: 32x the data, which is where the
 /// output stops changing at every size measured, so small chunks neither pay

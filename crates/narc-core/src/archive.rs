@@ -33,11 +33,26 @@ use crate::pipeline::{self, PackOptions};
 /// manifest from driving allocations, and for the memory model.
 pub const MAX_CHUNK: u32 = 32 * 1024 * 1024;
 
-pub(crate) const HEAD_SAMPLE: usize = 64 * 1024;
+/// How much of a file the analyzer gets to look at.
+///
+/// 1 MiB, not 64 KiB, because one of the questions it answers needs range: a
+/// zip written at deflate level 1 shows **+0.02%** on a 64 KiB zstd sample —
+/// indistinguishable from random noise — and **−25.6%** on a 1 MiB one. The
+/// bytes are free: `add_file` reads them anyway and chains them in front of the
+/// file, so nothing is read twice. Tests that only need a class keep their own
+/// smaller caps (see `analyze`).
+pub(crate) const HEAD_SAMPLE: usize = 1024 * 1024;
 
-/// Upper bound on a stored chunk. Compression can expand incompressible data
-/// slightly, hence the headroom; anything beyond is a corrupt manifest.
+/// Upper bound on a stored chunk. A max-tier unit is capped at twice
+/// `MAX_CHUNK`, and the check below is a strict `>`, so units of exactly 64 MiB
+/// are admitted. This may be raised, never lowered.
 const MAX_STORED_CHUNK: u64 = MAX_CHUNK as u64 * 2;
+
+/// Upper bound on the buffer a codec is asked to produce. A length-changing
+/// filter makes this bigger than the unit — undoing deflate turns a zip into
+/// several times its size — and it is what bounds extraction memory, so it is
+/// checked before anything is allocated. The attacker controls the manifest.
+pub(crate) const MAX_CODED_CHUNK: u64 = MAX_STORED_CHUNK * 4;
 
 /// How many footer candidates to try before declaring an archive corrupt.
 /// Each retry means "this footer's manifest did not verify"; a handful covers
@@ -65,19 +80,262 @@ pub struct Archive {
     writable: bool,
 }
 
-/// Progress of a long operation, for a UI that must stay alive while the max
-/// tier grinds through a large archive.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Progress {
-    pub files_done: u64,
-    pub files_total: u64,
-    pub bytes_done: u64,
-    pub bytes_total: u64,
+/// Which part of an operation is running. A byte count alone cannot explain a
+/// wait: the tail of a pack — draining the compressors, then writing and
+/// fsyncing the manifest — moves no source bytes at all, and on a source tree
+/// at the max tier it is most of the wall clock.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Phase {
+    /// Walking the inputs; totals are not known yet.
+    #[default]
+    Scan,
+    /// Reading and compressing, or extracting.
+    Work,
+    /// Inputs are consumed; the compressors are finishing what is in flight.
+    Drain,
+    /// Writing the manifest and the footer, with the fsync barrier between.
+    Commit,
+    /// Finished. The only reading where `bytes_done == bytes_total`.
+    Done,
 }
 
-/// Callback invoked as work completes. Called from the thread driving the
-/// operation, so it must be cheap and must not block.
+/// Progress of a long operation, for a UI that must stay alive while the max
+/// tier grinds through a large archive.
+///
+/// `bytes_done` counts source bytes whose work is FINISHED — for a pack, bytes
+/// whose unit has been written to the archive or deduplicated away; for an
+/// extraction, bytes written or deliberately skipped. It never runs ahead of
+/// the work, never goes backwards, and equals `bytes_total` exactly once, in
+/// the single reading with [`Phase::Done`].
+///
+/// It deliberately is NOT the same thing as `bytes_read`. Measured on a 113 MiB
+/// source tree at the max tier, a reader-side count reached 100% after 1.85 s of
+/// a 38.59 s operation — the reader can be a full in-flight budget ahead of the
+/// archive. `bytes_read` is kept because the gap between the two is the useful
+/// part: it is the work currently inside the compressors, which is what tells a
+/// UI that a long silence is progress rather than a hang.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Progress {
+    pub phase: Phase,
+    pub files_done: u64,
+    pub files_total: u64,
+    /// Source bytes whose work is finished. See the type docs.
+    pub bytes_done: u64,
+    pub bytes_total: u64,
+    /// Source bytes taken off disk so far; runs ahead of `bytes_done`.
+    pub bytes_read: u64,
+    /// Compressed bytes appended to the archive so far.
+    pub bytes_stored: u64,
+    /// Compression units finished, and handed to the pipeline so far. At the
+    /// max tier a 113 MiB tree is about six units compressed in parallel, so
+    /// this is what explains a long wait that no byte count can.
+    pub units_done: u64,
+    pub units_total: u64,
+}
+
+/// Callback invoked as work completes. Must be cheap and must not block: it is
+/// called from the thread driving the operation AND, during packing, from the
+/// pipeline's writer thread, which is the serialization point of the whole run.
 pub type ProgressFn<'a> = &'a (dyn Fn(Progress) + Send + Sync);
+
+/// Owns the progress reading and the decision of when to report it.
+///
+/// Two jobs, both of which have to live in one place. The reading is assembled
+/// from counters owned by different threads — the reader's files and bytes, the
+/// writer's committed units — so it needs one lock, or a UI receives halves of
+/// two different moments. And the throttling has to be here too, because only
+/// this side knows the totals: the GUI's own throttle was built with a total of
+/// `1`, which made its step one byte and let all 5751 events through.
+struct Reporter<'a> {
+    cb: Option<ProgressFn<'a>>,
+    state: Mutex<Snap>,
+}
+
+#[derive(Default)]
+struct Snap {
+    p: Progress,
+    /// Source bytes behind committed units, and bytes deduplicated away. Kept
+    /// apart because they arrive from different threads.
+    stored_unpacked: u64,
+    deduped: u64,
+    /// Watermarks: the last reported values, so a step can be measured.
+    sent_done: u64,
+    sent_files: u64,
+    /// Highest `files_done` ever assembled, so the reading cannot regress.
+    peak_files: u64,
+    /// The scan's own watermark. It cannot share `sent_files`: `emit` rewrites
+    /// that one from `files_done`, which is zero during a scan, so the scan's
+    /// step reset to zero on every report and every file got an event.
+    sent_scan: u64,
+    step_bytes: u64,
+    step_files: u64,
+}
+
+/// Roughly this many readings per operation. 500 is fine for a 200 px bar and
+/// leaves the webview time to repaint; the point of a step at all is that one
+/// event per file means 5751 IPC round trips on a source tree.
+const REPORTS_PER_OP: u64 = 500;
+
+/// While walking the inputs there is no total to divide, so the scan reports
+/// every this many files just to prove it is moving.
+const SCAN_STEP_FILES: u64 = 500;
+
+impl<'a> Reporter<'a> {
+    fn new(cb: Option<ProgressFn<'a>>) -> Self {
+        Reporter {
+            cb,
+            // The steps must start large, not at zero: before `totals` is known
+            // a zero step means "any movement is enough", and the scan of a
+            // 5751-file tree emitted one event per file.
+            state: Mutex::new(Snap {
+                step_bytes: u64::MAX,
+                step_files: SCAN_STEP_FILES,
+                ..Snap::default()
+            }),
+        }
+    }
+
+    /// True when nothing is listening, so every call site can return early and
+    /// the CLI pays nothing at all.
+    fn idle(&self) -> bool {
+        self.cb.is_none()
+    }
+
+    fn totals(&self, files_total: u64, bytes_total: u64) {
+        if self.idle() {
+            return;
+        }
+        let mut s = self.state.lock().expect("progress mutex poisoned");
+        s.p.files_total = files_total;
+        s.p.bytes_total = bytes_total;
+        s.step_bytes = (bytes_total / REPORTS_PER_OP).max(1);
+        s.step_files = (files_total / REPORTS_PER_OP).max(1);
+        // The scan counted discoveries against this watermark; the work phase
+        // measures finished files against it instead.
+        s.sent_files = 0;
+        self.emit(s, true);
+    }
+
+    fn phase(&self, phase: Phase) {
+        if self.idle() {
+            return;
+        }
+        let mut s = self.state.lock().expect("progress mutex poisoned");
+        s.p.phase = phase;
+        self.emit(s, true);
+    }
+
+    /// Files seen while walking the inputs.
+    ///
+    /// This grows `files_total`, not `files_done`: during a scan the total is
+    /// what is being discovered and nothing is finished yet. Reporting it as
+    /// `files_done` made the reading jump from 5751 back to 1 when packing
+    /// started, which is the one thing a progress reading may never do.
+    fn scanned(&self, files: u64) {
+        if self.idle() {
+            return;
+        }
+        let mut s = self.state.lock().expect("progress mutex poisoned");
+        s.p.files_total = files;
+        let force = files >= s.sent_scan.saturating_add(SCAN_STEP_FILES);
+        if force {
+            s.sent_scan = files;
+        }
+        self.emit(s, force);
+    }
+
+    /// Reader side of a pack.
+    fn read(&self, files_done: u64, bytes_read: u64, deduped: u64, submitted: u64) {
+        if self.idle() {
+            return;
+        }
+        let mut s = self.state.lock().expect("progress mutex poisoned");
+        s.p.files_done = files_done;
+        s.p.bytes_read = bytes_read;
+        s.p.units_total = submitted;
+        s.deduped = deduped;
+        self.emit(s, false);
+    }
+
+    /// Writer side of a pack: the honest counter.
+    fn stored(&self, t: pipeline::StoredTick) {
+        if self.idle() {
+            return;
+        }
+        let mut s = self.state.lock().expect("progress mutex poisoned");
+        s.stored_unpacked = t.unpacked;
+        s.p.bytes_stored = t.packed;
+        s.p.units_done = t.units;
+        s.p.units_total = s.p.units_total.max(t.units);
+        // Always report a finished unit: at the max tier there are only a few,
+        // and each one is the only news for tens of seconds.
+        self.emit(s, true);
+    }
+
+    /// Extraction, where finished work is per file and includes files the
+    /// overwrite policy deliberately skipped.
+    fn extracted(&self, files: u64, bytes: u64) {
+        if self.idle() {
+            return;
+        }
+        let mut s = self.state.lock().expect("progress mutex poisoned");
+        s.stored_unpacked += bytes;
+        s.p.files_done += files;
+        self.emit(s, false);
+    }
+
+    /// The one reading that is allowed to say 100%.
+    fn finish(&self) {
+        if self.idle() {
+            return;
+        }
+        let mut s = self.state.lock().expect("progress mutex poisoned");
+        s.p.phase = Phase::Done;
+        s.p.files_done = s.p.files_total;
+        s.p.bytes_done = s.p.bytes_total;
+        s.p.bytes_read = s.p.bytes_read.max(s.p.bytes_total);
+        let p = s.p;
+        drop(s);
+        if let Some(cb) = self.cb {
+            cb(p);
+        }
+    }
+
+    /// Assemble the reading, enforce its guarantees, and hand it over if it has
+    /// moved far enough. Takes the guard so the lock is released before the
+    /// callback runs — a UI callback must never be able to stall the writer
+    /// while holding this lock.
+    fn emit(&self, mut s: std::sync::MutexGuard<'_, Snap>, force: bool) {
+        // A file can grow between the stat and the read, so the denominator has
+        // to be able to follow, or the reading exceeds 100%.
+        s.p.bytes_total = s.p.bytes_total.max(s.p.bytes_read);
+        let done = s
+            .stored_unpacked
+            .saturating_add(s.deduped)
+            .min(s.p.bytes_total);
+        // Held one byte short on purpose: it makes "100%" mean Done and nothing
+        // else, structurally, instead of asking every consumer to check Phase.
+        let ceiling = s.p.bytes_total.saturating_sub(1);
+        s.p.bytes_done = done.min(ceiling).max(s.p.bytes_done);
+        // Both counters are clamped monotone here rather than trusted to be:
+        // they are fed by different threads, and extraction's workers each
+        // report their own completions.
+        s.p.files_done = s.p.files_done.max(s.peak_files);
+        s.peak_files = s.p.files_done;
+        let moved = s.p.bytes_done >= s.sent_done.saturating_add(s.step_bytes)
+            || s.p.files_done >= s.sent_files.saturating_add(s.step_files);
+        if !force && !moved {
+            return;
+        }
+        s.sent_done = s.p.bytes_done;
+        s.sent_files = s.p.files_done;
+        let p = s.p;
+        drop(s);
+        if let Some(cb) = self.cb {
+            cb(p);
+        }
+    }
+}
 
 #[derive(Debug, Default)]
 pub struct AddStats {
@@ -114,6 +372,30 @@ pub struct InfoStats {
     pub unit_max: u64,
     /// Bytes stored per codec id, so it is visible which codec actually won.
     pub by_codec: Vec<(u8, u64)>,
+}
+
+/// One compression unit as it was actually stored.
+///
+/// The two numbers that explain an archive's ratio are how big its units came
+/// out and which codec won each one, and neither is visible from the summary in
+/// [`InfoStats`]: an average hides a bimodal distribution, and "stored by
+/// lzma2 6 MiB, ppmd7 2 MiB" hides *which* data went where. This is the
+/// per-unit form, for measuring rather than reporting.
+#[derive(Clone, Debug)]
+pub struct UnitInfo {
+    pub idx: u32,
+    pub unpacked: u64,
+    pub packed: u64,
+    pub codec: u8,
+    /// PPMd7's model order, 0 for other codecs.
+    pub param: u8,
+    pub filter: u8,
+    /// How many file entries have bytes in this unit.
+    pub files: usize,
+    /// The most common extension among them, and how many distinct ones there
+    /// are — a unit holding one extension is the extension sort working.
+    pub top_ext: String,
+    pub distinct_exts: usize,
 }
 
 impl Archive {
@@ -251,10 +533,19 @@ so unchanged data still deduplicates",
             ));
         }
 
+        let reporter = Reporter::new(progress);
+        reporter.phase(Phase::Scan);
+
         // Collect the work list first and sort it by extension: neighbouring
         // files of the same type share a unit, which is where the compressor
         // finds what they have in common.
-        let mut work: Vec<(PathBuf, String)> = Vec::new();
+        //
+        // The size is taken here, from metadata the walk has already read, and
+        // carried along. A separate `fs::metadata` pass over the work list used
+        // to build the total, and its `filter_map` dropped stat failures
+        // silently — those files were still read, so the reading could exceed
+        // 100% with nothing to explain it.
+        let mut work: Vec<(PathBuf, String, u64)> = Vec::new();
         for input in inputs {
             let meta = fs::symlink_metadata(input)
                 .with_context(|| format!("cannot access {}", input.display()))?;
@@ -267,7 +558,8 @@ so unchanged data still deduplicates",
                     Some(n) => paths::normalize_rel(Path::new(n))?,
                     None => bail!("cannot determine archive name for {}", input.display()),
                 };
-                work.push((input.clone(), rel));
+                work.push((input.clone(), rel, meta.len()));
+                reporter.scanned(work.len() as u64);
             } else {
                 let root_name = input.file_name().map(|n| n.to_owned());
                 for entry in walkdir::WalkDir::new(input)
@@ -291,7 +583,13 @@ so unchanged data still deduplicates",
                         relp.push(n);
                     }
                     relp.push(inner);
-                    work.push((entry.path().to_path_buf(), paths::normalize_rel(&relp)?));
+                    let len = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                    work.push((
+                        entry.path().to_path_buf(),
+                        paths::normalize_rel(&relp)?,
+                        len,
+                    ));
+                    reporter.scanned(work.len() as u64);
                 }
             }
         }
@@ -320,26 +618,34 @@ so unchanged data still deduplicates",
                 .collect(),
         );
 
-        let files_total = work.len() as u64;
-        let bytes_total: u64 = work
-            .iter()
-            .filter_map(|(disk, _)| fs::metadata(disk).ok().map(|m| m.len()))
-            .sum();
-        let out = pipeline::pack_with(&mut self.file, opts, |sub| {
-            for (disk, rel) in &work {
-                packer.add_file(sub, disk, rel.clone(), &mut stats)?;
-                if let Some(cb) = progress {
-                    cb(Progress {
-                        files_done: stats.files as u64,
-                        files_total,
-                        bytes_done: stats.bytes_in,
-                        bytes_total,
-                    });
+        reporter.totals(work.len() as u64, work.iter().map(|(_, _, len)| len).sum());
+        reporter.phase(Phase::Work);
+        // The writer reports what has actually landed in the archive; the
+        // reader only reports how far ahead it has read. Both feed one snapshot.
+        let sink = |t: pipeline::StoredTick| reporter.stored(t);
+        let out = pipeline::pack_with(
+            &mut self.file,
+            opts,
+            (!reporter.idle()).then_some(&sink as pipeline::StoredFn),
+            |sub| {
+                for (disk, rel, _) in &work {
+                    packer.add_file(sub, disk, rel.clone(), &mut stats)?;
+                    reporter.read(
+                        stats.files as u64,
+                        stats.bytes_in,
+                        stats.bytes_deduped,
+                        sub.submitted(),
+                    );
                 }
-            }
-            packer.flush(sub, &mut stats)?;
-            Ok(())
-        })?;
+                packer.flush(sub, &mut stats, pack::Cut::End)?;
+                // Everything is submitted; what remains is compressors emptying
+                // out. Without this the tail of a max-tier pack is silent for
+                // most of the run.
+                reporter.phase(Phase::Drain);
+                Ok(())
+            },
+        )?;
+        reporter.phase(Phase::Commit);
 
         // The writer emitted units in submission order, so the indices the
         // packer predicted (base + submission index) are now correct.
@@ -362,6 +668,7 @@ so unchanged data still deduplicates",
             }
         }
         self.commit()?;
+        reporter.finish();
         Ok(stats)
     }
 
@@ -402,6 +709,8 @@ so unchanged data still deduplicates",
         progress: Option<ProgressFn>,
     ) -> Result<ExtractStats> {
         let mut stats = ExtractStats::default();
+        let reporter = Reporter::new(progress);
+        reporter.phase(Phase::Scan);
         let selectors: Option<Vec<String>> = select.map(|s| {
             s.iter()
                 .map(|x| paths::normalize_selector(x))
@@ -476,9 +785,8 @@ so unchanged data still deduplicates",
             .iter()
             .any(|c| matches!(c.codec, 2 | 3));
         let workers = opts.extract_workers(slow_codecs).min(work.len().max(1));
-        let bytes_total: u64 = work.iter().map(|(e, _)| e.size).sum();
-        let done_files = AtomicUsize::new(0);
-        let done_bytes = std::sync::atomic::AtomicU64::new(0);
+        reporter.totals(work.len() as u64, work.iter().map(|(e, _)| e.size).sum());
+        reporter.phase(Phase::Work);
         let counters = Mutex::new((0usize, 0u64, 0usize)); // files, bytes, skipped
         let failure: Mutex<Option<anyhow::Error>> = Mutex::new(None);
         let stop = AtomicBool::new(false);
@@ -520,18 +828,16 @@ so unchanged data still deduplicates",
                             Ok(Some(bytes)) => {
                                 local.0 += 1;
                                 local.1 += bytes;
-                                if let Some(cb) = progress {
-                                    let done = done_files.fetch_add(1, Ordering::Relaxed) + 1;
-                                    let b = done_bytes.fetch_add(bytes, Ordering::Relaxed) + bytes;
-                                    cb(Progress {
-                                        files_done: done as u64,
-                                        files_total: work.len() as u64,
-                                        bytes_done: b,
-                                        bytes_total,
-                                    });
-                                }
+                                reporter.extracted(1, bytes);
                             }
-                            Ok(None) => local.2 += 1,
+                            // A file kept per the overwrite policy is decided
+                            // work, and it is in the denominator. Not counting
+                            // it left the GUI — which extracts with `skip` —
+                            // showing 0% for an entire re-extraction.
+                            Ok(None) => {
+                                local.2 += 1;
+                                reporter.extracted(1, entry.size);
+                            }
                             Err(e) => {
                                 stop.store(true, Ordering::Relaxed);
                                 let mut slot = failure.lock().expect("mutex");
@@ -553,11 +859,89 @@ so unchanged data still deduplicates",
         if let Some(e) = failure.into_inner().expect("mutex") {
             return Err(e);
         }
+        reporter.finish();
         let c = counters.into_inner().expect("mutex");
         stats.files = c.0;
         stats.bytes = c.1;
         stats.skipped_existing = c.2;
         Ok(stats)
+    }
+
+    /// Rename or move entries, by exact path or by directory prefix.
+    ///
+    /// This is what the format exists for. A path lives in the manifest and the
+    /// bytes live in units, so moving a 4 GiB video into another folder rewrites
+    /// a few hundred bytes of manifest and re-reads nothing at all. The same
+    /// thing as remove + add would re-read and re-compress the file — which for
+    /// an archive of family photos is the difference between instant and
+    /// minutes.
+    ///
+    /// Refuses rather than clobbers: a destination that already exists, or that
+    /// only differs in letter case from an existing entry, is an error.
+    pub fn rename(&mut self, from: &str, to: &str) -> Result<usize> {
+        if !self.writable {
+            bail!("archive opened read-only");
+        }
+        let from = paths::normalize_selector(from);
+        let to = paths::normalize_selector(to);
+        if from.is_empty() || to.is_empty() {
+            bail!("both a source and a destination path are required");
+        }
+        if from == to {
+            return Ok(0);
+        }
+        // Moving a directory into itself would build paths forever.
+        if to.starts_with(&format!("{from}/")) {
+            bail!("cannot move {from:?} into itself");
+        }
+        // The destination must be a path this archive could have been built
+        // with, checked by the same rules extraction applies.
+        paths::sanitize(&to).with_context(|| format!("unsafe destination {to:?}"))?;
+
+        let prefix = format!("{from}/");
+        let mut moves: Vec<(usize, String)> = Vec::new();
+        for (i, f) in self.manifest.files.iter().enumerate() {
+            let dest = if f.path == from {
+                to.clone()
+            } else if let Some(rest) = f.path.strip_prefix(&prefix) {
+                format!("{to}/{rest}")
+            } else {
+                continue;
+            };
+            paths::sanitize(&dest).with_context(|| format!("unsafe destination {dest:?}"))?;
+            moves.push((i, dest));
+        }
+        if moves.is_empty() {
+            bail!("not found in archive: {from}");
+        }
+
+        // Collisions are checked against the whole archive as it will look
+        // afterwards, including entries that only differ in letter case —
+        // Windows and macOS cannot hold both, and a rename must not create a
+        // pair that a later extraction would silently drop.
+        let moving: HashSet<usize> = moves.iter().map(|(i, _)| *i).collect();
+        let mut taken: HashMap<String, String> = self
+            .manifest
+            .files
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !moving.contains(i))
+            .map(|(_, f)| (paths::collision_key(&f.path), f.path.clone()))
+            .collect();
+        for (_, dest) in &moves {
+            let key = paths::collision_key(dest);
+            if let Some(other) = taken.get(&key) {
+                bail!("{dest:?} would collide with {other:?} already in the archive");
+            }
+            taken.insert(key, dest.clone());
+        }
+
+        let n = moves.len();
+        for (i, dest) in moves {
+            self.manifest.files[i].path = dest;
+        }
+        self.commit()?;
+        Ok(n)
     }
 
     /// Remove entries (exact path or directory prefix). Space is reclaimed
@@ -667,6 +1051,48 @@ so unchanged data still deduplicates",
         }
     }
 
+    /// Every live unit, in archive order, with the codec that won it and the
+    /// file types it holds. See [`UnitInfo`].
+    pub fn units(&self) -> Vec<UnitInfo> {
+        let mut members: HashMap<u32, HashMap<String, usize>> = HashMap::new();
+        let mut files: HashMap<u32, HashSet<usize>> = HashMap::new();
+        for (i, f) in self.manifest.files.iter().enumerate() {
+            for e in &f.extents {
+                if files.entry(e.unit).or_default().insert(i) {
+                    *members
+                        .entry(e.unit)
+                        .or_default()
+                        .entry(group_key(&f.path))
+                        .or_default() += 1;
+                }
+            }
+        }
+        let mut out = Vec::with_capacity(files.len());
+        for (idx, rec) in self.manifest.chunks.iter().enumerate() {
+            let idx = idx as u32;
+            let Some(exts) = members.get(&idx) else {
+                continue; // dead unit, kept only as a dedup source
+            };
+            let top = exts
+                .iter()
+                .max_by(|a, b| a.1.cmp(b.1).then_with(|| b.0.cmp(a.0)))
+                .map(|(e, _)| e.clone())
+                .unwrap_or_default();
+            out.push(UnitInfo {
+                idx,
+                unpacked: rec.unpacked,
+                packed: rec.packed,
+                codec: rec.codec,
+                param: rec.param,
+                filter: rec.filter,
+                files: files.get(&idx).map_or(0, |s| s.len()),
+                top_ext: if top.is_empty() { "-".into() } else { top },
+                distinct_exts: exts.len(),
+            });
+        }
+        out
+    }
+
     /// Rewrite the archive keeping only live units, verifying every one on the
     /// way, then atomically replace the original. Consumes the archive (the
     /// file handle must be closed for the replace to work on Windows).
@@ -715,6 +1141,9 @@ so unchanged data still deduplicates",
                         tmp.as_file_mut().write_all(&buf)?;
                         let n = u32::try_from(new.chunks.len())
                             .context("archive unit count exceeds format limit")?;
+                        // Cloned wholesale on purpose: `filtered` and every
+                        // other coding detail must carry through compact
+                        // untouched, only the offset moves.
                         new.chunks.push(ChunkRec {
                             offset: off,
                             ..rec.clone()
@@ -735,9 +1164,9 @@ so unchanged data still deduplicates",
         let after = tmp.as_file_mut().metadata()?.len();
 
         drop(file); // close the original handle before replacing (Windows)
-        // Keep the archive's own identity: replacing in place preserves its
-        // permissions, attributes and creation time, where persisting the
-        // temporary file over it would carry the temp file's ACL instead.
+                    // Keep the archive's own identity: replacing in place preserves its
+                    // permissions, attributes and creation time, where persisting the
+                    // temporary file over it would carry the temp file's ACL instead.
         let (tmp_file, tmp_path) = tmp.keep().map_err(|e| anyhow::anyhow!("{}", e.error))?;
         drop(tmp_file);
         let swapped = narc_platform::replace_file(&tmp_path, &path);
@@ -840,7 +1269,7 @@ fn extract_one(
 /// Grouping key for units: the extension, lowercased. Sorting files by it puts
 /// .rs next to .rs and .png next to .png, which is what makes a shared unit
 /// compress well.
-fn group_key(rel: &str) -> String {
+pub(crate) fn group_key(rel: &str) -> String {
     match rel.rsplit_once('.') {
         Some((_, ext)) if !ext.is_empty() && ext.len() <= 16 && !ext.contains('/') => {
             ext.to_lowercase()
@@ -901,16 +1330,29 @@ fn read_packed(reader: &mut &File, rec: &ChunkRec, file_len: u64) -> Result<Vec<
 
 /// Decompress a chunk and check it against the hash recorded in the manifest.
 fn verify_chunk(rec: &ChunkRec, packed: &[u8]) -> Result<Vec<u8>> {
+    // The codec is asked for the length it produced, which is NOT the original
+    // length once a filter can change it. That number also fixes the LZMA2
+    // window and the PPMd7 model pool, neither of which is stored anywhere
+    // else: too narrow an LZMA2 window fails only when a match happens to reach
+    // past it, and a mismatched PPMd7 pool decodes into garbage of exactly the
+    // right length.
+    let coded = rec.coded_len();
+    if coded > MAX_CODED_CHUNK {
+        bail!("corrupt manifest: implausible coded chunk size");
+    }
     let mut data = codec::decompress(
         Codec::from_id(rec.codec)?,
         packed,
-        rec.unpacked as usize,
+        coded as usize,
         rec.param,
     )?;
     // Undo the pre-compression transform before checking the hash: the hash
     // was taken over the original bytes, so it also proves the filter round
     // -tripped exactly.
-    crate::filters::Filter::from_id(rec.filter)?.unapply(&mut data);
+    crate::filters::Filter::from_id(rec.filter)?.unapply(&mut data)?;
+    if data.len() as u64 != rec.unpacked {
+        bail!("chunk unfiltered to {} bytes, manifest says {}", data.len(), rec.unpacked);
+    }
     if blake3::hash(&data).as_bytes()[..16] != rec.hash {
         bail!("chunk checksum mismatch - archive is corrupt");
     }

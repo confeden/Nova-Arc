@@ -15,6 +15,12 @@ crossbeam-channel = "0.5"
 fastcdc = "3"
 lzma-rust2 = "0.19"
 ppmd-rust = "1.4"
+# Exact pin: preflate's correction-record format is not stable across
+# versions, and filter id 34 means "records written by 0.7.x" forever.
+preflate-rs = "=0.7.6"
+# Same reasoning as preflate: the Lepton bitstream is tied to the encoder, and
+# filter id 35 means "written by 0.5.x" forever.
+lepton_jpeg = "=0.5.8"
 filetime = "0.2"
 rmp-serde = "1"
 serde = { version = "1", features = ["derive"] }
