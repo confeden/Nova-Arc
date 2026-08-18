@@ -23,12 +23,23 @@ type ArchiveInfo = {
   entries: Entry[];
 };
 
+type Phase = "scan" | "work" | "drain" | "commit" | "done";
+
 type OpProgress = {
   op: string;
+  phase: Phase;
   files_done: number;
   files_total: number;
+  /** Source bytes whose work is finished; reaches the total exactly once. */
   bytes_done: number;
   bytes_total: number;
+  /** Source bytes read ahead of that — the gap is what is being compressed. */
+  bytes_read: number;
+  bytes_stored: number;
+  /** Blocks finished / submitted. One block is 32-64 MiB at the max tier and
+   *  takes tens of seconds, so this is the only honest account of a long wait. */
+  units_done: number;
+  units_total: number;
 };
 
 type OpResult = { op: string; ok: boolean; message: string; details: string[] };
@@ -73,6 +84,7 @@ const el = {
   machine: $<HTMLSpanElement>("machine"),
   progressWrap: $<HTMLDivElement>("progress-wrap"),
   progress: $<HTMLDivElement>("progress"),
+  progressRead: $<HTMLDivElement>("progress-read"),
   level: $<HTMLSelectElement>("level"),
   memory: $<HTMLSelectElement>("memory"),
   checkAll: $<HTMLInputElement>("check-all"),
@@ -88,6 +100,19 @@ const state = {
   sortAsc: true,
   busy: false,
   menuTarget: "" as string,
+  /** Last reading, and when it arrived. The clock lives here, not in the core:
+   *  narc-core reports on data movement, and speed/ETA/"nothing for a while"
+   *  all need arrival times, which the webview knows for free. */
+  prog: null as OpProgress | null,
+  progAt: 0,
+  startedAt: 0,
+  /** Bytes/s, exponentially smoothed: a deduplicated unit costs nothing and a
+   *  unique max-tier one costs three encode passes, so the raw rate is spiky. */
+  rate: 0,
+  ratePrev: 0,
+  /** The bar may never go backwards, whatever the numbers do. */
+  lastPct: 0,
+  ticker: 0 as ReturnType<typeof setInterval> | 0,
 };
 
 function human(n: number): string {
@@ -149,8 +174,99 @@ function setBusy(busy: boolean, text?: string) {
   }
   if (!busy) refreshButtons();
   el.progressWrap.classList.toggle("hidden", !busy);
-  if (!busy) el.progress.style.width = "0%";
+  if (busy) {
+    // Fresh operation: forget everything about the previous one, or its rate
+    // and its width bleed into the first frames of this one.
+    state.prog = null;
+    state.progAt = 0;
+    state.startedAt = performance.now();
+    state.rate = 0;
+    state.ratePrev = 0;
+    state.lastPct = 0;
+    el.progress.style.width = "0%";
+    el.progressRead.style.width = "0%";
+    el.progressWrap.classList.remove("indeterminate", "stalled");
+    if (!state.ticker) state.ticker = setInterval(renderProgress, 200);
+  } else if (state.ticker) {
+    clearInterval(state.ticker);
+    state.ticker = 0;
+  }
+  // The width is deliberately NOT reset here: the last frame of a successful
+  // operation used to be an ERASED bar, so a full one was never seen.
   if (text) setStatus(text);
+}
+
+// At the max tier the reader consumes a 113 MiB tree in under a second and the
+// codecs then work for another 38, so "drain" is not a brief tail — it is most
+// of the operation. Its label has to say what is happening, not that something
+// is finishing up.
+const PHASE_TEXT: Record<Phase, (op: string) => string> = {
+  scan: () => "Сканирование",
+  work: (op) => (op === "extract" ? "Распаковка" : "Упаковка"),
+  drain: (op) => (op === "extract" ? "Распаковка" : "Сжатие"),
+  commit: () => "Запись оглавления",
+  done: () => "Готово",
+};
+
+function hhmmss(sec: number): string {
+  const s = Math.max(0, Math.round(sec));
+  if (s < 60) return `${s} с`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m} мин ${String(s % 60).padStart(2, "0")} с`;
+  return `${Math.floor(m / 60)} ч ${String(m % 60).padStart(2, "0")} мин`;
+}
+
+/** Draw on a timer, not on arrival. One max-tier unit takes tens of seconds and
+ *  produces no event, so an event-driven bar simply stops repainting — which is
+ *  exactly what "always at 100% with an unknown wait" looked like. */
+function renderProgress() {
+  const p = state.prog;
+  if (!state.busy) return;
+  const now = performance.now();
+  const elapsed = (now - state.startedAt) / 1000;
+  if (!p) {
+    setStatus(`Подготовка… ${hhmmss(elapsed)}`);
+    return;
+  }
+  // No denominator: running, cannot say how far.
+  const measurable = p.bytes_total > 0;
+  el.progressWrap.classList.toggle("indeterminate", !measurable);
+  el.progressWrap.classList.toggle(
+    "stalled",
+    measurable && p.phase !== "done" && now - state.progAt > 1500,
+  );
+  if (measurable) {
+    const raw = (100 * p.bytes_done) / p.bytes_total;
+    // Clamped below 100 until the core says Done, so a full bar means finished
+    // and nothing else.
+    const cap = p.phase === "done" ? 100 : 99;
+    state.lastPct = Math.min(cap, Math.max(state.lastPct, raw));
+    el.progress.style.width = `${state.lastPct.toFixed(1)}%`;
+    el.progressRead.style.width = `${Math.min(100, (100 * p.bytes_read) / p.bytes_total).toFixed(1)}%`;
+  }
+
+  const head = PHASE_TEXT[p.phase](p.op);
+  const parts: string[] = [];
+  if (p.phase === "scan") {
+    parts.push(`${p.files_total} файл(ов) найдено`);
+  } else if (measurable) {
+    parts.push(`${state.lastPct.toFixed(0)}%`);
+    parts.push(`${human(p.bytes_done)} из ${human(p.bytes_total)}`);
+    if (p.files_total > 0) parts.push(`${p.files_done}/${p.files_total} файлов`);
+    // A block is 32-64 MiB at the max tier and yields nothing until it is done,
+    // so saying "block 3 of 6" is the difference between a wait and a hang.
+    if (p.units_total > 1) parts.push(`блок ${p.units_done}/${p.units_total}`);
+  }
+  if (state.rate > 0) parts.push(`${human(state.rate)}/с`);
+  // An estimate before a few seconds of data is worse than none, and there is
+  // nothing to estimate once the source is consumed.
+  const left = measurable ? p.bytes_total - p.bytes_done : 0;
+  if (state.rate > 0 && elapsed > 3 && left > 0 && (p.phase === "work" || p.phase === "drain")) {
+    parts.push(`осталось ~${hhmmss(left / state.rate)}`);
+  } else {
+    parts.push(hhmmss(elapsed));
+  }
+  setStatus(`${head}: ${parts.join(" · ")}`);
 }
 
 function setStatus(text: string, error = false) {
@@ -433,18 +549,34 @@ void getCurrentWebview().onDragDropEvent(async (event) => {
 
 void listen<OpProgress>("narc://progress", (ev) => {
   const p = ev.payload;
-  const pct = p.bytes_total > 0 ? (100 * p.bytes_done) / p.bytes_total : 0;
-  el.progress.style.width = `${Math.min(100, pct).toFixed(1)}%`;
-  setStatus(
-    `${p.op === "extract" ? "Распаковка" : "Упаковка"}: ${p.files_done}/${p.files_total} — ${human(
-      p.bytes_done,
-    )} из ${human(p.bytes_total)}`,
-  );
+  const now = performance.now();
+  // Events arrive up to ~20 times a second and must not each drag three DOM
+  // writes with them; they only update the model. renderProgress paints.
+  const prev = state.prog;
+  if (prev && now > state.progAt) {
+    const dt = (now - state.progAt) / 1000;
+    const db = p.bytes_done - prev.bytes_done;
+    if (db >= 0 && dt > 0) {
+      const inst = db / dt;
+      state.rate = state.rate > 0 ? state.rate * 0.7 + inst * 0.3 : inst;
+    }
+  }
+  state.prog = p;
+  state.progAt = now;
 });
 
 void listen<OpResult>("narc://done", async (ev) => {
   const r = ev.payload;
   setBusy(false);
+  // setBusy hides the track; on success bring it back full for a moment. The
+  // whole point of a progress bar is the frame where it is complete, and that
+  // frame used to be an erased bar.
+  if (r.ok) {
+    el.progressWrap.classList.remove("indeterminate", "stalled", "hidden");
+    el.progress.style.width = "100%";
+    el.progressRead.style.width = "100%";
+    setTimeout(() => el.progressWrap.classList.add("hidden"), 600);
+  }
   if (!r.ok) {
     setStatus(r.message, true);
     return;

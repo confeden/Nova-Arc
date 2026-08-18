@@ -304,6 +304,7 @@ tr.sel svg.ico {
 }
 
 .progress {
+  position: relative;
   flex: 0 0 auto;
   width: 200px;
   height: 8px;
@@ -316,6 +317,45 @@ tr.sel svg.ico {
   width: 0;
   background: var(--accent);
   transition: width 0.12s linear;
+}
+/* Bytes read ahead of what is stored: at the max tier the reader finishes in
+   seconds while the compressors work for a minute, and this ghost layer is what
+   shows that the wait is work. */
+#progress-read {
+  position: absolute;
+  inset: 0;
+  opacity: 0.28;
+}
+#progress {
+  position: relative;
+}
+/* compact and remove cannot report a fraction. A sliding stripe says "running,
+   cannot say how far" instead of an empty bar that reads as frozen. */
+.progress.indeterminate > div {
+  width: 100% !important;
+  transition: none;
+  background: repeating-linear-gradient(
+    115deg,
+    var(--accent) 0 10px,
+    transparent 10px 22px
+  );
+  animation: narc-indeterminate 0.9s linear infinite;
+}
+.progress.indeterminate > #progress-read {
+  opacity: 0;
+}
+@keyframes narc-indeterminate {
+  from { background-position: 0 0; }
+  to { background-position: 22px 0; }
+}
+/* One unit of a max-tier pack is 32-64 MiB and takes tens of seconds, during
+   which there is genuinely nothing to report. Pulsing says so. */
+.progress.stalled > #progress {
+  animation: narc-pulse 1.6s ease-in-out infinite;
+}
+@keyframes narc-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.45; }
 }
 
 /* --- context menu --------------------------------------------------------- */

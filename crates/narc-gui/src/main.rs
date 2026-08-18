@@ -8,10 +8,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use narc_core::{Archive, Overwrite, PackOptions, Progress, Tier};
+use narc_core::{Archive, Overwrite, PackOptions, Phase, Progress, Tier};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, State};
 
@@ -45,10 +44,22 @@ struct ArchiveInfo {
 #[derive(Serialize, Clone)]
 struct OpProgress {
     op: String,
+    /// "scan" | "work" | "drain" | "commit" | "done" — a byte count cannot
+    /// explain the tail of a pack, where no source bytes move at all.
+    phase: &'static str,
     files_done: u64,
     files_total: u64,
+    /// Source bytes whose work is finished. Reaches the total exactly once.
     bytes_done: u64,
     bytes_total: u64,
+    /// Source bytes read ahead; the gap to `bytes_done` is what is inside the
+    /// compressors right now, which is how the UI tells work from a hang.
+    bytes_read: u64,
+    bytes_stored: u64,
+    /// Blocks finished / handed to the compressors. At the max tier a whole
+    /// tree is a handful of blocks, so this is what explains a long wait.
+    units_done: u64,
+    units_total: u64,
 }
 
 #[derive(Serialize, Clone)]
@@ -76,47 +87,99 @@ fn pack_options(level: &str, threads: Option<usize>, memory_mib: Option<u64>) ->
     }
 }
 
-/// Progress events are cheap but not free: at one event per small file a big
-/// tree would flood the webview, so they are throttled to ~20/second worth of
-/// work by only emitting when a percent of the total has moved.
-struct Throttle {
-    last: AtomicU64,
-    step: u64,
-}
-
-impl Throttle {
-    fn new(total: u64) -> Self {
-        Throttle {
-            last: AtomicU64::new(0),
-            step: (total / 200).max(1),
-        }
-    }
-
-    fn should_emit(&self, done: u64) -> bool {
-        let last = self.last.load(Ordering::Relaxed);
-        if done >= last + self.step {
-            self.last.store(done, Ordering::Relaxed);
-            true
-        } else {
-            false
-        }
-    }
-}
-
-fn emit_progress(app: &AppHandle, op: &str, p: Progress, throttle: &Throttle) {
-    if !throttle.should_emit(p.bytes_done) {
-        return;
-    }
+/// Forward one reading to the webview.
+///
+/// There is no throttle here any more. There used to be one, constructed with a
+/// total of `1`, which made its step one byte and passed every event through —
+/// all 5751 of them on a source tree. Throttling belongs where the totals are
+/// known, so it now lives in narc-core and this side just forwards.
+fn emit_progress(app: &AppHandle, op: &str, p: Progress) {
     let _ = app.emit(
         "narc://progress",
         OpProgress {
             op: op.to_string(),
+            phase: match p.phase {
+                Phase::Scan => "scan",
+                Phase::Work => "work",
+                Phase::Drain => "drain",
+                Phase::Commit => "commit",
+                Phase::Done => "done",
+            },
             files_done: p.files_done,
             files_total: p.files_total,
             bytes_done: p.bytes_done,
             bytes_total: p.bytes_total,
+            bytes_read: p.bytes_read,
+            bytes_stored: p.bytes_stored,
+            units_done: p.units_done,
+            units_total: p.units_total,
         },
     );
+}
+
+/// Tell the webview an operation is running but cannot be measured — `compact`
+/// and `remove` report nothing, and a bar frozen at zero for the minutes a
+/// compact takes is indistinguishable from a hang.
+fn emit_indeterminate(app: &AppHandle, op: &str) {
+    let _ = app.emit(
+        "narc://progress",
+        OpProgress {
+            op: op.to_string(),
+            phase: "work",
+            files_done: 0,
+            files_total: 0,
+            bytes_done: 0,
+            bytes_total: 0,
+            bytes_read: 0,
+            bytes_stored: 0,
+            units_done: 0,
+            units_total: 0,
+        },
+    );
+}
+
+/// Guarantees the webview hears about the end of an operation even if the
+/// worker thread panics.
+///
+/// `finish` is the only thing that emits `narc://done`, and it is the last
+/// statement of each spawned closure — so any panic inside narc-core skipped it
+/// entirely, `setBusy(false)` was never called, and every button stayed disabled
+/// for the rest of the session with the bar frozen. That is the same picture as
+/// the progress bug and no amount of progress reporting fixes it.
+struct DoneGuard {
+    app: AppHandle,
+    op: &'static str,
+    armed: bool,
+}
+
+impl DoneGuard {
+    fn new(app: AppHandle, op: &'static str) -> Self {
+        DoneGuard {
+            app,
+            op,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for DoneGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.app.emit(
+                "narc://done",
+                OpResult {
+                    op: self.op.to_string(),
+                    ok: false,
+                    message: "операция прервана из-за внутренней ошибки".into(),
+                    details: Vec::new(),
+                },
+            );
+        }
+    }
 }
 
 fn finish(app: &AppHandle, op: &str, result: anyhow::Result<Vec<String>>) {
@@ -201,6 +264,7 @@ fn create_archive(
     memory_mib: Option<u64>,
 ) {
     std::thread::spawn(move || {
+        let mut guard = DoneGuard::new(app.clone(), "create");
         let opts = pack_options(&level, threads, memory_mib);
         let inputs: Vec<PathBuf> = inputs.into_iter().map(PathBuf::from).collect();
         let result = (|| -> anyhow::Result<Vec<String>> {
@@ -210,12 +274,11 @@ fn create_archive(
             } else {
                 Archive::create(&path)?
             };
-            let throttle = Throttle::new(1);
             let handle = app.clone();
             let stats = a.add_paths_with(
                 &inputs,
                 &opts,
-                Some(&move |p: Progress| emit_progress(&handle, "create", p, &throttle)),
+                Some(&move |p: Progress| emit_progress(&handle, "create", p)),
             )?;
             let mut details = vec![
                 format!("Файлов: {}", stats.files),
@@ -239,6 +302,7 @@ fn create_archive(
             details.extend(stats.warnings.iter().cloned());
             Ok(details)
         })();
+        guard.disarm();
         finish(&app, "create", result);
     });
 }
@@ -254,6 +318,7 @@ fn extract_archive(
     memory_mib: Option<u64>,
 ) {
     std::thread::spawn(move || {
+        let mut guard = DoneGuard::new(app.clone(), "extract");
         let opts = pack_options("normal", threads, memory_mib);
         let policy = match overwrite.as_str() {
             "force" => Overwrite::Force,
@@ -267,14 +332,13 @@ fn extract_archive(
             } else {
                 Some(paths.as_slice())
             };
-            let throttle = Throttle::new(1);
             let handle = app.clone();
             let stats = a.extract_reporting(
                 Path::new(&dest),
                 sel,
                 policy,
                 &opts,
-                Some(&move |p: Progress| emit_progress(&handle, "extract", p, &throttle)),
+                Some(&move |p: Progress| emit_progress(&handle, "extract", p)),
             )?;
             let mut details = vec![format!(
                 "Распаковано {} файл(ов), {}",
@@ -290,6 +354,7 @@ fn extract_archive(
             details.extend(stats.warnings.iter().cloned());
             Ok(details)
         })();
+        guard.disarm();
         finish(&app, "extract", result);
     });
 }
@@ -322,6 +387,10 @@ fn open_entry(
 #[tauri::command]
 fn compact_archive(app: AppHandle, archive: String) {
     std::thread::spawn(move || {
+        let mut guard = DoneGuard::new(app.clone(), "compact");
+        // Neither operation can report a fraction; say so instead of
+        // leaving an empty bar that looks like a hang.
+        emit_indeterminate(&app, "compact");
         let result = (|| -> anyhow::Result<Vec<String>> {
             let a = Archive::open_rw(Path::new(&archive))?;
             let (before, after) = a.compact()?;
@@ -331,6 +400,7 @@ fn compact_archive(app: AppHandle, archive: String) {
                 human(after)
             )])
         })();
+        guard.disarm();
         finish(&app, "compact", result);
     });
 }
@@ -338,6 +408,10 @@ fn compact_archive(app: AppHandle, archive: String) {
 #[tauri::command]
 fn remove_entries(app: AppHandle, archive: String, paths: Vec<String>) {
     std::thread::spawn(move || {
+        let mut guard = DoneGuard::new(app.clone(), "remove");
+        // Neither operation can report a fraction; say so instead of
+        // leaving an empty bar that looks like a hang.
+        emit_indeterminate(&app, "remove");
         let result = (|| -> anyhow::Result<Vec<String>> {
             let mut a = Archive::open_rw(Path::new(&archive))?;
             let n = a.remove(&paths)?;
@@ -345,6 +419,7 @@ fn remove_entries(app: AppHandle, archive: String, paths: Vec<String>) {
                 "Удалено записей: {n}. Освободить место — «Уплотнить»."
             )])
         })();
+        guard.disarm();
         finish(&app, "remove", result);
     });
 }
