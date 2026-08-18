@@ -13,47 +13,44 @@
   80-byte offset-bound footer, generation counter, resumable crash recovery,
   rw-open truncates uncommitted tail, `compact` with verify + atomic replace.
   Spec: `docs/format.md`.
-- Multi-threaded packing pipeline (`pipeline.rs`): reader hashes+dedups,
-  worker pool compresses, writer appends in submission order; byte-budget
-  backpressure. Extraction thread count keys off the archive's codecs (1 for
-  zstd/store, all cores for LZMA2/PPMd since they are CPU-bound to decode).
-  `narc-core` exposes `Progress` callbacks on add/extract for the GUI.
-  CLI: `-j/--threads`, `--memory`, `--eco`, `--full`, packing prints peak RAM.
+- Multi-threaded packing pipeline (`pipeline.rs`): reader hashes+dedups, worker
+  pool compresses, writer appends in submission order; byte-budget backpressure.
+  Extract threads key off the archive's codecs (1 for zstd/store, all cores for
+  LZMA2/PPMd, which are CPU-bound to decode). `Progress` callbacks feed the GUI.
+  CLI: `-j/--threads`, `--memory`, `--eco`, `--full`; packing prints peak RAM.
 - CLI: create/add/extract/list/remove/rename/compact/info (+aliases c/a/x/l/rm/mv),
   extract has `--force` / `--skip-existing` (default: refuse to clobber).
 - `rename` (`Archive::rename`) moves an entry or a whole folder by rewriting the
-  manifest ONLY: 77 entries in 0.053 s, zero new units, byte-identical
-  extraction. Reorganising folders must never re-read or re-compress. Cost is
-  one appended manifest, reclaimed by `compact`.
-- GUI (crate narc-gui, VERIFIED running): open/create/add/extract/remove/
-  compact, virtualized file list with type glyphs + solid-block badges, sortable
-  columns, multi-select, right-click menu, double-click opens a file from a temp
-  dir, Explorer drag&drop both ways, streamed+throttled progress, level/memory
-  in toolbar, below-normal priority, opens an archive passed as argv[1].
-  Shortcuts "nArc (dev)" and "Nova Arc" are on D:\Desktop.
-- Progress FIXED (the bar sat at 100% while 95% of the work was still to come;
-  four independent causes, from a reader-side counter to a GUI throttle built
-  with total=1). The PROGRESS CONTRACT below is the durable residue.
-- 81 tests green (`cargo test`), clippy clean. Covers roundtrip, append without
+  manifest ONLY: 77 entries in 0.053 s, zero new units, byte-identical output.
+  Reorganising folders must never re-read or re-compress. Cost is one appended
+  manifest, reclaimed by `compact`.
+- GUI (narc-gui, VERIFIED running): open/create/add/extract/remove/compact,
+  virtualized list with type glyphs + unit badges, sortable columns, multi-select,
+  context menu, double-click opens a file from a temp dir, Explorer drag&drop
+  both ways, throttled progress, level/memory in toolbar, argv[1] opens an
+  archive. Shortcuts "nArc (dev)" and "Nova Arc" are on D:\Desktop.
+- Progress FIXED (bar sat at 100% while 95% of the work remained; four causes).
+  The PROGRESS CONTRACT below is the durable residue.
+- 82 tests green (`cargo test`), clippy clean. Covers roundtrip, append without
   rewrite, dedup, replace, remove+compact, rename/move, selective extract, crash
   recovery, torn-manifest fallback, embedded-footer confusion, forged footer,
   writer lock, selector normalization, pre-1970 mtime, overwrite policy,
   compact-detects-corruption, the progress contract, deflate/JPEG/PDF
-  recompression round-trips, the PDF scanner's four traps, and the
-  `legacy-*.narc` fixtures written by the pre-recompression build.
-- Compression v2 DONE: analyzer picks codec+filter per content class
-  (analyze.rs), solid blocks grouped by extension, LZMA2 + PPMd7 codecs, BCJ x86
-  + delta filters (BCJ verified byte-identical against liblzma).
+  recompression round-trips, the PDF scanner's traps, and the `legacy-*.narc`
+  fixtures written by the pre-recompression build.
+- Compression v2 DONE: analyzer picks codec+filter per content class, solid
+  blocks grouped by extension, LZMA2 + PPMd7, BCJ x86 + delta filters (BCJ
+  verified byte-identical against liblzma).
 - Measured residue (8 logical cores, `bash test/bench.sh`): BCJ on real .exe
   +4.4-5.7% vs unfiltered, every codec/level. PPMd7 vs zstd-19 on 4 MiB prose
   -24%; LZMA2 vs zstd-19 on prose only ±2% (its edge needs big dictionaries).
   Threads scale 3.1x on big text. Peak RAM tracks `--memory` on EXTRACT too, on
-  a max archive with 30-60 MB units: 256M→153 MiB, default→1.0 GiB. Bounded,
-  but "~10 MiB peak" is long gone — units are the cost. (FIXED on the way:
+  a max archive with 30-60 MB units: 256M→153 MiB, default→1.0 GiB — bounded,
+  but "~10 MiB peak" is long gone, units are the cost. (FIXED on the way:
   `PPMD_POOL_BYTES` said 64 MiB while `ppmd7_mem_size` allocates up to 256 MiB,
   so `extract_workers` spawned ~4x the workers the budget allows.)
-- `test/` = local playground (gitignored): corpora, bench.sh, RU readme.
-- zip/7z/rar support and GPU: not started. Research reports: `docs/research/`.
+- `test/` = local playground (gitignored): corpora, bench.sh, RU readme. zip/7z/
+  rar support and GPU: not started. Research reports live in `docs/research/`.
 
 ## Architecture & invariants
 
@@ -489,10 +486,16 @@
 
 - Language: Rust. Open repo `confeden/Nova-Arc`; do NOT add a LICENSE file
   yet (owner will choose later). Zero telemetry/ads/analytics — ever.
-- Chat with owner in Russian; code/docs/CLI output in English; GUI must ship
-  RU localization.
-- Two-phase compression (analyze → compress) is a core requirement, as is
-  editing archives without repack (this is THE differentiator).
+- Chat with owner in Russian; code, docs/ and CLI output in English. EXCEPTIONS,
+  both owner-set: README.md and CHANGELOG.md are RUSSIAN. GUI ships RU too.
+- CHANGELOG.md: `# История изменений`, `## [X.Y.Z]` newest first, flat bullets
+  leading with a bold user-facing sentence. NO DATES — the owner asked for them
+  out; do not reintroduce them. Version numbering follows this file's milestones
+  (0.7.0 = recompression), and Cargo.toml + tauri.conf.json must match.
+- THE differentiator is now stated in this order: recompressing what is already
+  compressed FIRST (JPEG/PDF/zip — where other archivers have nothing), then
+  per-file method choice, then editing without repack. Two-phase compression
+  (analyze → compress) and cheap edits remain core requirements.
 - Resource policy: use all cores but at below-normal priority (system must
   stay responsive); bounded, configurable memory (weak PCs: extract must
   always work); GPU (CUDA/nvCOMP-class) acceleration to be attempted.
