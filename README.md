@@ -1,28 +1,42 @@
 # Nova Arc
 
-An archiver built around a question the popular formats never answered:
-**why should changing one file cost a whole repack?**
+Архиватор, построенный вокруг вопроса, на который популярные форматы так и не ответили: **почему замена одного файла стоит пересборки всего архива?**
 
-`.narc` is an append-only container of content-defined chunks. Replacing a
-photo inside a 700-photo archive appends the difference and nothing else —
-about a second, instead of rebuilding gigabytes. Deleted space is reclaimed
-when you ask for it, not before.
+`.narc` дописывается только вперёд. Заменить одну фотографию среди семисот — это дописать разницу и ничего больше: секунда вместо перепаковки гигабайтов. Освободившееся место возвращается тогда, когда вы об этом попросите, а не при каждой правке.
 
-Compression is decided per file, not per archive: the analyzer looks at what
-the data actually is, then the strongest tier compresses each block with
-several codecs and keeps the smallest result. On the Silesia corpus that
-matches 7-Zip's best ratio in a seventh of the time. Where it still loses, the
-benchmarks in this repository say so plainly.
+Метод сжатия выбирается под каждый файл, а не один на весь архив. Анализатор смотрит, что это за данные, после чего на максимальном уровне несколько кодеков сжимают каждый блок наперегонки и остаётся меньший результат.
 
-Written in Rust. Windows first, then Linux, macOS and Android. A desktop app
-and a command-line tool, both offline: no telemetry, no ads, no analytics —
-and there never will be.
+Отдельно Nova Arc умеет то, чего архиваторы обычно не делают вовсе: разворачивает уже сжатое — JPEG, PDF, zip, PNG, gzip — и пережимает содержимое заново, собирая исходный файл обратно бит в бит.
 
-Early development. The format will change before 1.0.
+## Сравнение с 7-Zip
+
+Замеры на одной машине, 7-Zip 26.02 `-mx9`, максимальный уровень Nova Arc. Случаи, где Nova Arc проигрывает, показаны наравне с остальными.
+
+| Данные | Nova Arc | 7-Zip -mx9 | |
+|---|---:|---:|---:|
+| Фотографии с камеры | 13,3 МиБ | 16,5 МиБ | **−19%** |
+| PDF-документы | 5,0 МиБ | 6,3 МиБ | **−20%** |
+| Zip, PNG, gzip, docx | 2,3 МиБ | 3,9 МиБ | **−40%** |
+| Silesia | 41,7 МиБ | ≈47 МиБ | **−11%** |
+| Дерево исходного кода | 8,9 МиБ | 8,7 МиБ | +2% |
+| Установленная программа | 89,1 МиБ | 83,5 МиБ | +7% |
+
+Отставание на последних двух — плата за дешёвую правку: 7-Zip сжимает всё одним сплошным потоком, поэтому изменить внутри него один файл нельзя, не собрав архив заново.
+
+## Ещё
+
+- Расход памяти ограничен и настраивается: распаковка обязана работать на слабой машине.
+- Пониженный приоритет процессора, памяти и диска по умолчанию — система остаётся отзывчивой под нагрузкой.
+- Настольное приложение и программа командной строки. Обе работают офлайн: ни телеметрии, ни рекламы, ни аналитики — и не будет.
+
+Написано на Rust. Сначала Windows, затем Linux, macOS и Android.
+
+Ранняя разработка: формат ещё изменится до версии 1.0.
 
 ---
 
-- [Format specification](docs/format.md)
-- [Research the design is based on](docs/research/)
+- [История изменений](CHANGELOG.md)
+- [Спецификация формата](docs/format.md)
+- [Исследования, на которых построены решения](docs/research/)
 
-License: to be chosen before the first release.
+Лицензия будет выбрана до первого релиза.

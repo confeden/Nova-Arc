@@ -2420,7 +2420,7 @@ dependencies = [
 
 [[package]]
 name = "narc-cli"
-version = "0.1.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2430,7 +2430,7 @@ dependencies = [
 
 [[package]]
 name = "narc-core"
-version = "0.1.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -2453,7 +2453,7 @@ dependencies = [
 
 [[package]]
 name = "narc-gui"
-version = "0.1.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "narc-core",
@@ -2468,7 +2468,7 @@ dependencies = [
 
 [[package]]
 name = "narc-platform"
-version = "0.1.0"
+version = "0.7.0"
 dependencies = [
  "windows-sys 0.60.2",
 ]
