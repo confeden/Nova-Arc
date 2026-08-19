@@ -81,7 +81,11 @@ impl Tier {
         // cleared the 1% trial bar, is not worth the full tournament: PPMd7
         // models symbol contexts, and data an entropy coder has already been
         // over has none left to model. It ran anyway and won nothing.
-        if self == Tier::Max && kind == Some(Class::Precompressed) {
+        // `Class::Wav` joins it for the same reason one step later: by the time a
+        // codec sees the unit, the record-width filter or FLAC has already run
+        // and what is left is an entropy-coded stream. Measured on 518 MB of
+        // PCM: LZMA2 and bsc split the units between them, PPMd7 took none.
+        if self == Tier::Max && matches!(kind, Some(Class::Precompressed) | Some(Class::Wav)) {
             return vec![(first, 0), (Codec::Bsc, 0)];
         }
         // The normal tier gets a two-horse race rather than a single pick.

@@ -35,16 +35,41 @@ const WAVE_EXTENSIBLE: u16 = 0xFFFE;
 const MAX_CHANNELS: u16 = 8;
 const MAX_SAMPLE_RATE: u32 = 655_350;
 
-struct Fmt {
-    channels: u16,
-    sample_rate: u32,
-    bits: u16,
+/// What the `fmt ` chunk says. Public because a .wav too large for one unit is
+/// split by the packer, and every piece after the first carries no `fmt ` of
+/// its own — the format has to travel with the plan instead of being re-parsed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Fmt {
+    pub channels: u16,
+    pub sample_rate: u32,
+    pub bits: u16,
 }
 
 impl Fmt {
-    fn frame_bytes(&self) -> usize {
+    pub fn frame_bytes(&self) -> usize {
         self.channels as usize * (self.bits / 8) as usize
     }
+
+    /// Can `encode_piece` transform audio in this format at all? A refusal here
+    /// is a fallback, never an error: the packer stores the file the ordinary
+    /// way and nothing is lost but the transform.
+    pub fn supported(&self) -> bool {
+        (self.bits == 16 || self.bits == 24)
+            && (1..=MAX_CHANNELS).contains(&self.channels)
+            && (1..=MAX_SAMPLE_RATE).contains(&self.sample_rate)
+            && self.frame_bytes() > 0
+    }
+}
+
+/// One unit's worth of a .wav: where the PCM sits inside the unit's bytes, and
+/// what it is. Everything outside `pcm` is wrapper and is stored verbatim, so a
+/// middle piece of a split file has an empty wrapper and a first or last piece
+/// carries the RIFF header or the trailing chunks.
+#[derive(Clone, Copy, Debug)]
+pub struct Piece {
+    pub fmt: Fmt,
+    pub pcm_start: usize,
+    pub pcm_len: usize,
 }
 
 fn u16le(b: &[u8], at: usize) -> u16 {
@@ -67,10 +92,23 @@ pub fn is_wav(b: &[u8]) -> bool {
 
 /// Walk the RIFF chunk list and return `fmt ` and the extent of `data`.
 ///
+/// Public so the packer can plan a split from the head bytes it has already
+/// read, without a second pass over the file.
+///
 /// Chunks are word-aligned: an odd payload is followed by a pad byte that is
 /// NOT counted in the declared size. The walk has to honour that or it drifts
 /// one byte per odd chunk and reads the next id from the middle of a payload.
-fn parse(data: &[u8]) -> Result<(Fmt, usize, usize)> {
+pub fn probe(data: &[u8]) -> Result<(Fmt, usize, usize)> {
+    probe_within(data, data.len())
+}
+
+/// As [`probe`], for a buffer that is only the HEAD of a longer file.
+///
+/// `total` is the length of the whole file. Without it the walk stops at the
+/// `data` chunk of any large .wav — its declared size runs past a 1 MiB head,
+/// which for a complete buffer means a truncated file and for a head means
+/// nothing at all. The packer plans a split from the head, so it needs this.
+pub fn probe_within(data: &[u8], total: usize) -> Result<(Fmt, usize, usize)> {
     ensure!(is_wav(data), "not a RIFF/WAVE file");
     let mut fmt: Option<Fmt> = None;
     let mut pcm: Option<(usize, usize)> = None;
@@ -84,10 +122,16 @@ fn parse(data: &[u8]) -> Result<(Fmt, usize, usize)> {
         // Stop the walk rather than guess; whatever is left stays in the
         // wrapper verbatim, and if `data` was never reached the transform is
         // refused below, which is the truncated case.
-        if body.saturating_add(size) > data.len() {
+        if body.saturating_add(size) > total {
             break;
         }
+        // The chunk fits in the file, but its body may still be past the end of
+        // a head buffer. `data` needs only its position; anything we have to
+        // READ has to be here.
         if id == b"fmt " && fmt.is_none() {
+            if body + size > data.len() {
+                break;
+            }
             ensure!(size >= 16, "fmt chunk is {size} bytes, needs 16");
             let f = &data[body..body + size];
             let mut tag = u16le(f, 0);
@@ -143,34 +187,44 @@ fn from_samples(samples: &[i32], bits: u16, out: &mut Vec<u8>) {
     }
 }
 
-/// Replace a .wav with `[header][wrapper][flac]`, where the wrapper is the file
-/// with its `data` payload cut out.
+/// Replace a whole .wav with `[header][wrapper][flac]`, where the wrapper is
+/// the file with its `data` payload cut out.
 pub fn encode(data: &[u8]) -> Result<Vec<u8>> {
-    let (fmt, off, len) = parse(data)?;
-    ensure!(
-        fmt.bits == 16 || fmt.bits == 24,
-        "{}-bit PCM is not transformed",
-        fmt.bits
-    );
-    ensure!(
-        (1..=MAX_CHANNELS).contains(&fmt.channels),
-        "{} channels is outside FLAC's range",
-        fmt.channels
-    );
-    ensure!(
-        (1..=MAX_SAMPLE_RATE).contains(&fmt.sample_rate),
-        "sample rate {} is outside FLAC's range",
-        fmt.sample_rate
-    );
+    let (fmt, off, len) = probe(data)?;
+    encode_piece(
+        data,
+        Piece {
+            fmt,
+            pcm_start: off,
+            pcm_len: len,
+        },
+    )
+}
+
+/// The general form: `buf` is one unit, `p.pcm` is the run of whole PCM frames
+/// inside it, and everything else is wrapper. A whole file is the case where
+/// the wrapper happens to be a RIFF header and a tail.
+pub fn encode_piece(buf: &[u8], p: Piece) -> Result<Vec<u8>> {
+    let Piece {
+        fmt,
+        pcm_start: off,
+        pcm_len: len,
+    } = p;
+    ensure!(fmt.supported(), "{fmt:?} is not integer PCM this can carry");
     let frame = fmt.frame_bytes();
-    ensure!(frame > 0, "fmt describes a zero-byte frame");
-    ensure!(len > 0, "empty data chunk");
-    // A partial frame at the end cannot become FLAC samples. Refusing keeps the
-    // wrapper honest: everything it holds is either a whole frame or verbatim.
+    ensure!(len > 0, "empty pcm run");
+    ensure!(
+        off.checked_add(len).is_some_and(|e| e <= buf.len()),
+        "pcm run {off}..{len} is outside the {}-byte unit",
+        buf.len()
+    );
+    // A partial frame cannot become FLAC samples. Refusing keeps the wrapper
+    // honest: everything it holds is either a whole frame or verbatim.
     ensure!(
         len.is_multiple_of(frame),
-        "data chunk is {len} bytes, not a whole number of {frame}-byte frames"
+        "pcm run is {len} bytes, not a whole number of {frame}-byte frames"
     );
+    let data = buf;
 
     let samples = to_samples(&data[off..off + len], fmt.bits);
     let flac = encode_flac(&samples, &fmt)?;

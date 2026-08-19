@@ -209,11 +209,18 @@ Phase 1 (analysis), per file and again per unit, from the head bytes:
 | other, fixed-width records | delta at the detected width | zstd | LZMA2 |
 | other, incompressible | — | store | store |
 
-The first three rows need the WHOLE file: a zip's central directory is at its
-end, lepton reads one complete JPEG, and a `.wav`'s RIFF chunk list has to
-arrive intact. Such a file is given a unit of its own, which is only possible
-between 64 KiB and twice the unit size — outside that range it takes the
-ordinary path for its content.
+The first two rows need the WHOLE file: a zip's central directory is at its end
+and lepton reads one complete JPEG. Such a file is given a unit of its own,
+which is only possible between 64 KiB and twice the unit size — that upper
+bound is the largest chunk a reader accepts, not a tuning knob. Outside the
+range the file takes the ordinary path for its content.
+
+A `.wav` is the exception, because FLAC frames are independent: a file past the
+bound is cut into unit-sized runs of whole frames, each its own unit. Only the
+first piece carries the RIFF header and only the last carries whatever follows
+the `data` chunk; the pieces in between are bare PCM. Their format therefore
+cannot be re-read from the bytes and travels with the packer's plan — but it is
+written into every record, so nothing about decoding changes.
 
 The record width is not declared anywhere, so it is inferred: the width that
 minimises the order-0 entropy of the differenced stream, then **verified** by

@@ -158,6 +158,12 @@ struct Job {
     candidates: Vec<(Codec, u8)>,
     /// Reversible transform to apply before compressing (0 = none).
     filter: u8,
+    /// Set when this unit is one piece of a .wav that was too large to be
+    /// transformed whole. A middle piece is bare PCM with no `fmt ` chunk in
+    /// it, so the format cannot be re-parsed from the bytes and has to arrive
+    /// with the job. The stored record carries it onward, which is why the
+    /// decode side needs nothing extra.
+    wav: Option<crate::wav::Piece>,
     /// Bytes charged to the memory budget for this chunk.
     charge: u64,
 }
@@ -415,6 +421,34 @@ impl Submitter<'_> {
         candidates: Vec<(Codec, u8)>,
         filter: u8,
     ) -> Result<u32> {
+        self.submit_job(data, hash, candidates, filter, None)
+    }
+
+    /// As [`Self::submit_filtered`], for one piece of a split .wav.
+    pub fn submit_wav(
+        &mut self,
+        data: Vec<u8>,
+        hash: [u8; 16],
+        candidates: Vec<(Codec, u8)>,
+        piece: crate::wav::Piece,
+    ) -> Result<u32> {
+        self.submit_job(
+            data,
+            hash,
+            candidates,
+            crate::filters::Filter::Wav.id(),
+            Some(piece),
+        )
+    }
+
+    fn submit_job(
+        &mut self,
+        data: Vec<u8>,
+        hash: [u8; 16],
+        candidates: Vec<(Codec, u8)>,
+        filter: u8,
+        wav: Option<crate::wav::Piece>,
+    ) -> Result<u32> {
         // Input plus a worst-case output buffer of the same size.
         let charge = data.len() as u64 * 2;
         if !self.budget.acquire(charge) {
@@ -427,6 +461,7 @@ impl Submitter<'_> {
             hash,
             candidates,
             filter,
+            wav,
             charge,
         };
         match self.tx.as_ref().expect("submitter closed").send(job) {
@@ -472,6 +507,7 @@ fn compress_job(
         hash,
         candidates,
         filter,
+        wav,
         charge,
     } = job;
     let unpacked = data.len() as u64;
@@ -494,7 +530,17 @@ fn compress_job(
     // transform from a file's magic, and a container whose streams preflate
     // cannot model simply gets stored the ordinary way. Aborting the whole
     // operation over one unit would be absurd.
-    let applied = match f.apply(&mut data) {
+    // A split .wav cannot go through `Filter::apply`, which reads the format out
+    // of the buffer it is handed: a middle piece is bare PCM. Same filter id,
+    // same record, same decode path — only the encoder needs telling.
+    let attempt = match wav {
+        Some(p) => crate::wav::encode_piece(&data, p).map(|v| {
+            data = v;
+            crate::filters::Applied::Rebuilt
+        }),
+        None => f.apply(&mut data),
+    };
+    let applied = match attempt {
         Ok(a) => a,
         Err(_) => {
             let data = original.take().unwrap_or(data);
@@ -637,6 +683,7 @@ fn plain(
             hash,
             candidates,
             filter: 0,
+            wav: None,
             charge,
         },
         level,

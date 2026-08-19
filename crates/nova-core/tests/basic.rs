@@ -1169,67 +1169,89 @@ fn wav_audio_is_recompressed_and_still_extracts() {
     assert_same_tree(&src, &out.join("audio"));
 }
 
-/// A .wav too large for a unit of its own must still come back byte for byte.
+/// A .wav too large for one unit is CUT, not given up on.
 ///
-/// The solo cap is the READER'S bound, not a heuristic: `read_packed` refuses a
-/// chunk above `MAX_STORED_CHUNK`, so a packer that hands a bigger file its own
-/// unit produces an archive that packs, lists, and then fails to extract with
-/// "corrupt manifest: implausible chunk size". Measured by doing it. This holds
-/// the fallback: past the cap the file takes the ordinary binary path, keeps
-/// the record-width filter, and round-trips.
+/// The solo cap is the reader's bound — `read_packed` refuses a chunk above
+/// `MAX_STORED_CHUNK` — so it cannot simply be raised for big audio. FLAC
+/// frames are independent, so the file is split into unit-sized runs of whole
+/// frames instead. Every piece after the first is bare PCM with no `fmt `
+/// chunk in it, which is the whole reason the format travels with the plan
+/// rather than being re-parsed from the bytes.
+///
+/// The second file is the control: same magic, IEEE float instead of integer
+/// PCM, so the split must be refused and the ordinary path taken.
 #[test]
-fn a_wav_past_the_solo_cap_falls_back_and_round_trips() {
+fn a_wav_past_the_solo_cap_is_split_and_round_trips() {
     let tmp = tempfile::tempdir().unwrap();
     let src = tmp.path().join("audio");
     fs::create_dir_all(&src).unwrap();
 
-    // The fast tier's unit is 4 MiB, so its solo cap is 8 MiB. Comfortably past.
-    let frames = 3_000_000usize;
-    let mut pcm = Vec::with_capacity(frames * 4);
-    let mut seed = 0x51ED_2701_A3B4_C5D6u64;
-    for i in 0..frames {
-        let t = i as f64;
-        seed ^= seed << 13;
-        seed ^= seed >> 7;
-        seed ^= seed << 17;
-        let d = (seed >> 48) as i16 % 28;
-        pcm.extend_from_slice(&(((t * 0.0107).sin() * 10500.0) as i16).wrapping_add(d).to_le_bytes());
-        pcm.extend_from_slice(&(((t * 0.0089).cos() * 9800.0) as i16).wrapping_sub(d).to_le_bytes());
-    }
-    let mut wav = Vec::with_capacity(pcm.len() + 44);
-    wav.extend_from_slice(b"RIFF");
-    wav.extend_from_slice(&((36 + pcm.len()) as u32).to_le_bytes());
-    wav.extend_from_slice(b"WAVEfmt ");
-    wav.extend_from_slice(&16u32.to_le_bytes());
-    wav.extend_from_slice(&1u16.to_le_bytes());
-    wav.extend_from_slice(&2u16.to_le_bytes());
-    wav.extend_from_slice(&44100u32.to_le_bytes());
-    wav.extend_from_slice(&(44100u32 * 4).to_le_bytes());
-    wav.extend_from_slice(&4u16.to_le_bytes());
-    wav.extend_from_slice(&16u16.to_le_bytes());
-    wav.extend_from_slice(b"data");
-    wav.extend_from_slice(&(pcm.len() as u32).to_le_bytes());
-    wav.extend_from_slice(&pcm);
-    assert!(wav.len() > 8 * 1024 * 1024, "must exceed the fast tier's cap");
-    fs::write(src.join("long.wav"), &wav).unwrap();
+    let pcm = |frames: usize, seed0: u64| {
+        let mut v = Vec::with_capacity(frames * 4);
+        let mut seed = seed0;
+        for i in 0..frames {
+            let t = i as f64;
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let d = (seed >> 48) as i16 % 28;
+            v.extend_from_slice(&(((t * 0.0107).sin() * 10500.0) as i16).wrapping_add(d).to_le_bytes());
+            v.extend_from_slice(&(((t * 0.0089).cos() * 9800.0) as i16).wrapping_sub(d).to_le_bytes());
+        }
+        v
+    };
+    let wav_of = |body: &[u8], tag: u16, tail: &[u8]| {
+        let mut w = Vec::with_capacity(body.len() + 64);
+        w.extend_from_slice(b"RIFF");
+        w.extend_from_slice(&((36 + body.len()) as u32).to_le_bytes());
+        w.extend_from_slice(b"WAVEfmt ");
+        w.extend_from_slice(&16u32.to_le_bytes());
+        w.extend_from_slice(&tag.to_le_bytes());
+        w.extend_from_slice(&2u16.to_le_bytes());
+        w.extend_from_slice(&44100u32.to_le_bytes());
+        w.extend_from_slice(&(44100u32 * 4).to_le_bytes());
+        w.extend_from_slice(&4u16.to_le_bytes());
+        w.extend_from_slice(&16u16.to_le_bytes());
+        w.extend_from_slice(b"data");
+        w.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        w.extend_from_slice(body);
+        w.extend_from_slice(tail);
+        w
+    };
+
+    // The fast tier's unit is 4 MiB, so this spans several of them, and the
+    // trailing bytes have to survive on the last piece.
+    let long = wav_of(&pcm(3_000_000, 0x51ED_2701_A3B4_C5D6), 1, b"loose bytes past the chunks");
+    assert!(long.len() > 8 * 1024 * 1024, "must exceed the fast tier's cap");
+    fs::write(src.join("long.wav"), &long).unwrap();
+    // Same size, IEEE float: the split must refuse it.
+    let float = wav_of(&pcm(3_000_000, 0x1122_3344_5566_7788), 3, b"");
+    fs::write(src.join("float.wav"), &float).unwrap();
 
     let arc = tmp.path().join("w.nva");
     let mut a = Archive::create(&arc).unwrap();
     a.add_paths(std::slice::from_ref(&src), &PackOptions::new(Tier::Fast))
         .unwrap();
+    let coded: Vec<_> = a.manifest.chunks.iter().filter(|c| c.filter == 38).collect();
     assert!(
-        a.manifest.chunks.iter().all(|c| c.filter != 38),
-        "past the cap the flac transform must not be reached"
+        coded.len() >= 2,
+        "the long file must be cut into several transformed pieces, got {}",
+        coded.len()
+    );
+    let carried: u64 = coded.iter().map(|c| c.unpacked).sum();
+    assert_eq!(
+        carried,
+        long.len() as u64,
+        "every byte of the .wav must be inside a transformed piece"
+    );
+    assert!(
+        coded.iter().all(|c| c.filtered > 0 && c.filtered < c.unpacked),
+        "flac must shrink each piece"
     );
     // No unit may exceed what a reader accepts, whatever path produced it.
     assert!(
         a.manifest.chunks.iter().all(|c| c.unpacked <= 64 * 1024 * 1024),
         "a unit above MAX_STORED_CHUNK cannot be extracted"
-    );
-    // The record-width filter is the fallback, and it must still be there.
-    assert!(
-        a.manifest.chunks.iter().any(|c| (2..=33).contains(&c.filter)),
-        "the fallback path must keep the record-width filter"
     );
     drop(a);
 

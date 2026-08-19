@@ -97,6 +97,18 @@ impl Trace {
     }
 }
 
+/// How a .wav too large for one unit is cut. See `Packer::wav_split_plan`.
+struct WavSplit {
+    fmt: crate::wav::Fmt,
+    /// Where the `data` payload starts, and how long it is.
+    data_off: usize,
+    data_len: usize,
+    /// PCM bytes per piece — a whole number of frames, at most one unit.
+    piece: usize,
+    /// Bytes after the `data` chunk, which ride with the last piece.
+    tail: usize,
+}
+
 struct TraceUnit<'a> {
     idx: u32,
     len: usize,
@@ -135,6 +147,10 @@ pub(crate) struct Packer {
     /// landed in units with no BCJ filter at all, because only the first of them
     /// ever heard that the file was an executable.
     current: Option<(Codec, u8)>,
+    /// Set while the unit under construction is one piece of a split .wav.
+    /// `flush` hands it to the submitter, because a middle piece is bare PCM
+    /// and the format cannot be recovered from the bytes.
+    wav_piece: Option<crate::wav::Piece>,
     /// Diagnostics only; `None` unless `NOVA_UNIT_TRACE` is set.
     trace: Option<Trace>,
 }
@@ -159,6 +175,7 @@ impl Packer {
             pending: Vec::new(),
             votes: HashMap::new(),
             current: None,
+            wav_piece: None,
             trace: Trace::open(),
         }
     }
@@ -306,6 +323,21 @@ impl Packer {
         // unit a large file spans hears it. See `unit_plan`.
         self.current = confident.then_some((plan.codec, plan.filter.id()));
 
+        // A .wav past the solo cap would otherwise lose the transform entirely —
+        // and the cap cannot simply be raised, because it IS the bound a reader
+        // enforces. FLAC frames are independent, so the file is cut into
+        // unit-sized runs of whole frames instead, each its own unit.
+        if whole.is_none() && is_wav {
+            if let Some(plan) = self.wav_split_plan(&head, meta.len()) {
+                let f = handle.expect("large files keep their handle");
+                let reader = std::io::Cursor::new(head).chain(BufReader::new(f));
+                self.add_wav_split(sub, idx, disk, reader, &plan, stats)?;
+                self.current = None;
+                stats.files += 1;
+                return Ok(());
+            }
+        }
+
         if let Some(data) = whole {
             // The size on disk may have changed since the metadata read; the
             // entry must describe what was actually stored.
@@ -336,6 +368,92 @@ impl Packer {
         }
         self.current = None;
         stats.files += 1;
+        Ok(())
+    }
+
+    /// Where to cut a .wav that is too large for one unit, or `None` if it
+    /// cannot be cut safely and should take the ordinary path.
+    ///
+    /// Every piece has to satisfy the same bound a whole solo file does, so the
+    /// wrapper ends — the RIFF header before `data` and whatever follows it —
+    /// are checked explicitly: a file with a huge `LIST` chunk in front is
+    /// refused rather than squeezed.
+    fn wav_split_plan(&self, head: &[u8], file_len: u64) -> Option<WavSplit> {
+        let (fmt, data_off, data_len) = crate::wav::probe_within(head, file_len as usize).ok()?;
+        if !fmt.supported() {
+            return None;
+        }
+        let frame = fmt.frame_bytes();
+        let end = (data_off as u64).checked_add(data_len as u64)?;
+        if data_len == 0 || end > file_len {
+            return None;
+        }
+        // Whole frames only, and at least one frame per piece.
+        let piece = (self.geom.unit as usize / frame) * frame;
+        if piece == 0 {
+            return None;
+        }
+        let cap = (self.geom.unit * 2).min(crate::archive::MAX_STORED_CHUNK);
+        let tail = file_len - end;
+        // The first piece carries the header, the last carries the tail; if
+        // either end is so large that its piece would exceed the bound, this
+        // file is not one we can split.
+        if data_off as u64 + piece as u64 > cap || tail + piece as u64 > cap {
+            return None;
+        }
+        Some(WavSplit {
+            fmt,
+            data_off,
+            data_len,
+            piece,
+            tail: tail as usize,
+        })
+    }
+
+    /// Read a large .wav and hand it over one unit at a time.
+    fn add_wav_split(
+        &mut self,
+        sub: &mut Submitter,
+        idx: usize,
+        disk: &Path,
+        mut reader: impl Read,
+        plan: &WavSplit,
+        stats: &mut AddStats,
+    ) -> Result<()> {
+        // Every piece is a unit of its own, so nothing may be left open.
+        self.flush(sub, stats, Cut::BeforeSolo)?;
+        let mut done = 0usize;
+        let mut actual = 0u64;
+        while done < plan.data_len {
+            let run = plan.piece.min(plan.data_len - done);
+            // The header rides with the first piece, the tail with the last.
+            let lead = if done == 0 { plan.data_off } else { 0 };
+            let trail = if done + run == plan.data_len {
+                plan.tail
+            } else {
+                0
+            };
+            let mut buf = vec![0u8; lead + run + trail];
+            reader
+                .read_exact(&mut buf)
+                .with_context(|| format!("reading {}", disk.display()))?;
+            let len = buf.len() as u64;
+            actual += len;
+            stats.bytes_in += len;
+            self.buf = buf;
+            // The offset in an `Extent` is inside the UNIT, not inside the
+            // file, and each piece is a unit of its own — so it is always 0.
+            self.pending.push((idx, 0, len));
+            self.kind = Some(analyze::Class::Wav);
+            self.wav_piece = Some(crate::wav::Piece {
+                fmt: plan.fmt,
+                pcm_start: lead,
+                pcm_len: run,
+            });
+            self.flush(sub, stats, Cut::Solo)?;
+            done += run;
+        }
+        self.files[idx].size = actual;
         Ok(())
     }
 
@@ -433,8 +551,11 @@ impl Packer {
             }
             None => {
                 let (codec, filter) = self.unit_plan(&buf);
-                let local =
-                    sub.submit_filtered(buf, key, self.tier.candidates(codec, kind), filter)?;
+                let cands = self.tier.candidates(codec, kind);
+                let local = match self.wav_piece {
+                    Some(p) => sub.submit_wav(buf, key, cands, p)?,
+                    None => sub.submit_filtered(buf, key, cands, filter)?,
+                };
                 let idx = self
                     .base
                     .checked_add(local)
@@ -444,6 +565,7 @@ impl Packer {
             }
         };
         self.votes.clear();
+        self.wav_piece = None;
 
         if let (Some((len, items, exts)), Some(t)) = (traced, self.trace.as_mut()) {
             t.unit(TraceUnit {
