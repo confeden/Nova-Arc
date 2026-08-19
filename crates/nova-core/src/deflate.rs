@@ -73,18 +73,7 @@ pub fn find_streams(buf: &[u8]) -> Vec<Stream> {
     // A unit is a concatenation of whole files, so keep scanning from wherever
     // the last container ended.
     while at < buf.len() {
-        let rest = &buf[at..];
-        let (streams, consumed) = if rest.starts_with(&[0x1F, 0x8B]) {
-            gzip(rest)
-        } else if rest.starts_with(b"\x89PNG\r\n\x1A\n") {
-            png(rest)
-        } else if rest.starts_with(b"PK\x03\x04") {
-            zip(rest)
-        } else if rest.starts_with(b"%PDF-") {
-            pdf(rest)
-        } else {
-            (Vec::new(), 0)
-        };
+        let (streams, consumed) = dispatch(&buf[at..], 0);
         if consumed == 0 {
             break;
         }
@@ -96,6 +85,39 @@ pub fn find_streams(buf: &[u8]) -> Vec<Stream> {
     }
     out.retain(|s| s.len() >= MIN_STREAM);
     out
+}
+
+/// How far to follow a container inside a container. A zip of zips is ordinary;
+/// a zip of zips of zips is how bombs are built, and every level multiplies the
+/// scan, so the recursion is bounded rather than trusted.
+const MAX_NESTING: u32 = 3;
+
+/// Pick the scanner for whatever starts at the front of `buf`.
+///
+/// `depth` is 0 at the top of a unit. Only deeper does a bare JPEG count: at
+/// the top, a JPEG file is filter id 35's business and reaches it through the
+/// analyzer, never through here — dispatching it at depth 0 would change what
+/// every existing unit scans to.
+fn dispatch(buf: &[u8], depth: u32) -> (Vec<Stream>, usize) {
+    if buf.starts_with(&[0x1F, 0x8B]) {
+        gzip(buf)
+    } else if buf.starts_with(b"\x89PNG\r\n\x1A\n") {
+        png(buf)
+    } else if buf.starts_with(b"PK\x03\x04") {
+        zip(buf, depth)
+    } else if buf.starts_with(b"%PDF-") {
+        pdf(buf)
+    } else if depth > 0 && buf.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        (
+            vec![Stream {
+                pieces: vec![(0, buf.len())],
+                kind: Kind::Jpeg,
+            }],
+            buf.len(),
+        )
+    } else {
+        (Vec::new(), 0)
+    }
 }
 
 /// gzip: header, optional extra fields, bare deflate, then CRC32 + ISIZE.
@@ -213,7 +235,7 @@ fn trim(pieces: &mut Vec<(usize, usize)>, front: usize, back: usize) {
 
 /// zip: read the central directory rather than scanning for local headers, so
 /// that an entry written with a data descriptor still gives a reliable size.
-fn zip(f: &[u8]) -> (Vec<Stream>, usize) {
+fn zip(f: &[u8], depth: u32) -> (Vec<Stream>, usize) {
     // End-of-central-directory, searched from the back (a comment may follow).
     let Some(eocd) = (0..f.len().saturating_sub(21))
         .rev()
@@ -240,7 +262,17 @@ fn zip(f: &[u8]) -> (Vec<Stream>, usize) {
         cd += 46 + name_len + extra_len + comment_len;
         // 0xFFFFFFFF means the real value is in a ZIP64 extra field; those
         // entries are left alone rather than guessed at.
-        if method != 8 || csize == 0 || csize == 0xFFFF_FFFF || lho == 0xFFFF_FFFF {
+        if csize == 0 || csize == 0xFFFF_FFFF || lho == 0xFFFF_FFFF {
+            continue;
+        }
+        // Method 0 is STORED, and skipping it threw away the best entries in
+        // the archive. A zip does not deflate what deflate cannot help: a
+        // backup of photographs stores its JPEGs, an epub stores its
+        // illustrations, an apk stores its PNGs. Those are exactly the bytes
+        // lepton and the PNG path can do something with, and nothing else in
+        // the archiver was ever going to see them, because the file they live
+        // in is a zip.
+        if method != 8 && method != 0 {
             continue;
         }
         if lho + 30 > f.len() || &f[lho..lho + 4] != b"PK\x03\x04" {
@@ -251,11 +283,24 @@ fn zip(f: &[u8]) -> (Vec<Stream>, usize) {
         let ln = u16::from_le_bytes([f[lho + 26], f[lho + 27]]) as usize;
         let le = u16::from_le_bytes([f[lho + 28], f[lho + 29]]) as usize;
         let start = lho + 30 + ln + le;
-        if start.checked_add(csize).is_some_and(|e| e <= f.len()) {
+        if start.checked_add(csize).is_none_or(|e| e > f.len()) {
+            continue;
+        }
+        if method == 8 {
             out.push(Stream {
                 pieces: vec![(start, csize)],
                 kind: Kind::Deflate,
             });
+        } else if depth < MAX_NESTING {
+            // A stored entry is a file lying inside the zip untouched, so it is
+            // scanned exactly as a file on disk would be — which is what makes
+            // one arm of `dispatch` enough for a stored JPEG, a stored PNG and
+            // a zip inside a zip alike.
+            let (inner, _) = dispatch(&f[start..start + csize], depth + 1);
+            out.extend(inner.into_iter().map(|st| Stream {
+                pieces: st.pieces.iter().map(|&(o, l)| (o + start, l)).collect(),
+                kind: st.kind,
+            }));
         }
     }
     (out, end)

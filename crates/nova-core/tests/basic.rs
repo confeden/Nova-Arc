@@ -1169,6 +1169,112 @@ fn wav_audio_is_recompressed_and_still_extracts() {
     assert_same_tree(&src, &out.join("audio"));
 }
 
+/// A zip that STORES its photographs is still recompressed.
+///
+/// Method 0 means the zip writer decided deflate could not help — which is
+/// exactly what it does with JPEG, and exactly the data lepton can halve. The
+/// scanner used to skip every entry that was not method 8, so a backup of
+/// photographs, an epub with illustrations and an apk full of stored assets
+/// all came out byte for byte the size they went in.
+#[test]
+fn a_zip_of_stored_jpegs_is_recompressed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("bak");
+    fs::create_dir_all(&src).unwrap();
+
+    // Photo-like: smooth gradients with detail, so the DCT coefficients look
+    // like a picture rather than like noise.
+    let (w, h) = (700usize, 520usize);
+    let mut rgb = Vec::with_capacity(w * h * 3);
+    for y in 0..h {
+        for x in 0..w {
+            let r = (x * 255 / w) as u8;
+            let g = (y * 255 / h) as u8;
+            let b = (((x * x + y * y) / 83) % 256) as u8;
+            rgb.extend_from_slice(&[r, g, b.wrapping_add((y as u8) >> 3)]);
+        }
+    }
+    let mut jpeg = Vec::new();
+    jpeg_encoder::Encoder::new(&mut jpeg, 92)
+        .encode(&rgb, w as u16, h as u16, jpeg_encoder::ColorType::Rgb)
+        .unwrap();
+
+    // A minimal zip with one STORED entry. Written by hand so the test does not
+    // depend on what a zip library decides to do.
+    let name = b"photo.jpg";
+    let crc = crc32(&jpeg);
+    let mut zip = Vec::new();
+    let lho = 0usize;
+    zip.extend_from_slice(b"PK");
+    zip.extend_from_slice(&[20, 0, 0, 0, 0, 0, 0, 0, 0, 0]); // version..time/date
+    zip.extend_from_slice(&crc.to_le_bytes());
+    zip.extend_from_slice(&(jpeg.len() as u32).to_le_bytes());
+    zip.extend_from_slice(&(jpeg.len() as u32).to_le_bytes());
+    zip.extend_from_slice(&(name.len() as u16).to_le_bytes());
+    zip.extend_from_slice(&0u16.to_le_bytes());
+    zip.extend_from_slice(name);
+    zip.extend_from_slice(&jpeg);
+    let cd = zip.len();
+    zip.extend_from_slice(b"PK");
+    zip.extend_from_slice(&[20, 0, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    zip.extend_from_slice(&crc.to_le_bytes());
+    zip.extend_from_slice(&(jpeg.len() as u32).to_le_bytes());
+    zip.extend_from_slice(&(jpeg.len() as u32).to_le_bytes());
+    zip.extend_from_slice(&(name.len() as u16).to_le_bytes());
+    zip.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]); // extra..attrs
+    zip.extend_from_slice(&(lho as u32).to_le_bytes());
+    zip.extend_from_slice(name);
+    let cd_len = zip.len() - cd;
+    zip.extend_from_slice(b"PK");
+    zip.extend_from_slice(&[0, 0, 0, 0, 1, 0, 1, 0]);
+    zip.extend_from_slice(&(cd_len as u32).to_le_bytes());
+    zip.extend_from_slice(&(cd as u32).to_le_bytes());
+    zip.extend_from_slice(&0u16.to_le_bytes());
+
+    assert!(zip.len() > 64 * 1024, "must be big enough for its own unit");
+    fs::write(src.join("photos.zip"), &zip).unwrap();
+
+    let arc = tmp.path().join("z.nva");
+    let mut a = Archive::create(&arc).unwrap();
+    a.add_paths(std::slice::from_ref(&src), &PackOptions::new(Tier::Max))
+        .unwrap();
+    let c = a
+        .manifest
+        .chunks
+        .iter()
+        .find(|c| c.filter == 37)
+        .expect("the container filter must reach a stored jpeg");
+    assert!(
+        c.packed * 10 < c.unpacked * 9,
+        "a stored jpeg must shrink well past 90%: {} of {}",
+        c.packed,
+        c.unpacked
+    );
+    drop(a);
+
+    let a = Archive::open_ro(&arc).unwrap();
+    let out = tmp.path().join("out");
+    a.extract(&out, None, Overwrite::Fail).unwrap();
+    assert_same_tree(&src, &out.join("bak"));
+}
+
+/// CRC-32 as zip defines it. Only needed so the fixture is a valid archive.
+fn crc32(data: &[u8]) -> u32 {
+    let mut table = [0u32; 256];
+    for (i, e) in table.iter_mut().enumerate() {
+        let mut c = i as u32;
+        for _ in 0..8 {
+            c = if c & 1 != 0 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
+        }
+        *e = c;
+    }
+    let mut c = 0xFFFF_FFFFu32;
+    for &b in data {
+        c = table[((c ^ b as u32) & 0xFF) as usize] ^ (c >> 8);
+    }
+    !c
+}
+
 /// A .wav too large for one unit is CUT, not given up on.
 ///
 /// The solo cap is the reader's bound — `read_packed` refuses a chunk above

@@ -209,6 +209,11 @@ Phase 1 (analysis), per file and again per unit, from the head bytes:
 | other, fixed-width records | delta at the detected width | zstd | LZMA2 |
 | other, incompressible | — | store | store |
 
+A zip is scanned through its central directory, and a **stored** entry (method
+0) is handed back to the same dispatcher as if it were a file on disk, up to
+three levels deep. That is where a zip keeps what deflate could not help:
+photographs, an epub's illustrations, an apk's assets.
+
 The first two rows need the WHOLE file: a zip's central directory is at its end
 and lepton reads one complete JPEG. Such a file is given a unit of its own,
 which is only possible between 64 KiB and twice the unit size — that upper
