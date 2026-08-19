@@ -73,9 +73,16 @@ impl Tier {
     /// measured on 32 MiB units, PPMd7 beats LZMA2 by 13-24% on prose, wiki
     /// text and database records, while LZMA2 beats PPMd7 by 16% on binaries
     /// and by 10-20% on solid blocks of source code.
-    pub fn candidates(self, first: Codec) -> Vec<(Codec, u8)> {
+    pub fn candidates(self, first: Codec, kind: Option<Kind>) -> Vec<(Codec, u8)> {
         if first == Codec::Store {
             return vec![(first, 0)];
+        }
+        // A unit whose magic says it is ALREADY ENTROPY-CODED, and which only
+        // cleared the 1% trial bar, is not worth the full tournament: PPMd7
+        // models symbol contexts, and data an entropy coder has already been
+        // over has none left to model. It ran anyway and won nothing.
+        if self == Tier::Max && kind == Some(Class::Precompressed) {
+            return vec![(first, 0), (Codec::Bsc, 0)];
         }
         // The normal tier gets a two-horse race rather than a single pick.
         // MEASURED: enwik8 −24.6%, Silesia −19.0%, PDFs −10.0%, precomp −9.0%,

@@ -413,7 +413,8 @@ impl Packer {
             }
             None => {
                 let (codec, filter) = self.unit_plan(&buf);
-                let local = sub.submit_filtered(buf, key, self.tier.candidates(codec), filter)?;
+                let local =
+                    sub.submit_filtered(buf, key, self.tier.candidates(codec, kind), filter)?;
                 let idx = self
                     .base
                     .checked_add(local)

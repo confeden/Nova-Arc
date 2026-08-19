@@ -36,60 +36,57 @@
   on 4 MiB prose -24%; LZMA2 vs zstd-19 on prose ±2%. Peak RAM tracks `--memory`
   on EXTRACT too (256M→153 MiB, default→1.0 GiB) — bounded, but "~10 MiB peak"
   is long gone, units are the cost.
-- `test/` = local playground (gitignored): corpora, benches, RU readme. zip/7z/
-  rar and GPU: not started. Research: `docs/research/`.
+- `test/` = local playground (gitignored). zip/7z/rar and GPU: not started.
 
 ## Architecture & invariants
 
 - Archive layout: `[header][manifest g1][footer g1]` from `create`, then
   `[chunks…][manifest gN][footer gN]` per update; committed bytes are NEVER
   rewritten except by `compact`.
-- Commit = manifest write → fsync → footer write → fsync (the barrier is
-  required: without it a valid footer can point at a torn manifest).
+- Benches: test/{bench-std,scaling,bwt-sweep,compare-7z,edit-cost,audio-bench,
+  delta-gate-check}.sh.
+- Commit = manifest → fsync → footer → fsync; without the barrier a valid footer
+  can point at a torn manifest.
 - Footer self-hash covers its own absolute offset, so a `.nva` stored inside
   another archive cannot be mistaken for a commit. Readers verify each footer
   candidate's manifest and resume the backward scan on failure (≤64).
-- Packing invariant: the writer appends chunks in submission order, so the
-  reader predicts each index as `base + submission index` and builds file
-  entries without waiting for compression.
+- Packing invariant: the writer appends chunks in submission order, so the reader
+  predicts each index as `base + submission index` and builds entries early.
 - PROGRESS CONTRACT (`Progress`, `Phase`, `archive::Reporter`). `bytes_done` =
-  source bytes whose work is FINISHED, fed by the writer; `bytes_read` = what
-  the reader took off disk, up to a whole in-flight budget ahead. Monotone,
-  never above the total, equal to it exactly once — the single `Phase::Done`
-  reading, since others are clamped to total-1 so "100%" structurally means
-  finished. INVARIANT: the Reporter mutex is never held while entering the
-  pipeline, or the reader sleeps in `Budget::acquire` holding it and stalls the
-  writer. Throttling lives in core; clocks live in the GUI — do NOT add a timer
-  thread to core.
+  source bytes whose work is FINISHED, fed by the writer; `bytes_read` = what the
+  reader took off disk, up to an in-flight budget ahead. Monotone, never above
+  the total, equal to it exactly once — the single `Phase::Done` reading, others
+  clamped to total-1 so "100%" structurally means finished. INVARIANT: the
+  Reporter mutex is never held while entering the pipeline, or the reader sleeps
+  in `Budget::acquire` holding it and stalls the writer. Throttling lives in
+  core, clocks in the GUI — do NOT add a timer thread to core.
 - Memory model: `budget ≈ 32 MiB base + workers × (tables + 8 MiB) + queued`;
   workers capped by the budget, then in-flight bytes capped by the workers.
   Table cost per tier in `Tier::worker_memory()` (fast 4, normal 40, max 56).
 - Chunk hash = blake3(uncompressed)[..16]; serves dedup AND extract integrity.
-  Dead chunk records stay in the manifest as dedup sources until compact.
+  Dead chunk records stay as dedup sources until compact.
 - INTRA-FILE DECODE LANES. Threads the file count cannot use become lanes
   INSIDE each file (`lanes_per_worker = budget / workers`), so a one-file
   archive stops using one thread while total concurrency, memory, ordering,
   overwrite policy and mtime all stay put. enwik8 at normal 4.80 → **1.63 s**.
   · GROUP BY DISTINCT UNIT, not by extent: consecutive extents usually share a
     unit and the sequential path got that free from `UnitCache`. Per extent it
-    decoded the same unit once per lane — enwik8 4.8 → 8.2 s. Each lane needs
-    its OWN `File` (a clone shares the position on Windows); running out of
+    decoded the same unit once per lane — enwik8 4.8 → 8.2 s. Running out of
     handles means fewer lanes, not an error.
 - PPMd7 order (10) and pool formula (32x chunk, cap 64 MiB) are FORMAT
   CONSTANTS — not stored per chunk, so changing them breaks old archives. Order
   10 beat 12/16: a pool-exhaustion restart costs more than depth gains.
-- LZMA2 presets 6..9 differ only in dictionary size, which we override with the
-  chunk cap, so max raises nice_len instead (xz -e style).
+- LZMA2 presets 6..9 differ only in dictionary size, which the chunk cap
+  overrides, so max raises nice_len instead (xz -e style).
 - Codec and filter ids are tabulated in `docs/format.md`; keep it in step. A
   NEW id must never be added by widening the delta range — `2..=MAX_DELTA_ID =>
   Delta(id - 1)` would have made 34 decode as Delta(33), silently. Per-chunk raw
   fallback if not smaller, and then the filter byte MUST be cleared too.
 - Fixed order: pack = filter → compress; unpack = decompress → unfilter. The
-  chunk hash covers the ORIGINAL bytes, so dedup and integrity are
-  filter-independent, and the hash check proves the filter round-tripped.
-- BCJ always runs with start_offset 0, never the chunk's file position —
-  position-dependent output would break dedup. Cost: one unconverted
-  instruction per boundary.
+  chunk hash covers the ORIGINAL bytes, so dedup and integrity are filter-
+  independent and the hash check proves the filter round-tripped.
+- BCJ always runs with start_offset 0, never the chunk's file position, or
+  position-dependent output breaks dedup. Cost: one instruction per boundary.
 - Solid blocks: files < `Geometry::chunked_from` (256 KiB fast/normal, 1 MiB
   MAX) are sorted by extension, concatenated into `Geometry::unit` streams
   (4/16/32 MiB) and compressed as ONE unit; a FileEntry holds one `Extent` into
@@ -128,8 +125,7 @@
   handle, then replaces in place (atomic, no .bak window).
 - Windows file locks are MANDATORY per byte range: a whole-file `File::try_lock`
   makes our OWN extraction threads fail with ERROR_LOCK_VIOLATION (33). Hence
-  `try_lock_exclusive` locks one byte at 0xFFFF_FFFF_FFFF_0000 — never real
-  data.
+  `try_lock_exclusive` locks one byte at 0xFFFF_FFFF_FFFF_0000, never real data.
 - `File::try_clone` SHARES the file position on Windows: extraction workers
   must each `File::open` the archive, never clone a handle.
 - GUI: run `npm --prefix ui run build` FIRST. There must be no `devUrl` in
@@ -142,8 +138,7 @@
 - .cmd launchers mangle Cyrillic (OEM codepage); use a BOM'd .ps1 instead.
 - `zpaqfranz x ... -to DIR` needs a TRAILING SLASH or it refuses, and a benchmark
   records the refusal as the decode time.
-- zstd already shrinks its window to the source size, so capping WindowLog
-  for 4 MiB chunks changes nothing; per-worker memory is match tables.
+- Per-worker memory is match tables, not the window.
 - A formatter hook rewrites files after every Write/Edit here. zstd/blake3/libbsc
   build C or C++ via MSVC.
 - git global identity: user.name "Brent", email confeden@cryptolab.net.
@@ -167,8 +162,19 @@
 ## Compression design (measured, v0.6 max tier)
 
 - No single codec wins: PPMd7 beats LZMA2 13-24% on prose, LZMA2 beats PPMd7
-  16% on binaries. MAX runs a per-unit tournament (LZMA2 + PPMd7 orders 10 & 16);
-  fast/normal trust the analyzer.
+  16% on binaries. MAX runs a per-unit tournament (LZMA2 + PPMd7 orders 10 & 16
+  + bsc); fast trusts the analyzer, normal races it against bsc.
+- THE TOURNAMENT IS NOT FOR EVERYTHING. A unit the analyzer classed
+  Precompressed — magic says entropy-coded, and only the 1% trial bar cleared —
+  gets normal's two-horse race instead: PPMd7 models symbol contexts, and data
+  an entropy coder has already been over has none left to model. On a 268 MB
+  FLAC library that is BYTE-IDENTICAL output in 28-43 s instead of 109-306.
+  Priced: +315 B on the deflate corpus (+0.01%), where one small precompressed
+  unit did give PPMd7 something.
+- TOURNAMENT WINNERS by corpus (`info --units`): enwik8 bsc 2 · Silesia bsc 7 /
+  lzma2 4 · source tree lzma2 4 / ppmd7-10 1 · Firefox lzma2 13 / **ppmd7-16 4**
+  · pdfs lzma2 14 / **ppmd7-16 5**. Order 16 earns its place — "it never wins"
+  is true of the SOURCE TREE only, and dropping it would cost real bytes.
 - Chunk size = compression unit = edit granularity. fast/normal 256K/1M/4M;
   max 1M/4M/16M (FastCDC caps max at 16 MiB). Solid target 4/16/32 MiB by tier.
 - Solid block boundaries are content-defined PER FILE (cut prob = size/target
@@ -248,75 +254,69 @@
   PPMd7 order 10 won one 35 KB unit, order 16 never won.
 - Diagnostics: `NOVA_UNIT_TRACE=<file>` logs one line per unit as it is built
   (idx, size, items, WHY it was cut, kind, ext histogram) — the cut reason exists
-  only at pack time. `nova info --units` dumps them back out with the winning
-  codec. Benches: test/{bench-std,scaling,bwt-sweep,compare-7z,edit-cost}.sh.
+  only at pack time. `nova info --units` dumps them with the winning codec.
 
 ## Recompression — DEFLATE, JPEG and PDF ARE LANDED (research 02, measured here)
 
 - Corpora: `test/precomp` (4.93 MiB zips/PNGs/docx/gz), `test/incompress` (7z
   output + random bytes — the control that must stay stored), `test/photos`
-  (camera JPEGs), `test/pdfs` (8.14 MiB, 19 documents, four producers),
-  `test/firefox` (installed program, 68.6% .dll) + `test/ff-{dll,ja,rest}`,
-  `test/audio` (268 MB of FLAC) + `test/audio-wav` (the same, decoded). Probes
-  live in `test/probe-preflate`, outside the workspace, and round-trip what they
-  measure.
-- MIN_STREAM = 64 bytes, MEASURED; 4096 cost 15 points. "A correction record
-  cannot pay for itself on 2 KB" is true per FILE, false inside a unit.
-- SHIPPED. Deflate corpus: nova **2,408,247 B** vs 3,988,643 (zpaqfranz -m5) as
-  best of the rest → **−39.6%**. Byte-exact on all 28 files.
+  (camera JPEGs), `test/pdfs` (8.14 MiB, 19 documents), `test/firefox` (68.6%
+  .dll) + `test/ff-{dll,ja,rest}`, `test/audio` (268 MB of FLAC) +
+  `test/audio-wav` (the same, decoded). Probes live in `test/probe-preflate`,
+  outside the workspace, and round-trip what they measure.
+- MIN_STREAM = 64 bytes, MEASURED; 4096 cost 15 points. "A record cannot pay for
+  itself on 2 KB" is true per FILE, false inside a unit.
+- SHIPPED (`preflate-rs 0.7.6`, Microsoft, Apache-2.0). Deflate corpus: nova
+  **2,408,562 B** vs 3,988,643 (zpaqfranz -m5) → **−39.6%**, byte-exact on 28/28.
 - JPEG (lepton, id 35) SHIPPED, for standalone photographs. test/photos, 6
   camera JPEGs: raw 17,324,730 · best of the rest 16,844,561 · **nova 13,990,872
   (−16.9%)**.
-  · The stored payload is the LEPTON FORM ITSELF: already entropy-coded, no
-    codec ever beat it, so `compress_job` keeps the smallest of {codec over
-    filtered, filtered verbatim, original}. A Store record carrying a filter is
-    safe — `filtered` records the coded length and an old reader rejects id 35.
-  · Lepton settings are a FORMAT CONSTANT for id 35, like PPMd7's order and
-    pool: `compat_lepton_vector_write`, single-threaded. Its 16386-pixel limit
-    means gallery panoramas are not transformed.
+  · The stored payload is the LEPTON FORM ITSELF: already entropy-coded, no codec
+    ever beat it, so `compress_job` keeps the smallest of {codec over filtered,
+    filtered verbatim, original}. A Store record carrying a filter is safe —
+    `filtered` holds the coded length and an old reader rejects id 35.
+  · Lepton settings are a FORMAT CONSTANT for id 35, like PPMd7's order and pool:
+    `compat_lepton_vector_write`, single-threaded. Its 16386-pixel limit leaves
+    gallery panoramas untransformed.
   · Cost: lepton is slow, ~0.8 MB/s per thread.
 - PDF IMAGES SHIPPED as filter id 37, a mixed container. 18.5% of a real
   19-document corpus is `/DCTDecode` — whole JPEGs, which lepton takes 20.3% off
   (39 of 39 accepted). pdfs max 5,290,810 → **5,064,071 (−4.3%)**, normal
   5,580,960 → 5,355,326; against 7z -mx9's 6,606,978 that is **−23.4%**.
-  · Id 34's framing has no room to say what a stream IS, so it can only carry
-    deflate. Id 37 adds a kind byte and a `NDf2` magic; the decoder reads both,
-    so everything already written still opens, and 34 is decode-only now — an id
-    is a promise, not a slot to reuse. The kind byte costs 1 B per stream
-    (precomp +429 B). A `/DCTDecode` stream is the JPEG itself: no zlib wrapper
-    to strip, and it must start at its SOI.
+  · Id 34's framing cannot say what a stream IS, so it only carries deflate. Id
+    37 adds a kind byte and a `NDf2` magic; the decoder reads both, so everything
+    already written still opens and 34 is decode-only — an id is a promise, not a
+    slot to reuse. The kind byte costs 1 B per stream (precomp +429 B). A
+    `/DCTDecode` stream is the JPEG itself: no zlib wrapper, and it starts at SOI.
 - PDF deflate came first (id 34, now decode-only): 7,626,464 → 5,290,810
   (−30.6%), against brotli's 6,536,147 as best of the rest.
   · THE TRAP: PDF's `/FlateDecode` is RFC 1950, so a stream carries two zlib
     header bytes and a four-byte adler32 that are NOT deflate. Handed those,
     preflate modelled **0 of 957** streams while the scanner reported 72%
     coverage — fully wired and doing nothing. Strip 2 + 4.
-  · The scan is LEXICAL; "PDF needs a full object parse" was the reason it was
-    deferred and it was WRONG. Rules: `stream` must follow `>>`; the FIRST name
-    after `/Filter` decides the kind; `/Length` needs whitespace or `/Length1`
-    (a font segment size) is read as the length; an indirect `/Length 9 0 R`
-    falls back to `endstream`, a MISSING one stops the scan.
+  · The scan is LEXICAL; "PDF needs a full object parse" deferred it and was
+    WRONG. Rules: `stream` must follow `>>`; the FIRST name after `/Filter`
+    decides the kind; `/Length` needs whitespace or `/Length1` (a font segment
+    size) is read as the length; an indirect `/Length 9 0 R` falls back to
+    `endstream`, a MISSING one stops the scan.
   · EVERY per-candidate backward scan needs a FLOOR at the previous candidate's
     end, not just a window: `%PDF-` + `>>stream` repeated matched neither `obj`
     nor `/Filter`, so both sweeps ran in full — 47 s for 16 MiB vs 45 ms of real
     PDF. Coverage: 74.1% FlateDecode (72.6% modelled), 18.5% DCTDecode.
     Diagnostics: `probe-preflate --bin {pdfscan,pdfhostile,lepton}`.
-- WAV → FLAC SHIPPED as filter id 38 (`crate::wav`, flacenc + claxon, both pure
-  Rust Apache-2.0). 518 MB of PCM: 341,071,616 → **276,221,291 (−19.0%)**,
-  against 7z -mx9's 342,942,386 and zpaqfranz -m5's 335,792,867; normal
-  448,646,185 → 305,746,008. Decode is 8.4 s for the corpus — claxon is cheap,
-  unlike lepton.
+- WAV → FLAC SHIPPED as filter id 38 (`crate::wav`, flacenc + claxon, pure Rust
+  Apache-2.0). 518 MB of PCM: 341,071,616 → **276,221,291 (−19.0%)**, against 7z
+  -mx9's 342,942,386 and zpaqfranz -m5's 335,792,867; normal → 305,746,008.
+  Decode 8.4 s for the corpus — claxon is cheap, unlike lepton.
   · ID 38 PINS THE DECODER, NOT THE ENCODER, unlike 34/35/37: the payload is a
-    standard FLAC stream, so a better encoder never has to spend an id. What it
-    DOES pin is the wrapper — the whole file with only the `data` payload cut
-    out, spliced back on decode. That, not FLAC, is what makes the round trip
-    exact: chunk order, odd sizes with pad bytes, a `RIFF` length that disagrees
-    with the file and trailing garbage all survive because nothing about the
-    container is rebuilt from a parse.
-  · A .wav past 2x the unit gets no unit of its own and falls back to the
-    GENERIC path, NOT the precompressed one: PCM is not precompressed, and
-    `plan_precompressed` would drop the record-width filter too. One 71 MB file
-    of 16 in the corpus lands there.
+    standard FLAC stream, so a better encoder never spends an id. What it DOES
+    pin is the wrapper — the whole file with only the `data` payload cut out,
+    spliced back on decode. That, not FLAC, is what makes the round trip exact:
+    chunk order, odd sizes with pad bytes, a `RIFF` length that disagrees with
+    the file and trailing garbage all survive, none of it rebuilt from a parse.
+  · A .wav past 2x the unit falls back to the GENERIC path, NOT the precompressed
+    one: PCM is not precompressed and `plan_precompressed` would drop the
+    record-width filter too. One 71 MB file of 16 lands there.
 - Installed-program corpus (test/firefox, 341.7 MiB, 68.6% .dll): 7z -mx9
   87,566,439 B vs nova 95,721,462 → **+9.3%, our weakest case**. Findings:
   · The codec+filter vote must be cast per CHUNK (`Packer::current` + `place`):
@@ -358,19 +358,16 @@
   scanner one whole PDF.
 - SAFETY, enforced not intended: the packer round-trips every rebuilt unit and
   falls back on any mismatch; a filter that refuses is a fallback, not an error;
-  the transformed form may not exceed `MAX_CODED_CHUNK` (256 MiB), charged as the
+  the transformed form may not exceed `MAX_CODED_CHUNK` (256 MiB), charged as
   pieces are BUILT and checked again before any decode allocation.
   · THE CODED-LENGTH BOUND BELONGS IN `compress_job`, beside `filtered =
     data.len()`, and nowhere else: only that line knows the number that reaches
     the manifest, and `verify_chunk` REFUSES a coded length above the cap — an
     unchecked one is an archive nova writes and cannot extract. Per-filter
     budgets do not substitute: `deflate_encode` charged plaintexts but not the
-    container bytes `encode` also emits, so a ~57 MiB PDF cleared a 256 MiB
-    budget and produced more.
+    container bytes, so a ~57 MiB PDF cleared a 256 MiB budget and produced more.
   · Never size a Vec from a count a payload claims: `decode` bailed correctly on
-    an implausible count but had already reserved for it — ~96 bytes of structure
-    per three bytes of header. Grow as records are actually parsed.
-- `preflate-rs 0.7.6` (Microsoft, Apache-2.0, pure Rust, forbid(unsafe)).
+    an implausible count but had already reserved for it. Grow as records parse.
 - TRAPS that would each have shipped a SILENT mis-decode. Fixed; recorded
   because the next length-changing filter meets every one again: the store
   fallback must compare against the ORIGINAL length and reset the coded length,
@@ -402,6 +399,11 @@
   verified). Real files already sit at the format's limit, and every archiver
   stores FLAC (nova max −0.17%, 7z −0.25%, zpaqfranz −0.47%), so what is left
   needs the RESIDUALS re-coded lepton-style, not a better encoder.
+- THE WHOLE AUDIO CEILING IS ~5%, measured, and it prices the one idea left:
+  paq8px -8 takes `01. Breach.wav` (14,394,284 B) to 6,613,802 against our
+  6,952,563 through filter 38 — **−4.9% in 11m47s for 14 MB**, ~700x slower than
+  the speed budget allows. Re-coding FLAC's Rice residuals could capture only
+  part of that 5%, not the 16-22% deflate and JPEG gave. Audio is SOLVED.
 - Byte-plane split for 16-bit data — research 14 §7.2's top "ship-now"
   (-10..-11% on x-ray and mr vs LZMA2). DEAD, killed twice: bsc ALONE beats the
   proposed filter (x-ray 3,757,028 vs 3,999,186; mr 2,206,462 vs 2,473,757), and
@@ -483,8 +485,8 @@
   identical · 7z -mx9 x1.79 and its output GROWS 1,407 B once threads > 1 ·
   xz x1.04, +18,324 B.
   · THE WEAKNESS IS ONE CORE: 170 s vs 7z's 72.5 s, because the tournament
-    compresses every unit four times. Lever: PPMd7 order 16 has never won a unit
-    on the source tree — dropping it removes a quarter of the work.
+    compresses every unit four times. Do NOT reach for dropping PPMd7 order 16
+    to fix it — see the winners list; it takes 4 Firefox units and 5 PDF ones.
 - MEMORY LOCALITY is an owner direction and the same question as scaling: a
   max-tier worker's LZMA2 table (~370 MB) or PPMd7 pool (256 MB) is 10-20x an
   8-core desktop's L3, so max packing is memory-bandwidth-bound BY CONSTRUCTION.
@@ -504,17 +506,14 @@
 
 ## Open issues
 
-- Not preserved: empty dirs, symlinks, NTFS attrs/ADS, ACLs. Manifest in RAM
-  (fine ≤ ~1 TB). Long Windows paths (>260) untested.
+- Not preserved: empty dirs, symlinks, NTFS attrs/ADS, ACLs. Manifest in RAM.
+  Long Windows paths (>260) untested.
 - Solid-block members are read whole into RAM at pack time (up to 8 MiB outside
-  the pipeline budget). No trained dictionaries; no audio recompression.
-- The max tournament runs on units it cannot help: a FLAC library spends minutes
-  for −0.17%, with only 32.6 of 255 MiB reaching Store and the rest "won" by
-  tenths of a percent. Precompressed units should skip the tournament.
+  the pipeline budget). No trained dictionaries; no MP3 recompression.
 - A container larger than 2x the unit (64 MiB at max) is never recompressed — it
   cannot get a unit of its own, so a big PDF or zip silently loses the feature.
 - The outer extraction loop is still per FILE; lanes engage only below workers.
-- `--eco`/`--full`/EcoQoS built but not measured under load; "no lag" unverified.
+- `--eco`/`--full`/EcoQoS built but not measured under load.
 - Progress granularity at max is bounded by the UNIT COUNT, not fixable in the
   reporter: ~6 units compress in PARALLEL, so between completions there is no
   finished work to report (~38 s of a ~70 s pack). The UI answers with elapsed
@@ -531,13 +530,15 @@ v0.7 recompression — deflate id 34, JPEG id 35, x86 split id 36, PDF images id
 The standing direction is the owner's: beat 7-Zip where it has NOTHING, rather
 than out-tune LZMA. Remaining, in measured order of value:
 
-1. AUDIO: PCM is done (record-width filter, then FLAC as id 38). What is left
-   is FLAC ITSELF — everyone stores it and its residuals are Rice-coded, so
-   re-coding them lepton-style is the win; re-encoding is not (−0.94%). Then
-   MP3, which needs packMP3 (LGPL-3.0, dormant) as a plugin.
-2. A container larger than 2x the unit silently loses recompression — now more
-   pressing, since .wav routinely runs to hundreds of MB. FLAC frames are
-   independent, so audio could be cut at frame boundaries instead.
+1. A container larger than 2x the unit silently loses recompression, and .wav
+   made it the top item: at NORMAL that cap is 32 MiB, so 5 of 16 real tracks
+   (55% of the bytes) missed the filter and normal landed at 305,746,008 against
+   max's 276,221,291. FLAC frames are independent, so audio CAN be cut — but a
+   bare PCM slice carries no `fmt `, and `Filter` is one byte with nowhere to
+   put one, so this needs a per-unit filter parameter.
+2. AUDIO IS OTHERWISE DONE — see Negative knowledge for why FLAC residuals are
+   not worth it. MP3 (packMP3, ~16%, LGPL-3.0, dormant) is the only piece left,
+   and it is a licensing question before it is a code one.
 3. Executable modelling (BCJ2-class, section splitting) — 51% of the remaining
    headroom to paq8px on Silesia, five times images and tables combined.
 4. zip/7z unpack + zip pack (sevenz-rust2), rar unpack (unrar). GUI: shell
