@@ -21,6 +21,11 @@ preflate-rs = "=0.7.6"
 # Same reasoning as preflate: the Lepton bitstream is tied to the encoder, and
 # filter id 35 means "written by 0.5.x" forever.
 lepton_jpeg = "=0.5.8"
+# The stored payload is a STANDARD FLAC stream, so unlike ids 34/35/37 the
+# encoder is not pinned by filter id 38 — only this decoder has to keep reading
+# what earlier encoders wrote, which any conforming FLAC decoder does.
+flacenc = { version = "0.5", default-features = false }
+claxon = "0.4"
 filetime = "0.2"
 rmp-serde = "1"
 serde = { version = "1", features = ["derive"] }

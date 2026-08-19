@@ -78,8 +78,31 @@ integrity checking.
 
 Codec ids: `0` = store (raw), `1` = zstd, `2` = LZMA2 (bare stream, dictionary
 = unit size, capped at 64 MiB), `3` = PPMd7 (order in the per-unit parameter,
-pool 8x the unit capped at 256 MiB). Filter ids: `0` = none, `1` = BCJ x86,
-`2..=33` = delta with distance `id - 1`.
+pool 8x the unit capped at 256 MiB), `4` = bsc (BWT + QLFC).
+
+Filter ids:
+
+| id | filter | length |
+|---|---|---|
+| `0` | none | — |
+| `1` | BCJ x86 | unchanged |
+| `2..=33` | delta at distance `id - 1` | unchanged |
+| `34` | deflate streams in a container, preflate 0.7.x | changed, **decode only** |
+| `35` | JPEG re-entropy-coded, lepton 0.5.x | changed |
+| `36` | x86 branch targets split into their own stream | changed |
+| `37` | mixed container: deflate **and** JPEG streams | changed |
+| `38` | RIFF/WAVE integer PCM carried as FLAC | changed |
+
+An id is a promise, not a slot to reuse: 34 still decodes every archive that
+used it, and 37 — which can say what each stream *is* — is what new archives
+get. Ids 34, 35 and 37 pin the library that wrote them, so upgrading it spends
+a new id. Id 38 does not: what it stores is a standard FLAC stream plus a
+wrapper of this format's own, so the encoder may change while the decoder keeps
+reading everything ever written.
+
+A length-changing filter records the coded length in `ChunkRec::filtered`;
+`unpacked` always means the ORIGINAL length, the one `hash` covers and `Extent`
+indexes into.
 
 Order of operations is fixed: pack = `filter → compress`; unpack =
 `decompress → unfilter`. Per-unit fallback: if the result is not smaller than
@@ -176,31 +199,46 @@ Phase 1 (analysis), per file and again per unit, from the head bytes:
 
 | content | filter | fast / normal | max |
 |---|---|---|---|
-| already compressed (JPEG, MP3, zip, video…) | — | store | store |
-| executable (PE/ELF/Mach-O) | BCJ x86 | zstd | LZMA2 |
+| deflate container (zip, PNG, gzip, docx, PDF) | mixed container (37) | zstd | LZMA2 |
+| JPEG photograph | lepton (35) | zstd | LZMA2 |
+| RIFF/WAVE integer PCM | FLAC (38) | zstd | LZMA2 |
+| already compressed (MP3, video, 7z…) | — | store | store |
+| executable (PE/ELF/Mach-O) | BCJ x86 / x86 split at max | zstd | LZMA2 |
 | text / source | — | zstd | PPMd7 |
 | other, compressible | — | zstd | LZMA2 |
 | other, fixed-width records | delta at the detected width | zstd | LZMA2 |
 | other, incompressible | — | store | store |
 
+The first three rows need the WHOLE file: a zip's central directory is at its
+end, lepton reads one complete JPEG, and a `.wav`'s RIFF chunk list has to
+arrive intact. Such a file is given a unit of its own, which is only possible
+between 64 KiB and twice the unit size — outside that range it takes the
+ordinary path for its content.
+
 The record width is not declared anywhere, so it is inferred: the width that
 minimises the order-0 entropy of the differenced stream, then **verified** by
 compressing a sample with and without the filter and kept only if it wins by
 at least 2%. The verification matters more than the estimate — on Silesia's
-`sao` the estimate proposed a width that made LZMA2 8-60% worse.
+`sao` the estimate proposed a width that made LZMA2 8-60% worse — and it is
+made with the codec that will actually run, because BWT already models
+interleaved fixed-width records and differencing them first makes it worse.
 
 Phase 2 (compression): the unit is filtered, then compressed at the tier level
-(zstd 3 / 12 / 19; LZMA2 presets 2 / 6 / 6+nice_len). At the max tier every
-unit is compressed by LZMA2 and by PPMd7 at two model orders, and the smallest
-result wins — no static rule picks the right codec for arbitrary data.
+(zstd 3 / 12 / 19; LZMA2 presets 2 / 6 / 6+nice_len). The normal tier races
+its codec against bsc; the max tier races LZMA2, PPMd7 at two model orders and
+bsc, and the smallest result wins — no static rule picks the right codec for
+arbitrary data. A filtered form that is already entropy-coded (lepton, FLAC)
+often beats every codec run over it, so the smallest of {codec over filtered,
+filtered verbatim, original} is what gets stored.
 
 Measured: PPMd7 is ~25% smaller than zstd-19 on prose; LZMA2 beats PPMd7 by
 16% on binaries; BCJ gains 4.4-5.7% on real executables; the record filter
-gains 11-17% on database, catalogue and 16-bit image data.
+gains 11-17% on database and catalogue data and 24% on 16-bit stereo PCM;
+FLAC takes another 19% off that PCM.
 
-Later milestones: recompression of deflate/JPEG/MP3 streams, and a dictionary
-for units created by `add` after the archive exists (measured at -21% to -31%
-there, and a net loss anywhere else).
+Later milestones: MP3 recompression, and a dictionary for units created by
+`add` after the archive exists (measured at -21% to -31% there, and a net loss
+anywhere else).
 
 ## Limits
 

@@ -860,7 +860,12 @@ mod tests {
         );
         // And out-of-order pieces, which `rebuild` could not splice back.
         assert!(
-            encode(&original, &[piece(vec![(200, 50), (100, 50)], &[], &[])], false).is_err(),
+            encode(
+                &original,
+                &[piece(vec![(200, 50), (100, 50)], &[], &[])],
+                false
+            )
+            .is_err(),
             "pieces out of order"
         );
     }

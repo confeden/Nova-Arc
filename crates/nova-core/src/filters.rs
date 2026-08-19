@@ -68,6 +68,14 @@ pub enum Filter {
     Jpeg,
     /// Move x86 branch targets into their own stream. See `x86_split_encode`.
     X86Split,
+    /// Replace a RIFF/WAVE file's PCM with a FLAC stream, keeping every other
+    /// byte of the container so the .wav comes back exactly.
+    ///
+    /// The one audio transform where the competition has nothing: uncompressed
+    /// PCM is stored near raw by every archiver. See `crate::wav` — and note
+    /// that this id pins the wrapper and the DECODER, not the encoder, because
+    /// what it stores is a standard FLAC stream.
+    Wav,
     /// Undo EVERY recompressible stream in a container, deflate and JPEG alike.
     ///
     /// The successor to [`Filter::Deflate`], which only ever saw deflate. A PDF
@@ -89,6 +97,10 @@ const X86_SPLIT: u8 = 36;
 /// streams, lepton 0.5.x for the JPEG ones. It pins BOTH library versions, so
 /// an upgrade of either must spend a new id.
 const CONTAINER_V2: u8 = 37;
+
+/// Filter id for RIFF/WAVE PCM carried as FLAC. Unlike 34/35/37 this pins a
+/// decoder and a wrapper, not a library version: the payload is standard FLAC.
+const WAV_FLAC: u8 = 38;
 
 /// Filter id for deflate recompression with preflate 0.7.x records.
 ///
@@ -132,6 +144,7 @@ impl Filter {
             Filter::Jpeg => JPEG_LEPTON_0_5,
             Filter::X86Split => X86_SPLIT,
             Filter::Container => CONTAINER_V2,
+            Filter::Wav => WAV_FLAC,
         }
     }
 
@@ -144,6 +157,7 @@ impl Filter {
             JPEG_LEPTON_0_5 => Ok(Filter::Jpeg),
             X86_SPLIT => Ok(Filter::X86Split),
             CONTAINER_V2 => Ok(Filter::Container),
+            WAV_FLAC => Ok(Filter::Wav),
             other => bail!("unknown filter id {other} - archive was made by a newer version"),
         }
     }
@@ -182,6 +196,10 @@ impl Filter {
                 *data = container_encode(data)?;
                 Ok(Applied::Rebuilt)
             }
+            Filter::Wav => {
+                *data = crate::wav::encode(data)?;
+                Ok(Applied::Rebuilt)
+            }
         }
     }
 
@@ -199,6 +217,7 @@ impl Filter {
             Filter::Jpeg => *data = jpeg_decode(data)?,
             Filter::X86Split => *data = x86_split_decode(data)?,
             Filter::Container => *data = deflate_decode(data)?,
+            Filter::Wav => *data = crate::wav::decode(data)?,
         }
         Ok(())
     }
@@ -208,7 +227,9 @@ impl Filter {
     pub fn changes_length(self) -> bool {
         match self {
             Filter::None | Filter::BcjX86 | Filter::Delta(_) => false,
-            Filter::Deflate | Filter::Jpeg | Filter::X86Split | Filter::Container => true,
+            Filter::Deflate | Filter::Jpeg | Filter::X86Split | Filter::Container | Filter::Wav => {
+                true
+            }
         }
     }
 }
@@ -831,7 +852,9 @@ mod tests {
         assert_eq!(Filter::X86Split.id(), 36);
         assert_eq!(Filter::from_id(37).unwrap(), Filter::Container);
         assert_eq!(Filter::Container.id(), 37);
-        for id in 38..=255u8 {
+        assert_eq!(Filter::from_id(38).unwrap(), Filter::Wav);
+        assert_eq!(Filter::Wav.id(), 38);
+        for id in 39..=255u8 {
             assert!(Filter::from_id(id).is_err(), "id {id} must be rejected");
         }
     }

@@ -211,14 +211,19 @@ impl Packer {
         // a fragment of a deflate stream, and preflate cannot start mid-stream.
         // The magic is enough to decide — a zip's central directory is at the
         // end of the file, so nothing that scans a head could tell.
-        let mut peek = [0u8; 8];
+        // Twelve bytes, not eight: a RIFF/WAVE is only distinguishable from any
+        // other RIFF at offset 8.
+        let mut peek = [0u8; 12];
         // Same for a JPEG: lepton reads one whole file, not a fragment of one.
+        // And for a .wav, whose RIFF chunk list has to arrive intact.
         let recompressible = meta.len() >= MIN_CONTAINER
             && meta.len() <= self.geom.unit * 2
             && File::open(disk)
                 .and_then(|mut f| f.read(&mut peek))
                 .map(|n| {
-                    analyze::is_deflate_container(&peek[..n]) || analyze::is_jpeg(&peek[..n])
+                    analyze::is_deflate_container(&peek[..n])
+                        || analyze::is_jpeg(&peek[..n])
+                        || crate::wav::is_wav(&peek[..n])
                 })
                 .unwrap_or(false);
         let deflate_container = recompressible;
@@ -246,8 +251,18 @@ impl Packer {
         // A container too small to be alone cannot be recompressed: the scanner
         // must see exactly one container, so a shared unit would hand it a
         // concatenation. Put it back on the ordinary already-compressed path.
-        if matches!(plan.kind, analyze::Class::Deflate | analyze::Class::Jpeg) && !recompressible {
-            plan = analyze::plan_precompressed(&head, self.tier);
+        if !recompressible {
+            match plan.kind {
+                analyze::Class::Deflate | analyze::Class::Jpeg => {
+                    plan = analyze::plan_precompressed(&head, self.tier);
+                }
+                // A .wav that cannot be alone falls back to the ORDINARY binary
+                // path, not the precompressed one: PCM is not compressed at all,
+                // and `plan_precompressed` would hand it `Filter::None` and give
+                // up the 27% the record-width filter takes off it.
+                analyze::Class::Wav => plan = analyze::plan_generic(&head, self.tier),
+                _ => {}
+            }
         }
         let incompressible = meta.len() >= self.geom.chunked_from && plan.codec == Codec::Store;
         // A deflate container is alone in its unit, and that is not a

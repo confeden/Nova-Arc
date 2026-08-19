@@ -182,6 +182,9 @@ pub enum Class {
     /// Its bytes are entropy-coded, but reversibly so, which is the one case
     /// where already-compressed data can still be shrunk a lot.
     Deflate,
+    /// RIFF/WAVE integer PCM: the opposite case, data that is not compressed at
+    /// all and that a waveform model beats every general codec on.
+    Wav,
     Generic,
 }
 
@@ -237,6 +240,20 @@ pub fn plan(head: &[u8], tier: Tier) -> Plan {
             codec: general_codec(tier),
             filter: Filter::Container,
             kind: Class::Deflate,
+        };
+    }
+    // PCM is the reverse of the two above — not entropy-coded at all, and so
+    // far from it that the record-width filter plus LZMA2 still leaves 8
+    // percentage points to a waveform model. Routed by magic for the same
+    // reason: the transform needs the whole RIFF container, so the decision has
+    // to be made before the file is cut into chunks.
+    if crate::wav::is_wav(head) {
+        return Plan {
+            // The codec runs over the FLAC stream, which is already entropy
+            // coded; as with lepton the pipeline keeps whichever is smaller.
+            codec: general_codec(tier),
+            filter: Filter::Wav,
+            kind: Class::Wav,
         };
     }
     match classify(head) {
@@ -302,42 +319,55 @@ pub fn plan(head: &[u8], tier: Tier) -> Plan {
             filter: Filter::None,
             kind: Class::Text,
         },
-        Class::Generic => {
-            // Fixed-width records — database rows, catalogues, audio frames,
-            // arrays of numbers — look like noise to a match finder because
-            // nothing repeats byte for byte, yet each column changes slowly.
-            // Differencing at the record width exposes that, and it is the
-            // one case where data everyone calls incompressible is not.
-            //
-            // "Already compresses" is NOT a reason to skip the detector, and
-            // an early return on it cost 27% on 16-bit stereo PCM: a .wav
-            // compresses to 82% unfiltered, cleared the gate, and never met
-            // the filter that takes it to 60%. `pays_off` is the guard — it
-            // trials the transform and keeps it only on a clear win, which is
-            // exactly what the source trees the gate was written for need.
-            //
-            // Capped deliberately: the detector runs one entropy pass per
-            // candidate distance, so it is the one test whose cost scales with
-            // the sample. 64 KiB is plenty to see a record structure.
-            let filter = crate::filters::detect_delta_stride(&head[..head.len().min(TRIAL_SAMPLE)])
-                .and_then(|d| Filter::delta(d).ok())
-                .filter(|f| pays_off(head, *f, tier));
-            match filter {
-                Some(filter) => Plan {
-                    codec: general_codec(tier),
-                    filter,
-                    kind: Class::Generic,
-                },
-                // No stride helps. Compressible data still goes to the codec;
-                // only data that is noise to both is stored.
-                None if compresses(head) => Plan {
-                    codec: general_codec(tier),
-                    filter: Filter::None,
-                    kind: Class::Generic,
-                },
-                None => Plan::STORE,
-            }
-        }
+        // Routed by magic above, exactly like Jpeg and Deflate; `classify`
+        // never returns it.
+        Class::Wav => Plan {
+            codec: general_codec(tier),
+            filter: Filter::Wav,
+            kind: Class::Wav,
+        },
+        Class::Generic => plan_generic(head, tier),
+    }
+}
+
+/// The verdict for binary data of no recognised format. Reachable on its own
+/// because a .wav too large for a unit of its own still wants the record-width
+/// filter — `plan_precompressed` would give it `Filter::None` and throw away
+/// 27%, since PCM is not precompressed at all.
+pub fn plan_generic(head: &[u8], tier: Tier) -> Plan {
+    // Fixed-width records — database rows, catalogues, audio frames,
+    // arrays of numbers — look like noise to a match finder because
+    // nothing repeats byte for byte, yet each column changes slowly.
+    // Differencing at the record width exposes that, and it is the
+    // one case where data everyone calls incompressible is not.
+    //
+    // "Already compresses" is NOT a reason to skip the detector, and
+    // an early return on it cost 27% on 16-bit stereo PCM: a .wav
+    // compresses to 82% unfiltered, cleared the gate, and never met
+    // the filter that takes it to 60%. `pays_off` is the guard — it
+    // trials the transform and keeps it only on a clear win, which is
+    // exactly what the source trees the gate was written for need.
+    //
+    // Capped deliberately: the detector runs one entropy pass per
+    // candidate distance, so it is the one test whose cost scales with
+    // the sample. 64 KiB is plenty to see a record structure.
+    let filter = crate::filters::detect_delta_stride(&head[..head.len().min(TRIAL_SAMPLE)])
+        .and_then(|d| Filter::delta(d).ok())
+        .filter(|f| pays_off(head, *f, tier));
+    match filter {
+        Some(filter) => Plan {
+            codec: general_codec(tier),
+            filter,
+            kind: Class::Generic,
+        },
+        // No stride helps. Compressible data still goes to the codec;
+        // only data that is noise to both is stored.
+        None if compresses(head) => Plan {
+            codec: general_codec(tier),
+            filter: Filter::None,
+            kind: Class::Generic,
+        },
+        None => Plan::STORE,
     }
 }
 

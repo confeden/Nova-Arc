@@ -1057,6 +1057,118 @@ fn jpeg_photos_are_recompressed_and_still_extract() {
     assert_same_tree(&src, &out.join("photos"));
 }
 
+/// A .wav goes in as PCM, comes back byte for byte, and is stored as FLAC.
+///
+/// The two ways this can go wrong are both here. The transform must survive a
+/// container with the awkwardness real files have — a metadata chunk with an
+/// odd length and its pad byte, a chunk AFTER `data`, and a `RIFF` size that
+/// disagrees with the file — because none of that is reconstructed from a
+/// parse, only spliced back. And a RIFF that is not PCM must be refused
+/// without damaging anything, since a refusal is a fallback and not an error.
+#[test]
+fn wav_audio_is_recompressed_and_still_extracts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("audio");
+    fs::create_dir_all(&src).unwrap();
+
+    // Two channels of a slowly-moving waveform with dither: what a match finder
+    // cannot use and a linear predictor can.
+    let frames = 300_000usize;
+    let mut pcm = Vec::with_capacity(frames * 4);
+    let mut seed = 0x8E37_79B9_7F4A_7C15u64;
+    for i in 0..frames {
+        let t = i as f64;
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        let d = (seed >> 48) as i16 % 32;
+        let l = ((t * 0.0121).sin() * 11000.0) as i16;
+        let r = ((t * 0.0093).cos() * 10500.0) as i16;
+        pcm.extend_from_slice(&l.wrapping_add(d).to_le_bytes());
+        pcm.extend_from_slice(&r.wrapping_sub(d).to_le_bytes());
+    }
+
+    let riff = |body: &[u8], tail: &[u8]| {
+        let mut out = Vec::new();
+        out.extend_from_slice(b"RIFF");
+        // Deliberately not the real length: real encoders get this wrong.
+        out.extend_from_slice(&((body.len() + 1) as u32).to_le_bytes());
+        out.extend_from_slice(b"WAVE");
+        out.extend_from_slice(body);
+        out.extend_from_slice(tail);
+        out
+    };
+    let chunk = |id: &[u8; 4], body: &[u8], out: &mut Vec<u8>| {
+        out.extend_from_slice(id);
+        out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        out.extend_from_slice(body);
+        if body.len() % 2 == 1 {
+            out.push(0);
+        }
+    };
+    let fmt_pcm = |tag: u16| {
+        let mut f = Vec::new();
+        f.extend_from_slice(&tag.to_le_bytes());
+        f.extend_from_slice(&2u16.to_le_bytes()); // channels
+        f.extend_from_slice(&44100u32.to_le_bytes());
+        f.extend_from_slice(&(44100u32 * 4).to_le_bytes());
+        f.extend_from_slice(&4u16.to_le_bytes()); // block align
+        f.extend_from_slice(&16u16.to_le_bytes()); // bits
+        f
+    };
+
+    let mut body = Vec::new();
+    chunk(b"fmt ", &fmt_pcm(1), &mut body);
+    chunk(b"LIST", b"INFOINAModd length", &mut body);
+    chunk(b"data", &pcm, &mut body);
+    chunk(b"id3 ", b"after the audio", &mut body);
+    let wav = riff(&body, b"loose bytes past the last chunk");
+    fs::write(src.join("music.wav"), &wav).unwrap();
+
+    // IEEE float, not integer PCM: same magic, must be refused and stored the
+    // ordinary way.
+    let mut fbody = Vec::new();
+    chunk(b"fmt ", &fmt_pcm(3), &mut fbody);
+    chunk(b"data", &pcm, &mut fbody);
+    let float = riff(&fbody, b"");
+    fs::write(src.join("float.wav"), &float).unwrap();
+
+    let arc = tmp.path().join("a.nva");
+    let mut a = Archive::create(&arc).unwrap();
+    let stats = a
+        .add_paths(std::slice::from_ref(&src), &PackOptions::new(Tier::Max))
+        .unwrap();
+    let coded: Vec<_> = a
+        .manifest
+        .chunks
+        .iter()
+        .filter(|c| c.filter == 38)
+        .collect();
+    assert_eq!(coded.len(), 1, "exactly the integer-PCM file");
+    let c = coded[0];
+    assert_eq!(c.unpacked, wav.len() as u64);
+    assert!(
+        c.filtered > 0 && c.filtered < c.unpacked,
+        "flac must shrink it: {} vs {}",
+        c.filtered,
+        c.unpacked
+    );
+    // Well under what the record-width filter reaches on the same samples.
+    assert!(
+        c.packed * 10 < c.unpacked * 7,
+        "{} is not comfortably below 70% of {}",
+        c.packed,
+        c.unpacked
+    );
+    assert!(stats.bytes_stored < stats.bytes_in);
+    drop(a);
+
+    let a = Archive::open_ro(&arc).unwrap();
+    let out = tmp.path().join("out");
+    a.extract(&out, None, Overwrite::Fail).unwrap();
+    assert_same_tree(&src, &out.join("audio"));
+}
+
 /// One big file, extracted with the intra-file decode lanes.
 ///
 /// Extraction parallelises across FILES, so an archive holding a single large

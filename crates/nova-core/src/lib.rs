@@ -24,6 +24,7 @@ pub mod manifest;
 mod pack;
 pub mod paths;
 pub mod pipeline;
+pub mod wav;
 
 pub use analyze::{Plan, Tier};
 pub use archive::{
