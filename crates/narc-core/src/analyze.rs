@@ -74,7 +74,29 @@ impl Tier {
     /// text and database records, while LZMA2 beats PPMd7 by 16% on binaries
     /// and by 10-20% on solid blocks of source code.
     pub fn candidates(self, first: Codec) -> Vec<(Codec, u8)> {
-        if self != Tier::Max || first == Codec::Store {
+        if first == Codec::Store {
+            return vec![(first, 0)];
+        }
+        // The normal tier gets a two-horse race rather than a single pick.
+        // MEASURED: enwik8 −24.6%, Silesia −19.0%, PDFs −10.0%, precomp −9.0%,
+        // source tree −6.2%, for 1.6-1.9x the encode time. Normal now beats
+        // 7z -mx9 on Silesia in a sixth of its time.
+        if self == Tier::Normal {
+            return vec![(first, 0), (Codec::Bsc, 0)];
+        }
+        // FAST DELIBERATELY DOES NOT GET IT. Measured twice, the second time
+        // after intra-file decode lanes landed, which was the condition the
+        // first refusal named. The ratio is tempting — enwik8 −31.9%, Silesia
+        // −27.5%, source tree −24.1% — and the lanes did fix the single-file
+        // case (enwik8 decode 5.07 → 1.30 s). But they only help when there are
+        // fewer files than workers, so a real tree still pays: Silesia decode
+        // 0.46 → 3.19 s, source tree 1.84 → 4.14 s.
+        //
+        // The ladder settles it. Fast with bsc would be 47.8 MB / 2.90 s pack /
+        // 3.19 s extract against NORMAL's 46.4 MB / 7.0 s / 2.09 s — smaller
+        // only in pack time, worse in both others. That is not a fast tier, it
+        // is a worse normal one.
+        if self != Tier::Max {
             return vec![(first, 0)];
         }
         let mut out = vec![(Codec::Lzma2, 0)];
@@ -83,6 +105,13 @@ impl Tier {
                 .iter()
                 .map(|&o| (Codec::Ppmd7, o)),
         );
+        // BWT is the fourth entrant, not a replacement, because it is the only
+        // one that both wins and loses by a wide margin depending on the data.
+        // Measured at narc's own 32 MiB unit: on enwik8 it beats PPMd7 on ratio
+        // AND is 35x faster to encode and 20x to decode; on a source tree it is
+        // 45% worse than what narc already produces. A tournament settles that
+        // per unit, which is the entire argument for having one.
+        out.push((Codec::Bsc, 0));
         out
     }
 

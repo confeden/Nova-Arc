@@ -14,6 +14,14 @@ pub enum Codec {
     Lzma2,
     /// PPMd variant H (the 7-Zip flavour), with the 7z range coder.
     Ppmd7,
+    /// Burrows-Wheeler transform plus QLFC, via libbsc.
+    ///
+    /// Added because it beats PPMd7 on text at narc's own unit size on all
+    /// three axes at once — measured on enwik8 at a 32 MiB block: 21,983,674 B
+    /// against 22,466,101, 2.0 s against 71.7 s to compress, 0.9 s against
+    /// 18.3 s to decompress. It loses heavily on source trees, which is the
+    /// whole reason it joins the tournament rather than replacing anything.
+    Bsc,
 }
 
 impl Codec {
@@ -23,6 +31,7 @@ impl Codec {
             Codec::Zstd => 1,
             Codec::Lzma2 => 2,
             Codec::Ppmd7 => 3,
+            Codec::Bsc => 4,
         }
     }
 
@@ -32,6 +41,7 @@ impl Codec {
             1 => Ok(Codec::Zstd),
             2 => Ok(Codec::Lzma2),
             3 => Ok(Codec::Ppmd7),
+            4 => Ok(Codec::Bsc),
             other => bail!("unknown codec id {other} - archive was made by a newer version"),
         }
     }
@@ -48,6 +58,9 @@ pub fn compress(codec: Codec, level: i32, param: u8, data: &[u8]) -> Result<Vec<
         Codec::Zstd => Ok(zstd::bulk::compress(data, level)?),
         Codec::Lzma2 => lzma2_compress(level, data),
         Codec::Ppmd7 => ppmd7_compress(ppmd7_order(param), data),
+        // libbsc needs nothing from `param`: its block sorter, entropy coder
+        // and LZP settings are format constants of codec id 4.
+        Codec::Bsc => narc_bsc::compress(data),
     }
 }
 
@@ -74,6 +87,9 @@ pub fn decompress(codec: Codec, data: &[u8], unpacked_len: usize, param: u8) -> 
         }
         Codec::Lzma2 => lzma2_decompress(data, unpacked_len),
         Codec::Ppmd7 => ppmd7_decompress(ppmd7_order(param), data, unpacked_len),
+        // The length is checked against libbsc's own header before anything is
+        // allocated, so a forged manifest cannot drive the allocation.
+        Codec::Bsc => narc_bsc::decompress(data, unpacked_len),
     }
 }
 
@@ -216,7 +232,13 @@ fn ppmd7_decompress(order: u32, data: &[u8], unpacked_len: usize) -> Result<Vec<
 mod tests {
     use super::*;
 
-    const ALL: [Codec; 4] = [Codec::Store, Codec::Zstd, Codec::Lzma2, Codec::Ppmd7];
+    const ALL: [Codec; 5] = [
+        Codec::Store,
+        Codec::Zstd,
+        Codec::Lzma2,
+        Codec::Ppmd7,
+        Codec::Bsc,
+    ];
     /// The levels the tiers actually use: fast, normal, max.
     const LEVELS: [i32; 3] = [3, 12, 19];
     const CHUNK: usize = crate::archive::MAX_CHUNK as usize;
@@ -340,8 +362,8 @@ mod tests {
         for codec in ALL {
             assert_eq!(Codec::from_id(codec.id()).unwrap(), codec);
         }
-        let err = Codec::from_id(4).unwrap_err().to_string();
-        assert!(err.contains("unknown codec id 4"), "{err}");
+        let err = Codec::from_id(5).unwrap_err().to_string();
+        assert!(err.contains("unknown codec id 5"), "{err}");
     }
 
     #[test]
@@ -432,7 +454,7 @@ mod tests {
     #[test]
     fn corrupted_input_errors() {
         let data = text(200 * 1024);
-        for codec in [Codec::Zstd, Codec::Lzma2, Codec::Ppmd7] {
+        for codec in [Codec::Zstd, Codec::Lzma2, Codec::Ppmd7, Codec::Bsc] {
             let packed = compress(codec, 12, 0, &data).unwrap();
 
             let truncated = &packed[..packed.len() / 2];

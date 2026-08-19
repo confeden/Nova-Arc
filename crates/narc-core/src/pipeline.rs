@@ -110,7 +110,21 @@ impl PackOptions {
     /// 7.5 s on eight. So slow archives get every core the memory budget
     /// allows — PPMd7's model pool is 64 MiB per worker, which is the term
     /// that matters on a small budget.
-    pub fn extract_workers(&self, slow_codecs: bool) -> usize {
+    /// `slow_codecs` means "decode is CPU-bound", which decides both the thread
+    /// count and the per-worker memory. zstd and store leave extraction
+    /// I/O-bound and measured SLOWER on more threads.
+    ///
+    /// libbsc belongs in the slow set, and the first version of this had it
+    /// wrong. The `bsc` command line decodes 100 MB in 0.9 s, which reads like
+    /// 110 MB/s — but that figure is multithreaded across blocks, and narc
+    /// disables libbsc's own threads. Single-threaded it is ~25 MB/s, and
+    /// treating it as fast made a normal-tier Silesia archive take 8.7 s to
+    /// extract where it had taken 0.5 s. Measured, not reasoned.
+    ///
+    /// `hungry_codecs` is kept separate because the inverse BWT holds an index
+    /// four bytes wide per byte of block: a future codec could be hungry
+    /// without being slow.
+    pub fn extract_workers(&self, slow_codecs: bool, hungry_codecs: bool) -> usize {
         let cores = if self.threads == 0 {
             narc_platform::logical_cores()
         } else {
@@ -124,7 +138,7 @@ impl PackOptions {
         } else {
             Some(self.memory_budget)
         });
-        let per_worker = if slow_codecs {
+        let per_worker = if slow_codecs || hungry_codecs {
             PPMD_POOL_BYTES + WORKER_CHUNK_BYTES
         } else {
             WORKER_CHUNK_BYTES

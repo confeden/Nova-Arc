@@ -136,6 +136,7 @@ fn codec_name(c: u8) -> &'static str {
         1 => "zstd",
         2 => "lzma2",
         3 => "ppmd7",
+        4 => "bsc",
         _ => "unknown",
     }
 }

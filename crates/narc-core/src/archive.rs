@@ -777,14 +777,26 @@ so unchanged data still deduplicates",
             }
         }
 
-        // LZMA2 and PPMd7 make extraction CPU-bound; zstd/store leave it
+        // LZMA2, PPMd7 and bsc make extraction CPU-bound; zstd/store leave it
         // I/O-bound. Which one this archive is decides the thread count.
+        // bsc is in the slow set because narc runs it WITHOUT libbsc's internal
+        // threads, where it decodes at ~25 MB/s — not the ~110 MB/s the `bsc`
+        // command line shows, which is that same work spread over blocks.
         let slow_codecs = self
             .manifest
             .chunks
             .iter()
-            .any(|c| matches!(c.codec, 2 | 3));
-        let workers = opts.extract_workers(slow_codecs).min(work.len().max(1));
+            .any(|c| matches!(c.codec, 2..=4));
+        // The inverse BWT's index is four bytes per byte of block, so a bsc
+        // worker needs the large allowance even where LZMA2 would not.
+        let hungry_codecs = self.manifest.chunks.iter().any(|c| c.codec == 4);
+        let budget = opts.extract_workers(slow_codecs, hungry_codecs);
+        let workers = budget.min(work.len().max(1));
+        // Threads the budget allows but the file count cannot use. An archive of
+        // one large file left seven of eight cores idle; those become decode
+        // lanes INSIDE each file instead. Total concurrency is unchanged, so the
+        // memory `extract_workers` sized still holds.
+        let lanes_per_worker = (budget / workers.max(1)).max(1);
         reporter.totals(work.len() as u64, work.iter().map(|(e, _)| e.size).sum());
         reporter.phase(Phase::Work);
         let counters = Mutex::new((0usize, 0u64, 0usize)); // files, bytes, skipped
@@ -797,7 +809,7 @@ so unchanged data still deduplicates",
                 scope.spawn(|| {
                     // A private handle per worker: cloned handles share a file
                     // position on Windows, which would corrupt concurrent reads.
-                    let mut reader = match File::open(&self.path) {
+                    let reader = match File::open(&self.path) {
                         Ok(f) => f,
                         Err(e) => {
                             *failure.lock().expect("mutex") = Some(anyhow::Error::new(e));
@@ -806,7 +818,28 @@ so unchanged data still deduplicates",
                         }
                     };
                     narc_platform::lower_io_priority(&reader);
-                    let mut cache = UnitCache::default();
+                    // Each lane needs its OWN handle: a cloned one shares the
+                    // file position on Windows, which would corrupt concurrent
+                    // reads. Opened once per worker, not per window.
+                    let mut lanes: Vec<(File, UnitCache)> = Vec::new();
+                    if lanes_per_worker > 1 {
+                        for _ in 0..lanes_per_worker {
+                            match File::open(&self.path) {
+                                Ok(f) => {
+                                    narc_platform::lower_io_priority(&f);
+                                    lanes.push((f, UnitCache::default()));
+                                }
+                                // Running short of handles is not fatal: fewer
+                                // lanes simply means less parallelism.
+                                Err(_) => break,
+                            }
+                        }
+                    }
+                    let mut dec = Decoder {
+                        reader,
+                        cache: UnitCache::default(),
+                        lanes,
+                    };
                     let mut local = (0usize, 0u64, 0usize);
                     loop {
                         if stop.load(Ordering::Relaxed) {
@@ -817,13 +850,12 @@ so unchanged data still deduplicates",
                             break;
                         };
                         match extract_one(
-                            &mut reader,
+                            &mut dec,
                             &self.manifest,
                             entry,
                             target,
                             overwrite,
                             file_len,
-                            &mut cache,
                         ) {
                             Ok(Some(bytes)) => {
                                 local.0 += 1;
@@ -1213,16 +1245,79 @@ impl UnitCache {
     }
 }
 
+/// Decode the units one window of extents needs, `lanes` at a time.
+///
+/// This exists because extraction parallelises across FILES, so an archive of
+/// one large file used a single thread however many cores the budget allowed —
+/// a bsc unit decodes at ~25 MB/s, so that was 4.8 s for enwik8 with seven
+/// cores idle. Splitting the file's own units across lanes fixes it without
+/// touching how the file is written: the writer still appends in order, from
+/// one handle, so nothing about ordering, the overwrite policy or mtime moves.
+///
+/// The window is `lanes` extents wide, which bounds the extra memory at
+/// `lanes` units — and `lanes` is only above 1 when there are fewer files than
+/// workers, so the total in flight is the same as it always was.
+fn decode_window(
+    lanes: &mut [(File, UnitCache)],
+    manifest: &Manifest,
+    file_len: u64,
+    window: &[u32],
+) -> Result<Vec<Vec<u8>>> {
+    let n = window.len();
+    let mut out: Vec<Vec<u8>> = vec![Vec::new(); n];
+    let next = AtomicUsize::new(0);
+    let failure: Mutex<Option<anyhow::Error>> = Mutex::new(None);
+    let slots: Vec<Mutex<&mut Vec<u8>>> = out.iter_mut().map(Mutex::new).collect();
+
+    std::thread::scope(|scope| {
+        for (reader, cache) in lanes.iter_mut() {
+            let next = &next;
+            let failure = &failure;
+            let slots = &slots;
+            scope.spawn(move || loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                if i >= n || failure.lock().expect("mutex").is_some() {
+                    break;
+                }
+                match cache.load(reader, manifest, window[i], file_len) {
+                    Ok(unit) => **slots[i].lock().expect("mutex") = unit.to_vec(),
+                    Err(e) => {
+                        let mut slot = failure.lock().expect("mutex");
+                        if slot.is_none() {
+                            *slot = Some(e);
+                        }
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    drop(slots);
+    match failure.into_inner().expect("mutex") {
+        Some(e) => Err(e),
+        None => Ok(out),
+    }
+}
+
+/// Everything one extraction worker needs to read units: its own archive
+/// handle and cache, plus the extra lanes it may use inside a single file.
+/// Grouped because the handles must never be shared — a cloned `File` shares
+/// its position on Windows — so the ownership is the invariant.
+struct Decoder {
+    reader: File,
+    cache: UnitCache,
+    lanes: Vec<(File, UnitCache)>,
+}
+
 /// Write one entry to `target`. Returns the number of bytes written, or
 /// `None` when an existing file was kept per the overwrite policy.
 fn extract_one(
-    reader: &mut File,
+    dec: &mut Decoder,
     manifest: &Manifest,
     entry: &FileEntry,
     target: &Path,
     overwrite: Overwrite,
     file_len: u64,
-    cache: &mut UnitCache,
 ) -> Result<Option<u64>> {
     if let Some(parent) = target.parent() {
         fs::create_dir_all(parent)?;
@@ -1243,17 +1338,61 @@ fn extract_one(
     narc_platform::lower_io_priority(&out);
 
     let mut written = 0u64;
-    for e in &entry.extents {
-        let unit = cache
-            .load(reader, manifest, e.unit, file_len)
-            .with_context(|| format!("in {}", entry.path))?;
-        let start = usize::try_from(e.off).context("extent offset out of range")?;
-        let end = start
-            .checked_add(usize::try_from(e.len).context("extent length out of range")?)
-            .filter(|end| *end <= unit.len())
-            .context("corrupt manifest: extent outside its unit")?;
-        out.write_all(&unit[start..end])?;
-        written += e.len;
+    // One lane means the original path, byte for byte: decode into the shared
+    // cache, write, move on. Several lanes only ever appear when this file
+    // would otherwise leave cores idle.
+    if dec.lanes.len() < 2 || entry.extents.len() < 2 {
+        for e in &entry.extents {
+            let unit = dec
+                .cache
+                .load(&mut dec.reader, manifest, e.unit, file_len)
+                .with_context(|| format!("in {}", entry.path))?;
+            let start = usize::try_from(e.off).context("extent offset out of range")?;
+            let end = start
+                .checked_add(usize::try_from(e.len).context("extent length out of range")?)
+                .filter(|end| *end <= unit.len())
+                .context("corrupt manifest: extent outside its unit")?;
+            out.write_all(&unit[start..end])?;
+            written += e.len;
+        }
+    } else {
+        // Group by DISTINCT unit before splitting the work. Consecutive extents
+        // of one file usually share a unit — several chunks land in the same
+        // 16 or 32 MiB stream — and the sequential path gets that for free from
+        // `UnitCache`. Parallelising per EXTENT threw it away and decoded the
+        // same unit once per lane: measured, enwik8 went from 4.8 s to 8.2 s.
+        let mut i = 0usize;
+        while i < entry.extents.len() {
+            let mut units: Vec<u32> = Vec::new();
+            let mut j = i;
+            while j < entry.extents.len() {
+                let u = entry.extents[j].unit;
+                if !units.contains(&u) {
+                    if units.len() == dec.lanes.len() {
+                        break;
+                    }
+                    units.push(u);
+                }
+                j += 1;
+            }
+            let decoded = decode_window(&mut dec.lanes, manifest, file_len, &units)
+                .with_context(|| format!("in {}", entry.path))?;
+            for e in &entry.extents[i..j] {
+                let unit = units
+                    .iter()
+                    .position(|u| *u == e.unit)
+                    .map(|k| &decoded[k])
+                    .context("internal: extent unit missing from its window")?;
+                let start = usize::try_from(e.off).context("extent offset out of range")?;
+                let end = start
+                    .checked_add(usize::try_from(e.len).context("extent length out of range")?)
+                    .filter(|end| *end <= unit.len())
+                    .context("corrupt manifest: extent outside its unit")?;
+                out.write_all(&unit[start..end])?;
+                written += e.len;
+            }
+            i = j;
+        }
     }
     if written != entry.size {
         bail!("size mismatch extracting {}", entry.path);
@@ -1351,7 +1490,11 @@ fn verify_chunk(rec: &ChunkRec, packed: &[u8]) -> Result<Vec<u8>> {
     // -tripped exactly.
     crate::filters::Filter::from_id(rec.filter)?.unapply(&mut data)?;
     if data.len() as u64 != rec.unpacked {
-        bail!("chunk unfiltered to {} bytes, manifest says {}", data.len(), rec.unpacked);
+        bail!(
+            "chunk unfiltered to {} bytes, manifest says {}",
+            data.len(),
+            rec.unpacked
+        );
     }
     if blake3::hash(&data).as_bytes()[..16] != rec.hash {
         bail!("chunk checksum mismatch - archive is corrupt");

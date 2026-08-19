@@ -962,7 +962,9 @@ fn deflate_containers_are_recompressed_and_still_extract() {
     let stats = a
         .add_paths(std::slice::from_ref(&src), &PackOptions::new(Tier::Max))
         .unwrap();
-    // At least one unit used the recompression filter.
+    // At least one unit used the recompression filter. 37 is the mixed
+    // container (deflate + JPEG); 34 is its deflate-only predecessor, which
+    // still decodes but is no longer written.
     assert!(
         a.manifest.chunks.iter().any(|c| c.filter == 34),
         "no unit was recompressed: {:?}",
@@ -1053,6 +1055,59 @@ fn jpeg_photos_are_recompressed_and_still_extract() {
     let out = tmp.path().join("out");
     a.extract(&out, None, Overwrite::Fail).unwrap();
     assert_same_tree(&src, &out.join("photos"));
+}
+
+/// One big file, extracted with the intra-file decode lanes.
+///
+/// Extraction parallelises across FILES, so an archive holding a single large
+/// file used one thread however many cores the budget allowed. The lanes fix
+/// that by decoding the file's own units concurrently, and this is the shape
+/// that turns them on: one file, many extents, nothing else to spread over.
+///
+/// The trap it guards is not the threading but the GROUPING. Consecutive
+/// extents of one file usually share a unit, and a first version split the work
+/// per extent — which decoded the same unit once per lane and made enwik8
+/// SLOWER, 4.8 s to 8.2 s. Grouping by distinct unit took it to 1.6 s.
+#[test]
+fn one_large_file_extracts_through_parallel_lanes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("big");
+    fs::create_dir_all(&src).unwrap();
+
+    // Large enough to span several units at the fast tier (4 MiB each), and
+    // compressible so the units are real rather than stored.
+    let mut data = text(24 << 20);
+    // Vary it so the chunker cuts in more than one place and the extents do not
+    // all collapse into one deduplicated unit.
+    for (i, b) in data.iter_mut().enumerate() {
+        if i % 4096 == 0 {
+            *b = (i / 4096 % 251) as u8;
+        }
+    }
+    fs::write(src.join("one.bin"), &data).unwrap();
+
+    let arc = tmp.path().join("big.narc");
+    let mut a = Archive::create(&arc).unwrap();
+    a.add_paths(std::slice::from_ref(&src), &PackOptions::new(Tier::Fast))
+        .unwrap();
+    let entry = a
+        .manifest
+        .files
+        .iter()
+        .find(|f| f.path.ends_with("one.bin"))
+        .expect("the file is in the archive");
+    assert!(
+        entry.extents.len() > 4,
+        "needs several extents to exercise the lanes, got {}",
+        entry.extents.len()
+    );
+    drop(a);
+
+    let a = Archive::open_ro(&arc).unwrap();
+    let out = tmp.path().join("out");
+    let stats = a.extract(&out, None, Overwrite::Fail).unwrap();
+    assert_eq!(stats.files, 1);
+    assert_eq!(fs::read(out.join("big/one.bin")).unwrap(), data);
 }
 
 /// PDF recompression. A text PDF is almost entirely `/FlateDecode` streams —

@@ -2419,6 +2419,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "narc-bsc"
+version = "0.7.0"
+dependencies = [
+ "anyhow",
+ "cc",
+]
+
+[[package]]
 name = "narc-cli"
 version = "0.7.0"
 dependencies = [
@@ -2441,6 +2449,7 @@ dependencies = [
  "jpeg-encoder",
  "lepton_jpeg",
  "lzma-rust2",
+ "narc-bsc",
  "narc-platform",
  "ppmd-rust",
  "preflate-rs",

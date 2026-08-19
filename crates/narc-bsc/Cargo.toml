@@ -1,0 +1,16 @@
+[package]
+name = "narc-bsc"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+description = "libbsc (BWT + QLFC) behind a safe Rust API for Nova Arc"
+
+# This crate exists for one reason: narc-core is `#![forbid(unsafe_code)]` and
+# libbsc is C++. All of the FFI lives here, the way all OS calls live in
+# narc-platform.
+
+[dependencies]
+anyhow.workspace = true
+
+[build-dependencies]
+cc = "1"
