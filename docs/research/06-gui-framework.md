@@ -1,4 +1,4 @@
-# 06 — GUI Stack for Nova Arc (Windows-first, Android later)
+# 06 — GUI Stack for Nova Prism (Windows-first, Android later)
 
 Research date: 2026-08-16. All liveness/version/benchmark claims verified against live sources (linked inline).
 Scope: Tauri 2, Slint, egui, iced, Dioxus, native WinUI 3 via windows-rs — evaluated against archiver-specific
@@ -61,7 +61,7 @@ dev velocity, 2026 maturity, realistic Android path, zero telemetry.
 - **Telemetry**: Tauri framework/CLI does not phone home. The community-raised concern is WebView2 itself — a
   Microsoft OS component whose telemetry is governed by OS-level settings
   ([discussion #4089](https://github.com/tauri-apps/tauri/discussions/4089)). The *app* ships nothing; document
-  this in the privacy policy ("UI rendered by the OS webview; Nova Arc itself sends zero bytes").
+  this in the privacy policy ("UI rendered by the OS webview; Nova Prism itself sends zero bytes").
 - **Risks**: webview engine differences across OSes (WebKitGTK on Linux is the known pain point later);
   UI layer is TypeScript, not Rust (core remains 100% Rust); WebView2 runtime dependency (preinstalled on Win11,
   auto-distributed on Win10; offline installer exists).
@@ -73,7 +73,7 @@ dev velocity, 2026 maturity, realistic Android path, zero telemetry.
 - **License**: triple — GPLv3 **or** Royalty-Free 2.0 (free for desktop/mobile apps but **requires disclosing that
   you use Slint**, e.g. AboutSlint badge) **or** paid commercial ([FAQ](https://github.com/slint-ui/slint/blob/master/FAQ.md),
   [license](https://github.com/slint-ui/slint/blob/master/LICENSE.md)). For a FOSS archiver GPLv3 is fine;
-  the attribution requirement only bites if Nova Arc avoids GPL.
+  the attribution requirement only bites if Nova Prism avoids GPL.
 - **Virtualized lists**: `ListView` instantiates only visible rows — 100k rows is within design
   ([docs](https://docs.slint.dev/latest/docs/slint/reference/std-widgets/views/listview/)). But real-world reports:
   `StandardTableView` fast-scroll CPU spikes, "10k rows unusable on M1"
@@ -144,7 +144,7 @@ dev velocity, 2026 maturity, realistic Android path, zero telemetry.
 - **Telemetry — verified**: the `dx` CLI collects anonymized telemetry since 0.7, **opt-out**
   (`dx config set disable-telemetry true` / `TELEMETRY=false` / `disable-telemetry` build flag)
   ([release notes](https://dioxuslabs.com/blog/release-070/)). It's dev-tooling-only — nothing ships in the app —
-  but an opt-out default clashes with Nova Arc's zero-telemetry ethos and would need documenting for
+  but an opt-out default clashes with Nova Prism's zero-telemetry ethos and would need documenting for
   reproducible-build contributors.
 - **Verdict**: rejected as primary — if we accept a webview, Tauri is the same engine with a larger plugin
   ecosystem (incl. the drag-out plugin), bigger community, and no CLI telemetry. Rust-in-UI is attractive but
@@ -221,19 +221,19 @@ A drag source calls OLE `DoDragDrop` with an `IDataObject`. Two ways to represen
 
 Conclusion: **temp-materialization + `CF_HDROP` is the industry-standard mechanism** — neither market leader ships
 virtual-file drag. Matching them is table stakes; beating them (virtual files = no temp writes, correct progress,
-no plaintext residue from encrypted archives) is a genuine differentiator Nova Arc can add later.
+no plaintext residue from encrypted archives) is a genuine differentiator Nova Prism can add later.
 
 ### 3.3 What each framework gives us
 
 - **Tauri 2**: no built-in drag-out ([tauri#6664](https://github.com/tauri-apps/tauri/issues/6664) open).
   Use [`tauri-plugin-drag`](https://github.com/crabnebula-dev/drag-rs) (`startDrag({ item: [paths], icon })` from
-  JS): Nova Arc extracts the selection to its managed temp dir, then starts the OS drag with real paths — exactly
+  JS): Nova Prism extracts the selection to its managed temp dir, then starts the OS drag with real paths — exactly
   the WinRAR model, and battle-tested by Spacedrive (a file manager, our closest real-world analog).
 - **egui/iced**: same `drag` crate at the Rust level (winit windows supported on Windows/macOS; the crate's Linux
   path is GTK-only — winit-Linux unsupported).
 - **Slint**: nothing until their winit cross-app DnD work lands.
 - **Phase-2 upgrade (framework-independent)**: implement our own `IDataObject` in Rust via `windows-rs` exposing
-  *both* `CFSTR_FILEDESCRIPTORW`+`CFSTR_FILECONTENTS` (streamed straight from the .narc chunk store — no temp
+  *both* `CFSTR_FILEDESCRIPTORW`+`CFSTR_FILECONTENTS` (streamed straight from the .nva chunk store — no temp
   files, exact sizes for the progress bar) *and* delayed-rendered `CF_HDROP` (extract to temp only when a
   legacy target actually requests it), plus `IDataObjectAsyncCapability` so extraction runs off the UI thread.
   This works with any framework that hands us an HWND + mouse-down hook; `drag-rs` is the scaffold to fork.
@@ -263,9 +263,9 @@ comments):
 4. **Security**: contents of *encrypted* archives sit in plaintext in `%TEMP%`; cleanup is unreliable
    ([bug #1448](https://sourceforge.net/p/sevenzip/bugs/1448/)).
 
-### 4.2 Recommended Nova Arc design (do better on every failure mode)
+### 4.2 Recommended Nova Prism design (do better on every failure mode)
 
-1. **Dedicated temp root**: `%LOCALAPPDATA%\NovaArc\open\<session>\<archive-hash>\` (never bare `%TEMP%`; honor a
+1. **Dedicated temp root**: `%LOCALAPPDATA%\NovaPrism\open\<session>\<archive-hash>\` (never bare `%TEMP%`; honor a
    user-configured override — the thing 7-Zip's bug #2056 gets wrong). Mark files read-only when the archive is
    read-only.
 2. **Watch the directory, not the process**: `ReadDirectoryChangesW` (Rust `notify` crate) on the extraction
@@ -275,7 +275,7 @@ comments):
    (`RmStartSession`/`RmGetList`) or a periodic exclusive-open probe to know whether *any* process still holds
    the file — this solves both the two-process-editor and the locked-Word-file cases.
 4. **Offer update non-modally**: toast/banner "photo.jpg changed — update archive?" with "always for this
-   session". Thanks to .narc append-only updates, applying it is near-instant — this flow becomes a headline
+   session". Thanks to .nva append-only updates, applying it is near-instant — this flow becomes a headline
    feature instead of a scary repack.
 5. **Locked-file edge**: if the file is still locked when the user closes the archive, keep a pending-update
    journal; retry on next launch (and GC temp entries older than N hours, WinRAR-style, but *per entry* with the
@@ -315,7 +315,7 @@ CLI/extraction engine a separate lean binary so shell-integration paths never pa
 - Explorer-quality thumbnails: `IShellItemImageFactory::GetImage`
   ([windows crate binding](https://microsoft.github.io/windows-docs-rs/doc/windows/Win32/UI/Shell/struct.IShellItemImageFactory.html)) —
   requires a real file, so thumbnails for archived images = extract-to-cache first (or decode ourselves from the
-  chunk store, which .narc makes cheap; do that and skip the shell for common image types).
+  chunk store, which .nva makes cheap; do that and skip the shell for common image types).
 - Convenience crates: [windows-icons](https://crates.io/crates/windows-icons),
   [file_icon_provider](https://crates.io/crates/file_icon_provider) (cross-platform).
 - Delivery into the UI: Tauri — custom `icon://` protocol returning PNG (cache by extension); egui/Slint/iced —

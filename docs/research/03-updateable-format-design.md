@@ -1,6 +1,6 @@
-# Research 03 — Designing an Updateable Archive Container (.narc)
+# Research 03 — Designing an Updateable Archive Container (.nva)
 
-**Scope:** cheap in-place updates, random access, deduplication for the Nova Arc `.narc` format.
+**Scope:** cheap in-place updates, random access, deduplication for the Nova Prism `.nva` format.
 **Date:** 2026-08-16. All liveness/version claims verified against the live web on this date.
 
 ---
@@ -32,10 +32,10 @@
 
 ## 2. Prior art: journaling / dedup archive systems
 
-### 2.1 zpaq — the direct ancestor of the .narc idea
+### 2.1 zpaq — the direct ancestor of the .nva idea
 
 zpaq (Matt Mahoney, public domain / MIT) added its **journaling format in Sept 2012 (zpaq 6.00,
-spec v2.01)**. It is the closest existing thing to the planned .narc: a single archive file,
+spec v2.01)**. It is the closest existing thing to the planned .nva: a single archive file,
 append-only updates, CDC dedup, per-update transactions, rollback.
 
 Design facts (from the [spec](https://mattmahoney.net/dc/zpaq201.pdf) and
@@ -96,7 +96,7 @@ CDC blobs (Rabin fingerprint, 64-byte window; blobs 512 KiB–8 MiB, target 1 Mi
 not split) inside **pack files** whose *header is at the end* (written after streaming the blobs),
 plus separate **index files** kept < 8 MiB each with a `supersedes` field for index rewrites.
 
-- **Prune safety ordering (adopt verbatim for .narc compaction):**
+- **Prune safety ordering (adopt verbatim for .nva compaction):**
   1. write the new pack, 2. add the updated index, 3. delete the old index, 4. only then delete
   the old pack. A pack must be unreferenced by any live index before deletion.
 - The old prune (pre-2020, [issue #2547](https://github.com/restic/restic/issues/2547)) read every
@@ -133,11 +133,11 @@ GC is mark-and-sweep: `casync gc --store=… index1 index2` deletes unreferenced
 | Replace/delete one file | Append new copy, rewrite directory; old bytes remain as dead space until repack (this is exactly an append-only log with the directory as manifest) | Any file inside a solid folder ⇒ **the whole folder must be decompressed and recompressed**; with default solid block size = min(dict×128, 4 GiB) that means gigabytes of work for a 1-byte change |
 | Random access | Yes (per-file streams) | Only per-folder; extracting file *N* of a solid folder decompresses files 1…N−1 |
 
-- The dead-space-until-repack behavior of ZIP updates is the *same* model as the planned .narc
+- The dead-space-until-repack behavior of ZIP updates is the *same* model as the planned .nva
   log + compaction — ZIP just never automated the compaction.
 - ZIP64 exists because the original format used 4-byte sizes/offsets ([ZIP64 notes](https://blog.yaakov.online/zip64-go-big-or-go-home/)). **Use 64-bit fields everywhere from v0.**
 - The redundant local headers are what make ZIP archives salvageable by scanning when the central
-  directory is destroyed — the property the raw .narc chunk log currently lacks.
+  directory is destroyed — the property the raw .nva chunk log currently lacks.
 - 7-Zip itself is alive (v26.02, 2026-06-25, [history](https://www.7-zip.org/history.txt));
   WinRAR 7.20 beta (Oct 2025) advertises *faster deletion from solid archives* — even the
   incumbents are being pushed toward cheap partial updates.
@@ -151,7 +151,7 @@ Pros: single file; per-file in-place update/delete with real transactions (WAL);
 metadata; ~2 % larger than an equivalent ZIP; SQLite's crash-safety is the best-tested on Earth;
 [appfileformat.html](https://sqlite.org/appfileformat.html) makes a strong general case.
 
-Cons that kill it as the .narc outer container:
+Cons that kill it as the .nva outer container:
 - **BLOB hard cap 2^31−3 bytes (≈ 2 GiB), default `SQLITE_MAX_LENGTH` 10^9**
   ([limits](https://sqlite.org/limits.html)) → every large file needs app-level chunking anyway.
 - No solid compression, no dedup, zlib-only in the reference tooling → ratio loses badly to zstd
@@ -174,13 +174,13 @@ zstd decoder still decompresses the whole file. Footer = 9 bytes:
 from EOF. Each entry: `Compressed_Size (4) | Decompressed_Size (4) [| XXH64-low32 (4)]` → 8–12
 bytes/frame; 4-byte sizes cap a frame at 4 GiB.
 
-Takeaways for .narc:
+Takeaways for .nva:
 - The "magic at the very last bytes, parse backwards" pattern is proven — same as the planned
   footer.
 - Per-frame independent compression + tiny table = random access at a measurable ratio cost;
   frame size is the ratio/latency dial (same dial as solid-block size).
 - Rust implementation: [`zeekstd` 0.6.2](https://crates.io/crates/zeekstd) (BSD-2, Dec 2025,
-  active). Nova Arc doesn't need the exact format internally, but *emitting* seekable-zstd for
+  active). Nova Prism doesn't need the exact format internally, but *emitting* seekable-zstd for
   single-file compression mode would give free interop.
 
 ---
@@ -212,7 +212,7 @@ confirms normalization ≤ NC-3 costs only marginal dedup.
   crate. Corollary (zpaq lesson): *min/avg/max/normalization/seed must be stored in the archive
   header and reused for every subsequent update of that archive.*
 
-**Recommended .narc defaults** (aligned with zpaq/restic practice): min 16 KiB / avg 64 KiB /
+**Recommended .nva defaults** (aligned with zpaq/restic practice): min 16 KiB / avg 64 KiB /
 max 256 KiB, Normalization Level 1, per-archive seed 0 for v0. At 64 KiB average and ~32 B of
 metadata per chunk, metadata overhead ≈ 0.05 % of stored data; RAM for the dedup index ≈ 40–48 B
 per chunk ⇒ ~0.7 GB RAM per 1 TB of unique data — acceptable, and small-file archives use far
@@ -236,7 +236,7 @@ Evidence ([Wikipedia/solid compression](https://en.wikipedia.org/wiki/Solid_comp
   fragments into `d`-blocks grouped by file type; restic packs ~1 MiB blobs into pack files and
   compresses each blob (v2 repos, zstd); borg compresses each chunk into 500 MB segments.
 - Compressing each 64 KiB chunk independently would cost real ratio (small zstd windows, no
-  cross-chunk context). Mitigations, in .narc-relevant order:
+  cross-chunk context). Mitigations, in .nva-relevant order:
   1. **Solid segments:** compress a *sequence of chunks* (grouped by file type/extension, zpaq
      style) as one zstd stream, 16–64 MiB per segment; random access decompresses at most one
      segment.
@@ -302,7 +302,7 @@ last footer that validates transitively.
 
 ## 6. Container strategy comparison
 
-| Property | ZIP | 7z (solid) | zpaq journaling | borg 1.x segments | restic packs | sqlar | **.narc v0 target** |
+| Property | ZIP | 7z (solid) | zpaq journaling | borg 1.x segments | restic packs | sqlar | **.nva v0 target** |
 |---|---|---|---|---|---|---|---|
 | Single file | yes | yes | yes | no (repo dir) | no (repo dir) | yes | yes |
 | Add file w/o repack | yes (append+CD rewrite) | partial (new folder + header rewrite) | yes (append) | yes | yes | yes | yes |
@@ -315,7 +315,7 @@ last footer that validates transitively.
 | Liveness 2026 | ubiquitous | 7-Zip 26.02 (06/2026) | zpaq dead; zpaqfranz 64.8 (06/2026) | active; 2.0 changed model | active 0.19.x | SQLite active | — |
 
 Note zpaq's one real format hole: it has **no compaction at all** — deleted data lives forever
-unless you rebuild the archive. .narc's offline compaction is the differentiator; borg/restic
+unless you rebuild the archive. .nva's offline compaction is the differentiator; borg/restic
 supply the safety playbook for it.
 
 ---
@@ -433,7 +433,7 @@ still dedup.
 `chunk-index` record: sorted (blake3_short → segment, offset) table. Update sessions load it in
 one read instead of walking all segment headers. ~24–32 B per unique chunk.
 
-**F-6. Compaction spec (fixes P-9).** Offline only, in v0: write `archive.narc.tmp` on the same
+**F-6. Compaction spec (fixes P-9).** Offline only, in v0: write `archive.nva.tmp` on the same
 volume (copy live segments, drop dead ones, write fresh snapshot+footer, generation+1),
 `FlushFileBuffers`, then `SetFileInformationByHandle`+POSIX rename with `ReplaceFile` fallback;
 handle 1175 (retry), 1176/1177 (temp file is the good archive — finish the swap on next open).

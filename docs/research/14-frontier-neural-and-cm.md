@@ -16,7 +16,7 @@ measurement dates; where a source's hardware is unknown or old, that is stated.
 >    16-bit-image half survives (MEASURED HERE: `x-ray` −11.0%, `mr` −10.1%). Corrected in §7.
 > 2. **The CM speed figure was 2.5–3× too pessimistic and the ratio needs no discount at all.**
 >    kanzi's README states the level-9 default block size *is* 32 MB, so 41,520,670 on Silesia is
->    already a measurement at narc's own unit granularity, produced with only ~7 of 16 cores busy.
+>    already a measurement at nova's own unit granularity, produced with only ~7 of 16 cores busy.
 >    Corrected per-core figure: **~2.7–2.9 MB/s**, not 1.1. Corrected in §6 and §10.
 > 3. **The memory line was an order of magnitude too optimistic.** This document's own LTCB table
 >    lists kanzi TPAQX at 3,100 MB and lpaq9m at 1,542 MB. "64–256 MB per decode thread" is a
@@ -32,9 +32,9 @@ measurement dates; where a source's hardware is unknown or old, that is stated.
 > `test/Silesia-compression-corpus/raw/`. The baselines reproduce Mahoney's `7z -mx=9` per-file
 > column to within 0.2%, which validates the harness.
 
-Reference point for everything in this document — narc as measured on 8 cores / Windows 11:
+Reference point for everything in this document — nova as measured on 8 cores / Windows 11:
 
-| Corpus | narc max | 7-Zip -mx9 | narc time |
+| Corpus | nova max | 7-Zip -mx9 | nova time |
 |---|---|---|---|
 | Silesia 202 MiB (211.9 MB) | 47 MiB (~49.3 MB) | 47 MiB / 49 s | 6.8 s (≈31 MB/s aggregate) |
 | Source tree 114 MiB, 5751 files | 12 MiB | 8.8 MiB | — |
@@ -47,7 +47,7 @@ Reference point for everything in this document — narc as measured on 8 cores 
 > ratio at ≥10 MB/s single-thread on a CPU, with deterministic bit-exact output across machines?
 
 **No. Not within a factor of two, let alone a few percent.** The measured 2026 frontier, on the
-same corpus narc benchmarks (Silesia), from Matt Mahoney's Silesia benchmark (last updated
+same corpus nova benchmarks (Silesia), from Matt Mahoney's Silesia benchmark (last updated
 **2026-05-20**) and the kanzi 2.5.0 README benchmark (Ryzen 9 9950X, Ubuntu 25.10):
 
 | Class | Program | Silesia total | vs paq8px | Single-thread throughput |
@@ -59,7 +59,7 @@ same corpus narc benchmarks (Silesia), from Matt Mahoney's Silesia benchmark (la
 | open CM | mcm 0.82 -9 -max | 40,068,926 | +44% | ~2.5 MB/s |
 | open CM (maintained) | kanzi 2.5.0 -l 9 (TPAQX) | 41,520,670 | +49% | **~2.7–2.9 MB/s/core** |
 | BWT+CM (maintained) | bsc 3.3.11 | 46,723,436 … 47,900,848 | +68…72% | ~11 MB/s/core |
-| **narc today** | **narc max** | **~49,300,000** | **+77%** | ~4 MB/s/core |
+| **nova today** | **nova max** | **~49,300,000** | **+77%** | ~4 MB/s/core |
 | LZMA | xz 5.8.1 -9 / 7z -mx=9 | 48,802,580 / 48,792,760 | +75% | ~4.9 MB/s |
 
 Read that table twice. Two separate facts fall out of it:
@@ -68,7 +68,7 @@ Read that table twice. Two separate facts fall out of it:
    larger than paq8px. No CM and no neural model gets near 10 MB/s single-thread in 2026.
 2. **The bankable prize is not "paq-class". It is 15–20% over LZMA at ~2–3 MB/s/core.** Every
    maintained open CM codec sits in a tight band, 39–42 MB on Silesia, at 2–3 MB/s per core
-   (corrected — see §6). That band is 15–20% better than narc's current 49.3 MB. It is also
+   (corrected — see §6). That band is 15–20% better than nova's current 49.3 MB. It is also
    40–50% *worse* than paq8px. **Where the remaining 40–50% lives was mis-attributed in the first
    draft.** Decomposing the same Mahoney table per file: half of it is executables and binary
    containers (`mozilla`, `samba`, `ooffice`), a third is plain text, and the 16-bit-image and
@@ -100,7 +100,7 @@ On determinism the answer is cleaner and more useful:
   exact GPU or CPU model nor on the number of configured threads."* So GPU-side determinism *is*
   achievable (BF16 with pinned evaluation order). It costs a closed binary, a GPU, and ≤1 MB/s.
 
-**Therefore the only neural technique narc can ship is the one the paq lineage has shipped since
+**Therefore the only neural technique nova can ship is the one the paq lineage has shipped since
 2002: integer logistic mixing of many cheap predictors.** Everything with a matmul in it is out.
 
 ---
@@ -179,9 +179,9 @@ version of this that becomes interesting.
 
 **(c) The PPM column deserves a second look.** `durilca'kingsize -o41 -m13000` gets enwik9 to
 127.4 MB at ~0.75 MB/s — better than every open CM compressor in the table except paq-class, and
-narc already has a PPMd7 engine. The lever there is **order and memory** (order 41, 13 GB), not
+nova already has a PPMd7 engine. The lever there is **order and memory** (order 41, 13 GB), not
 neural anything. That is a cheaper experiment than a CM codec, though 13 GB collides head-on
-with narc's bounded-extraction invariant.
+with nova's bounded-extraction invariant.
 
 ---
 
@@ -210,15 +210,15 @@ Verdict on the whole family: **reject**, and the reasons are structural, not inc
   charge 2 bytes per parameter and note that language models *"suffer a huge loss in compression
   rate due to their large size, which cannot be offset when compressing only 1 GB of data."*
   For an archiver this is worse than a size penalty — it makes the archive undecodable without
-  bit-identical weights forever. A .narc that cannot be opened in 2035 without a specific GGUF
+  bit-identical weights forever. A .nva that cannot be opened in 2035 without a specific GGUF
   file is not an archive.
 - **Context.** DeepMind's transformer setting chunks input to **2048 bytes** per compression
-  unit. narc's problem is the opposite direction (32 MiB is already too small).
+  unit. nova's problem is the opposite direction (32 MiB is already too small).
 - **Blobs and licences.** NNCP's source is MIT but `libnc` ships binary-only with no source —
   a proprietary blob, disqualified. ts_zip is a closed binary. cmix and paq8px are GPL-2/3.
   gmix is GPL. bsc-m03 is GPL. Of everything surveyed, only **libbsc, libsais and kanzi
   (Apache-2.0)**, **libzpaq (public domain)** and **bzip3 (LGPL-3, static-link friction)** are
-  licence-compatible with narc without contaminating it.
+  licence-compatible with nova without contaminating it.
 
 ---
 
@@ -246,10 +246,10 @@ Two structural observations:
   an entry built exactly this way — sparse GLN neurons over hashed n-gram contexts of orders
   1,2,3,4,6,8,16 plus partial-byte state, one weight per prediction, cascaded logistic mixers.
   **That is an integer-friendly, cache-friendly, deterministic architecture.** It is also, in
-  narc terms, "write lpaq in Rust with a better justification". Which is fine — but do not
+  nova terms, "write lpaq in Rust with a better justification". Which is fine — but do not
   mistake the framing for a speed breakthrough: gmix is 13.5 kB/s.
 - **The `-Ofast` warning in cmix's README is the whole determinism story in one line.** Any
-  narc CM implementation must have a test that compresses on one machine and decompresses on
+  nova CM implementation must have a test that compresses on one machine and decompresses on
   another, and must forbid `-ffast-math`-equivalent behaviour by simply having no floats in the
   prediction path.
 
@@ -258,7 +258,7 @@ Two structural observations:
 ## 4. The 2026 research literature on "lightweight" neural compression: uniformly worse than 2010 practice
 
 This is the most important negative result in the document, because the papers *sound* like the
-answer to narc's question and are not.
+answer to nova's question and are not.
 
 | Paper | Date | Claim | Reality check |
 |---|---|---|---|
@@ -266,7 +266,7 @@ answer to narc's question and are not.
 | **StateSMix** (arXiv 2605.02904) | 2026-05 | Online Mamba SSM (DM=32, NL=2, ~120 K active params) + 9 sparse n-gram hash tables, pure C with AVX2, **no GPU**, no pretrained weights | **2.123 bpb on 1 MB of enwik8**, beating `xz -9e` by 8.7% / 5.4% / 0.7% at 1/3/10 MB — the advantage *vanishes as input grows*. **~2,000 tokens/s ≈ 2 kB/s**; OpenMP gives 1.9× on 4 cores. Precision not stated |
 | **Nacrith** (arXiv 2602.19626) | 2026-02 | 135M transformer + light online predictors, CDF precision 2^16→2^24 removing "~75% of quantisation overhead" | GPU, GGUF weights uncounted (§2) |
 | **STC: Reversible Digit-Context Decomposition for BWT-family text compression** (arXiv 2606.03570 v3, Du/Shen/Xiang) | 2026-08-11 | Split digit runs out of text into context-conditioned side streams before BWT | **enwik9 157,388,188** (157,571,362 with decoder) — a genuine **1.6% gain** over the no-split control, exactly reversible, deterministic. But: 694 s encode / 670 s decode, **12.5 GiB peak RAM**, and it inherits GPL from bsc-m03's model tables |
-| **2026 AIT Data Compression Challenge** (arXiv 2606.17712, Ribeiro et al., 2026-06-16; aitdcc.github.io) | 2026-06 | 117 valid submissions, 16 heterogeneous files, hidden test partition, **≤8 GB RAM, decompressor ≤1 MB**, AC/range coding encouraged | Conclusion: *"performance depends strongly on the optimization criterion"* — zstd-1/brotli-1 win speed, "modelling-intensive" compressors win size at much higher cost. **No submission broke the ratio/speed trade-off.** Notable entry `G7-V10`: block-level selection among raw / BWT / LZP / x86-filtered transforms and models — i.e. narc's tournament idea, independently validated |
+| **2026 AIT Data Compression Challenge** (arXiv 2606.17712, Ribeiro et al., 2026-06-16; aitdcc.github.io) | 2026-06 | 117 valid submissions, 16 heterogeneous files, hidden test partition, **≤8 GB RAM, decompressor ≤1 MB**, AC/range coding encouraged | Conclusion: *"performance depends strongly on the optimization criterion"* — zstd-1/brotli-1 win speed, "modelling-intensive" compressors win size at much higher cost. **No submission broke the ratio/speed trade-off.** Notable entry `G7-V10`: block-level selection among raw / BWT / LZP / x86-filtered transforms and models — i.e. nova's tournament idea, independently validated |
 | **Integer-Only Discrete Flows** (arXiv 2206.08869, ICML 2022) | 2022 | int8 integer-only neural compressor, 5.9–8.7× faster, ~10× over fastest neural compressors | TensorRT **on GPU**; images only |
 | **Practical Lossless Neural Compression for LiDAR** (arXiv 2603.25260) | 2026-03 | First cross-platform **integer-only** inference pipeline for neural PCC; int8 GEMM w/ int32 accumulate, fixed-point requant/activations, LUT softmax; ~14 FPS, no ratio loss vs float | Point clouds, not general data. **Valuable as a technique reference, not as a codec** |
 
@@ -275,7 +275,7 @@ xz, on 1–10 MB files, at 2–400 kB/s, and losing to a 2009 BWT compressor. Th
 about their own limits; the risk is reading the abstracts and not the tables.
 
 **Exception worth respecting:** the *techniques* for integer-only determinism (2603.25260,
-2206.08869) are real and directly reusable — but the thing narc should apply them to is a
+2206.08869) are real and directly reusable — but the thing nova should apply them to is a
 lpaq-class mixer, where the answer is trivially "already integer".
 
 ---
@@ -312,7 +312,7 @@ Everything else would be a port.
 
 ---
 
-## 6. The one measurement that matters for narc: Silesia, modern hardware, 2025/2026
+## 6. The one measurement that matters for nova: Silesia, modern hardware, 2025/2026
 
 From the **kanzi 2.5.0 README** — `silesia.tar` = 211,957,760 bytes, **AMD Ryzen 9 9950X 16-core,
 Ubuntu 25.10**, competitors run with `-T16`/`-j 16` where they support it, kanzi with its default
@@ -327,7 +327,7 @@ job count:
 | bzip3 1.5.1 -j 16 | 2,348 ms | 2,218 ms | 47,260,281 | 90 / 96 |
 | **kanzi -l 8 (TPAQ)** | **4,473 ms** | **4,881 ms** | **42,962,913** | **47 / 43** |
 | **kanzi -l 9 (TPAQX)** | **11,618 ms** | **12,381 ms** | **41,520,670** | **18 / 17** aggregate — but only ~7 of 16 cores were busy |
-| *narc max (8 cores, Win11)* | *6,800 ms* | *—* | *~49,300,000* | *~31 / —* |
+| *nova max (8 cores, Win11)* | *6,800 ms* | *—* | *~49,300,000* | *~31 / —* |
 
 **Do not divide those wall times by 16.** The kanzi README states, verbatim:
 
@@ -337,7 +337,7 @@ job count:
 
 Two consequences, and both matter more than anything else in this document:
 
-1. **41,520,670 is already a 32 MB-block measurement.** It needs no discount for narc's 32 MiB
+1. **41,520,670 is already a 32 MB-block measurement.** It needs no discount for nova's 32 MiB
    unit cap — the cap is exactly the geometry it was measured at. This is the single most
    directly transferable number in the survey.
 2. **Only ~7 of the 16 cores were busy.** 211,957,760 / 32 MB = 7 blocks, one job per block. So
@@ -358,7 +358,7 @@ So the defensible per-core band is **2–3 MB/s both directions**, and the first
 argument.** 4.06 MB/s/core with 4 concurrent jobs (M3) vs 2.89 MB/s/core with 7 concurrent jobs
 (9950X) is the signature of **memory-bandwidth contention**: a CM codec is random access into
 hash tables measured in GB (§1: kanzi TPAQX 3,100 MB), which is the worst possible cache
-behaviour, and narc's whole case for tolerating a 2 MB/s codec is "we run 8 of them at once".
+behaviour, and nova's whole case for tolerating a 2 MB/s codec is "we run 8 of them at once".
 Per-core CM throughput under N-way parallelism must be measured, not assumed linear. Provisional
 planning figure: **~2 MB/s/core at 8-way**, i.e. do not bank the 2.89.
 
@@ -368,7 +368,7 @@ bytes in 8,260 ms, decode 8,760 ms**. For scale on the same file: `xz -9e` ≈ 1
 
 ### The unit-size tax, quantified
 
-CM is often blamed for needing huge inputs. It does — but **so does everything else**, and narc
+CM is often blamed for needing huge inputs. It does — but **so does everything else**, and nova
 already pays this tax:
 
 | Program | enwik8 bpb | enwik9 bpb | Gain from 10× more data |
@@ -377,8 +377,8 @@ already pays this tax:
 | bsc-m03 | 1.624 | 1.282 | 21.1% |
 | xz | ~1.99 | 1.579 | 20.7% |
 
-So moving to a CM codec does **not** make narc's 32 MiB unit cap worse in relative terms. But it
-also does **not fix the source-tree loss**: narc is 12 MiB vs 7-Zip's 8.8 MiB on the 114 MiB /
+So moving to a CM codec does **not** make nova's 32 MiB unit cap worse in relative terms. But it
+also does **not fix the source-tree loss**: nova is 12 MiB vs 7-Zip's 8.8 MiB on the 114 MiB /
 5751-file tree, a 36% gap. A codec swap worth 12–16% takes 12 MiB → ~10.1 MiB and still loses.
 **Do not expect an ultra tier to close the source-tree gap.**
 
@@ -394,10 +394,10 @@ statement is "cold start, fixable, see doc 15 §1".
 
 Separately, the small-input warm-up penalty is real and sharp at the low end: paq8px is ~1.27 bpb
 on enwik8 (100 MB) but **1.73 bpb on alice29.txt (152 KB)**, worse than cmix on the same file.
-Any CM tier in narc must not be applied to small solid blocks without measuring.
+Any CM tier in nova must not be applied to small solid blocks without measuring.
 
 **And this is the interaction the first draft missed entirely: CM's cold start is worse than
-LZMA2's, so an ultra tier is penalised hardest on exactly the corpus where narc already loses.**
+LZMA2's, so an ultra tier is penalised hardest on exactly the corpus where nova already loses.**
 A CM model must learn its hash tables, its mixer weights and its SSE tables from scratch per unit,
 where LZMA2 only loses its match window and its range-coder probabilities. Two consequences:
 
@@ -455,7 +455,7 @@ Per-file sizes in KB (Mahoney, Silesia, 2026-05-20, files compressed individuall
 
 ### 7.2 The proposed implementation, measured — and it mostly fails
 
-§10 proposed shipping these as *reversible filters in the existing tournament* (narc has no CM
+§10 proposed shipping these as *reversible filters in the existing tournament* (nova has no CM
 codec to plug a context source into, so filters are the only shippable form). That is a different
 mechanism from paq8px's, so it was measured directly. Filters: stride detection by byte-position
 autocorrelation (which works — it recovers `sao`'s 28-byte records and the 16-bit stride of
@@ -490,12 +490,12 @@ autocorrelation (which works — it recovers `sao`'s 28-byte records and the 16-
    already has the shippable form of it (BCJ2, dispack-class disassembly filters, per-section
    splitting). Cross-reference it instead of re-deriving.
 4. Expected total from this whole family, honestly: **1.0% of Silesia now** (16-bit filter),
-   ~3% more only after a CM tier exists, and **0% on the source tree**, which is where narc
+   ~3% more only after a CM tier exists, and **0% on the source tree**, which is where nova
    actually loses.
 
 The 2026 AITDCC's noted entry `G7-V10` (block-level selection among raw, BWT, LZP and x86-filtered
 transforms) does validate the *tournament* frame — but note that the corroboration is for
-per-block method selection, which narc already has, not for the submodels. The paper's abstract
+per-block method selection, which nova already has, not for the submodels. The paper's abstract
 (verified 2026-08-17) supports only the general conclusion that "performance depends strongly on
 the optimization criterion"; the `G7-V10` detail is a body claim and was not re-verified.
 
@@ -527,9 +527,9 @@ model** as one predictor inside the CM ensemble, plus LZP folding. Evidence:
   MB/s). There is nothing to adopt.
 
 **Conclusion: "LZ + light CM" and "CM with a match model" are the same thing, and the match model
-is mandatory, not optional.** Any narc CM codec must have one.
+is mandatory, not optional.** Any nova CM codec must have one.
 
-**(c) "CM fallback for units where LZ does badly."** This is free for narc — the per-unit codec
+**(c) "CM fallback for units where LZ does badly."** This is free for nova — the per-unit codec
 tournament already exists. The work is not plumbing; it is (i) a cheap predictor of when CM will
 win so the tournament does not have to actually run a 1 MB/s codec on every unit, and (ii) the
 memory/tier policy. A good cheap predictor: run the existing LZMA2 and PPMd7 candidates, and only
@@ -539,7 +539,7 @@ unit) or when the LZMA2 ratio is poor in absolute terms.
 **(d) One adjacent non-CM finding that outranks most of this document.** `bsc 3.3.11` compressed
 Silesia to **47,900,848 bytes in 1.2 s / 0.7 s on 16 cores** — better ratio than 7-Zip -mx9 and
 xz -9, roughly **36× faster to compress than xz**. libbsc and libsais are **Apache-2.0** and
-Grebnov maintains both. If narc's goal were "beat 7-Zip on ratio *and* speed" rather than "beat
+Grebnov maintains both. If nova's goal were "beat 7-Zip on ratio *and* speed" rather than "beat
 paq", a BWT tier is a far cheaper move than a CM tier. It is not neural and not in scope for this
 document, but it should not be missed because the question was framed around neural work.
 
@@ -567,22 +567,22 @@ Measured, and the result is counter-intuitive in a useful way:
 DRT shrinks the enwik8 byte stream itself by 5–8% (60,520,510 → 55,852,090 in phda9's pipeline),
 but the final-size gain **collapses to ~0.1% once the back end has its own word model**.
 
-**Implication for narc, which uses PPMd7:** a DRT/WRT-style transform is worth ~5% on English
+**Implication for nova, which uses PPMd7:** a DRT/WRT-style transform is worth ~5% on English
 text units *today*, before any CM work. Costs: a ~200–500 KB dictionary shipped in the binary (and
 charged against the gain if you care about self-containment), English-only benefit, and a transform
-that must be exactly reversible on arbitrary bytes. And if narc later ships a CM codec with a word
+that must be exactly reversible on arbitrary bytes. And if nova later ships a CM codec with a word
 model, this gain mostly evaporates — so build it as a transform in the tournament, not as an
 always-on stage.
 
 **Review: downgraded from "ship-now" to "watch". Four problems, any one of which is enough.**
 
-1. **The 5.1% is not measured with anything resembling narc's back end.** It is `ppmonstr J
+1. **The 5.1% is not measured with anything resembling nova's back end.** It is `ppmonstr J
    -m1650 -o64`: order **64**, 1.65 GB, and PPMonstr rather than PPMd (§11.3 — different program,
-   materially stronger model). narc runs PPMd7 at orders 10/16 under a bounded memory budget. The
+   materially stronger model). nova runs PPMd7 at orders 10/16 under a bounded memory budget. The
    transfer is plausible in direction and completely unquantified in size. The table's own trend is
    the warning: the gain falls from 5.1% (ppmonstr) to 0.16% (phda9) to 0.08% (cmix) as the back
    end's own text modelling improves.
-2. **It buys nothing on either corpus narc is judged on.** Silesia is ~50 MB of prose out of 202;
+2. **It buys nothing on either corpus nova is judged on.** Silesia is ~50 MB of prose out of 202;
    the source tree is identifiers, punctuation and paths, where a natural-language dictionary is a
    poor fit. The 5% is a 5% of a fraction.
 3. **A measured alternative strictly dominates it.** Doc 15 §1.4: preset dictionaries drawn from
@@ -604,11 +604,11 @@ again, not a new one.
 
 ---
 
-## 10. What narc should realistically adopt as an optional "ultra" tier
+## 10. What nova should realistically adopt as an optional "ultra" tier
 
 ### Honest projected numbers
 
-Baseline: narc max = ~49.3 MB on Silesia, 6.8 s compress on 8 cores (~31 MB/s aggregate).
+Baseline: nova max = ~49.3 MB on Silesia, 6.8 s compress on 8 cores (~31 MB/s aggregate).
 
 | Ultra tier design | Projected Silesia size | Projected compress (8 cores) | Projected decompress (8 cores) | Memory per worker |
 |---|---|---|---|---|
@@ -617,16 +617,16 @@ Baseline: narc max = ~49.3 MB on Silesia, 6.8 s compress on 8 cores (~31 MB/s ag
 | Table-shrunk variant that actually fits 64–256 MB/worker | **unmeasured — do not plan on it** | faster | faster | 64–256 MB |
 
 Derivation, corrected (§6): kanzi -l 9 reaches 41,520,670 on Silesia **at a 32 MB default block
-size** — narc's own unit granularity, so no discount for the unit cap is warranted; the ratio band
+size** — nova's own unit granularity, so no discount for the unit cap is warranted; the ratio band
 is 41.5 MB plus whatever a first-generation Rust implementation gives away against 2,726 commits of
 tuning, call it 41.5–43 MB. Per-core throughput is 2.7–2.9 MB/s on a 9950X and 2.0 MB/s on LTCB's
 older single-threaded run; planning at **2 MB/s/core at 8-way parallelism** to leave room for
 memory-bandwidth contention gives 8 × 2 = 16 MB/s aggregate → ~13 s for 202 MiB, about **2× slower
-than narc max today**, not 3.5×.
+than nova max today**, not 3.5×.
 
-**The architectural point that makes this viable at all:** narc compresses units in parallel, so
+**The architectural point that makes this viable at all:** nova compresses units in parallel, so
 a codec that is 2 MB/s single-thread is ~16 MB/s aggregate on the owner's 8-core box. The
-"≥10 MB/s single-thread" bar in the original question is the wrong bar for narc's architecture.
+"≥10 MB/s single-thread" bar in the original question is the wrong bar for nova's architecture.
 The right bar is **≥1 MB/s single-thread with per-unit independence**, and that bar is met by
 integer CM today.
 
@@ -641,27 +641,27 @@ integer CM today.
 - **The decompression baseline it is being compared against was never measured.** "LZMA2's
   ~200+ MB/s" traces to the kanzi README's `xz -9` decode row (211,957,760 B / 931 ms = 228 MB/s),
   which is implausibly fast for single-threaded LZMA2 decode and is probably measuring a
-  multi-block stream and/or warm cache. **Measure narc's own extraction throughput before quoting
+  multi-block stream and/or warm cache. **Measure nova's own extraction throughput before quoting
   any slowdown factor.** The honest statement today is "decode drops to ~16 MB/s aggregate, from an
   unmeasured baseline that is at least an order of magnitude higher".
 
 ### Hard constraints: which ones this breaks
 
-| narc constraint | Status under an ultra CM tier |
+| nova constraint | Status under an ultra CM tier |
 |---|---|
 | Editing one file stays cheap; append-only; no full repack | **Preserved.** CM runs per 32 MiB unit, independently, no cross-unit state |
 | Extraction in bounded memory, 10–80 MiB today | **BROKEN, and worse than the first draft admitted.** The first draft said "64–256 MB per decode thread"; this document's own LTCB table lists **kanzi TPAQX at 3,100 MB, lpaq9m at 1,542 MB, mcm at 5,961 MB, zcm at 3,100 MB** — every CM in the table is 1.5–6 GB. Those are the configurations the quoted ratios came from. So the real figure is **1–3 GB per decode thread, a 20–40× breach of today's budget**, and 8-way parallel decode would want 8–24 GB. A 64–256 MB table-shrunk configuration is a *different operating point whose ratio nobody has measured* — it is not free, and the 41.5 MB number does not travel with it. Measure the ratio-vs-table-size curve first; it may be the fact that kills the tier |
 | Exactly reversible, bit for bit | **Preserved, if and only if the prediction path is integer-only.** No floats anywhere. Add a cross-machine round-trip test (different CPU vendor, different SIMD width, `-C target-cpu=native` vs baseline). Note: integer SIMD is *not* a hazard here and is worth 2–4× — see §11.2 |
-| Decompression speed matters | **Degraded ~10×+, and latency degraded ~10×+ too.** ~16 MB/s aggregate against an unmeasured LZMA2 baseline. The first draft's "3–5×" understated it and, more importantly, missed **selective-extract latency**: pulling one 4 KB file out of a 32 MiB CM unit costs a full single-threaded unit decode, ≈16 s at 2 MB/s, versus well under a second today. That attacks narc's core value proposition (cheap random access), not just its throughput, and it compounds with doc 15's dictionary chains (× chain depth). Acceptable only as an opt-in tier, never as a default, and the UI must warn at *create* time that this archive will be slow to browse |
+| Decompression speed matters | **Degraded ~10×+, and latency degraded ~10×+ too.** ~16 MB/s aggregate against an unmeasured LZMA2 baseline. The first draft's "3–5×" understated it and, more importantly, missed **selective-extract latency**: pulling one 4 KB file out of a 32 MiB CM unit costs a full single-threaded unit decode, ≈16 s at 2 MB/s, versus well under a second today. That attacks nova's core value proposition (cheap random access), not just its throughput, and it compounds with doc 15's dictionary chains (× chain depth). Acceptable only as an opt-in tier, never as a default, and the UI must warn at *create* time that this archive will be slow to browse |
 | Pure Rust preferred, FFI OK, no GPL, no blobs | **Satisfiable.** Port from Apache-2.0 kanzi / public-domain libzpaq. **Do the licence due diligence:** kanzi's wiki states TPAQ is *"based initially on Tangelo 2.4"*, itself *"derived from FPAQ8"* — trace that chain before vendoring code, since fpaq8/Tangelo ancestry may not be Apache-2.0. Reimplementing from the published algorithm is the safe path |
 | Zero telemetry, offline, consumer hardware, GPU optional | **Preserved.** No GPU, no network, no model download |
 
 ### Format invariants the tier must add
 
 1. **Pin the model in the unit header**, ZPAQ-style: number and type of components, context orders,
-   hash table sizes, mixer learning rates, SSE table sizes. narc already pins chunk geometry to
+   hash table sizes, mixer learning rates, SSE table sizes. nova already pins chunk geometry to
    the archive; a CM model's table size changes its predictions, so it is geometry too. Without
-   this, a future narc build with a different default table size cannot decode old archives.
+   this, a future nova build with a different default table size cannot decode old archives.
 2. **Version the codec ID separately from the tier name.** "ultra" is a UI concept; the codec ID
    is a format promise.
 3. **Declare peak decode memory per unit in the unit header** so the extractor can schedule
@@ -673,7 +673,7 @@ Revised after the review pass. The first draft's steps 1 and 2 were the two item
 survive; the measurement step moved to the front because it is now nearly free.
 
 1. **Measure, with a CLI, before writing any Rust.** `kanzi -l 9` already uses 32 MB blocks by
-   default, so `kanzi -l 9` (or `-b 32m` explicitly) on narc's own corpora *is* the experiment —
+   default, so `kanzi -l 9` (or `-b 32m` explicitly) on nova's own corpora *is* the experiment —
    an afternoon of shell scripting, no FFI, no feature flag, Apache-2.0, actively maintained.
    Required numbers: ratio and wall time on `test/corpus` (the source tree, where CM's cold start
    should hurt most), per-core throughput at 1/2/4/8-way parallelism, and peak RSS per process.
@@ -689,7 +689,7 @@ survive; the measurement step moved to the front because it is now nearly free.
    headroom on Silesia — five times the record/image files combined — and doc 04 already has the
    shippable plan (BCJ2, dispack-class filters, section splitting).
 4. **The ratio-vs-model-memory curve**, before committing to a tier. Run `kanzi -l 8` (TPAQ, less
-   memory) against `-l 9` (TPAQX) on narc's corpora and, if possible, an lpaq-class build at
+   memory) against `-l 9` (TPAQX) on nova's corpora and, if possible, an lpaq-class build at
    several table sizes. If a 256 MB-per-thread configuration gives up most of the 16%, the tier is
    dead and steps 5–6 should not happen.
 5. **Model priming** for whichever back end wins, using doc 15's committed-dictionary-unit
@@ -700,7 +700,7 @@ survive; the measurement step moved to the front because it is now nearly free.
    (§11.2), ~1,500–3,000 lines, plus a lot of tuning. Budget the tuning honestly; kanzi has 2,726
    commits. Fold the record/column model in here — §7.2 shows it does not work anywhere else.
 7. **Cheaper and skipped entirely by the first draft:** before any of 4–6, try **PPMd7 →
-   secondary estimation** (§11.3). Same model family narc already ships, published algorithm, no
+   secondary estimation** (§11.3). Same model family nova already ships, published algorithm, no
    new format tier, and the prize is plausibly half the CM tier's at a fraction of the cost.
 8. **Never**: anything with a matmul, a GPU, a model file, or a float in the prediction path.
 
@@ -721,15 +721,15 @@ review. paq8px's README documents `-T`, which pre-trains the text models from `e
 `english.exp`, and `-E`, which pre-trains the EXE model from the paq8px binary itself.
 
 The critical design lesson is the *warning* attached to those flags, and it points straight at
-narc's format rules. paq8px states the training files are "used only to pre-train models before
+nova's format rules. paq8px states the training files are "used only to pre-train models before
 compression" and are not stored in the archive, and that an archive made with `-E` will differ if a
-different `paq8px.exe` is used. **That is exactly the failure mode narc must not adopt**: an archive
-whose decodability depends on an external file or a specific binary is not an archive. The narc-safe
+different `paq8px.exe` is used. **That is exactly the failure mode nova must not adopt**: an archive
+whose decodability depends on an external file or a specific binary is not an archive. The nova-safe
 form is doc 15's: the priming source must be an **already-committed unit inside the archive**,
 referenced by chunk id, with a depth cap. Then priming costs zero stored bytes, is language- and
 corpus-independent, and preserves append-only and cheap edits.
 
-Priming applies to all three back ends narc has or might have — LZMA2 (measured, doc 15 §1.4,
+Priming applies to all three back ends nova has or might have — LZMA2 (measured, doc 15 §1.4,
 −12.6…−18% on the source tree), PPMd7 (feed the dictionary through the model, suppress output;
 no format change beyond the reference), and a CM tier (feed the bits, update all tables and mixer
 weights, emit nothing). For CM the effect should be *larger* than for LZMA2, because CM has strictly
@@ -759,18 +759,18 @@ possibly 4–6 MB/s/core, which is most of the objection to the tier.
 The document's own §9 table uses `ppmonstr J` as a back end and its §1 table lists `ppmonstr J
 -o16` — without ever noting what PPMonstr *is*. PPMd and PPMonstr were released together (var. I,
 April 2002) as two variants of the **same** PPMII model from Shkarin's DCC 2002 paper "PPM: one step
-to practicality": PPMd is the speed-oriented variant (the one 7-Zip adopted, and the one narc
+to practicality": PPMd is the speed-oriented variant (the one 7-Zip adopted, and the one nova
 inherits), PPMonstr is the maximum-ratio variant, and the principal difference is that **PPMonstr
 applies secondary estimation (SSE-style probability refinement) far more aggressively**, trading
 speed for ratio.
 
-Why this matters more than a new codec tier: narc already ships the PPMII model. Adding a secondary
+Why this matters more than a new codec tier: nova already ships the PPMII model. Adding a secondary
 estimation stage over it is an upgrade *within an existing tournament entry* — published algorithm,
 integer, deterministic, no GPU, no new memory class, no new format geometry beyond a codec ID, and
 it reuses code that already exists and is already tested. The document's own numbers hint at the
 size of the prize (`ppmonstr J -m1650 -o64` = 19,098,634 on enwik8 vs 7-Zip-class PPMd in the low
 21 MB range), i.e. plausibly **~10% on text at ~2× slower**, versus the CM tier's 16% at ~10×
-slower decode and 20–40× the memory. **Measure narc's PPMd7 against `ppmonstr` on the same files
+slower decode and 20–40× the memory. **Measure nova's PPMd7 against `ppmonstr` on the same files
 before spending weeks on CM.** Caveat to respect: PPMonstr itself is a closed binary; only the
 algorithm is published (Shkarin's paper, mirrored at ctxmodel.net), with PPMd var. I sources
 circulating (e.g. `cielavenir/ppmdj1`). Provenance of any borrowed code needs checking.
@@ -784,7 +784,7 @@ read one 4 KB file is a product-level regression, and it is invisible in every b
 
 ### 11.5 The dedup side of the source-tree gap is not mentioned at all
 
-The document frames narc's 36% source-tree loss as codec-or-geometry. A 2026 storage researcher
+The document frames nova's 36% source-tree loss as codec-or-geometry. A 2026 storage researcher
 would ask a third question first: **are near-duplicate chunks being delta-compressed?** That
 literature is mature and directly applicable to an append-only, content-defined-chunked archive:
 Finesse (FAST '19), Odess (super-feature sketching by content-defined sampling, ~31× faster
@@ -804,7 +804,7 @@ disposition is "measured, retired", which is more useful than an unquantified ex
 ### 11.7 Two cited benchmarks were never actually used
 
 - **GDCC (4th edition, results 2025-05-15, €77,500)** appears in Sources and contributes nothing to
-  the analysis, despite its speed classes (rapid / balanced / HCR) bracketing narc's exact operating
+  the analysis, despite its speed classes (rapid / balanced / HCR) bracketing nova's exact operating
   point and its winners being the practical state of the art rather than the paq end of the scale.
   Attempted retrieval on 2026-08-17 failed (`gdcc.tech` refused the connection), which is worth
   recording rather than papering over; the leaderboard notation is documented (GP = grand prize,
@@ -812,7 +812,7 @@ disposition is "measured, retired", which is more useful than an unquantified ex
   **Open action: retrieve `gdcc.tech/results/` and extract the balanced/HCR winners and methods.**
 - **AITDCC** contributes one abstract quotation. Its regime (≤ 8 GB RAM, decompressor ≤ 1 MB, 117
   submissions, hidden test partition, 16 heterogeneous files) is the closest published match to
-  narc's constraints of anything in this document, and its per-file leaderboard would answer
+  nova's constraints of anything in this document, and its per-file leaderboard would answer
   "which cheap transforms actually pay on heterogeneous data" better than Silesia does.
 
 ### 11.8 No ablation discipline anywhere in the evidence base
@@ -835,7 +835,7 @@ available here and neither was done.
 - **Byte-plane split + delta on 16-bit data wins and is the cheapest confirmed ratio item found:**
   −11.0% on `x-ray`, −10.1% on `mr` (MEASURED HERE). Stride detection by byte-position
   autocorrelation is reliable — it recovered 28 for `sao` and 2 for `x-ray`/`mr` on the first pass.
-- **Do not discount CM ratio projections for narc's 32 MiB units.** kanzi -l 9's default block size
+- **Do not discount CM ratio projections for nova's 32 MiB units.** kanzi -l 9's default block size
   *is* 32 MB; its 41,520,670 on Silesia is already the right geometry.
 - **Do not divide multi-threaded benchmark wall times by core count** when the block size limits
   the job count. That error made CM look 2.5–3× slower than it is.

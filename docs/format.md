@@ -1,7 +1,7 @@
-# NARC format — v0.3 draft
+# NOVA format — v0.3 draft
 
 Status: prototype, subject to change until v1.0. This document describes what
-the code in `crates/narc-core` actually implements. Pre-1.0 the reader rejects
+the code in `crates/nova-core` actually implements. Pre-1.0 the reader rejects
 any archive with a higher **minor** version, since the format may still change
 incompatibly.
 
@@ -33,7 +33,7 @@ operation (rewrite + atomic replace).
 
 | offset | size | field |
 |---|---|---|
-| 0 | 4 | magic `NARC` |
+| 0 | 4 | magic `NOVA` |
 | 4 | 1 | version major (0) |
 | 5 | 1 | version minor (3) |
 | 6 | 2 | flags (0) |
@@ -129,7 +129,7 @@ a hostile archive cannot escape the destination directory.
 
 | offset | size | field |
 |---|---|---|
-| 0 | 8 | magic `NARCEND1` |
+| 0 | 8 | magic `NOVAEND1` |
 | 8 | 8 | generation (LE u64) |
 | 16 | 8 | manifest offset |
 | 24 | 8 | manifest packed size |
@@ -139,7 +139,7 @@ a hostile archive cannot escape the destination directory.
 | 64 | 16 | self-check: blake3-128 of `bytes[0..64] ‖ footer_offset_le` |
 
 The self-check covers the footer's own absolute offset. Without that binding,
-a `.narc` file stored *inside* another archive would place a byte-identical,
+a `.nva` file stored *inside* another archive would place a byte-identical,
 self-consistent footer image in the middle of the outer archive, where the
 crash-recovery scan could mistake it for a real commit.
 

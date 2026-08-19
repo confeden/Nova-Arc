@@ -3,7 +3,7 @@
 *Research date: 2026-08-16. All liveness/version/benchmark claims verified against live web sources
 (GitHub, LTCB, lzbench, official project pages) — links inline and at the bottom.*
 
-Scope: codec landscape for Nova Arc (.narc), tier recommendations (fast/normal/max), the
+Scope: codec landscape for Nova Prism (.nva), tier recommendations (fast/normal/max), the
 "own entropy codec?" question, licenses, and Rust availability for every candidate.
 
 ---
@@ -22,15 +22,15 @@ Scope: codec landscape for Nova Arc (.narc), tier recommendations (fast/normal/m
 - **Context mixing (zpaq, paq8px, cmix) and NN compressors (nncp, ts_zip) are not shippable** in a
   general-purpose archiver: 1.6 KB/s–150 KB/s compression, 7–31 GB RAM, GPU requirements (nncp),
   GPL (paq8px/cmix). They define the ratio ceiling, not the product.
-- **Recommended narc codec set:** zstd (fast+normal), LZMA2 + filters (max), PPMd var.H/I and
+- **Recommended nova codec set:** zstd (fast+normal), LZMA2 + filters (max), PPMd var.H/I and
   optionally a BWT codec as per-type specialists chosen by the analyzer. All of these exist as
-  **maintained pure-Rust crates** (`zstd`/`ruzstd`, `lzma-rust2`, `ppmd-rust`, `brotli`) — narc can
+  **maintained pure-Rust crates** (`zstd`/`ruzstd`, `lzma-rust2`, `ppmd-rust`, `brotli`) — nova can
   ship its Windows-first MVP with zero C dependencies if it accepts `lzma-rust2`'s encoder, or with
   one C dependency (`liblzma`, 0BSD) for the fastest/most battle-tested LZMA encoder.
 - **Do NOT write a new entropy codec.** FSE/huff0 (zstd), the LZMA range coder, and rANS are all
   within ~1–3% of entropy on real data. All differentiation in 2026 comes from *modeling and
   filters* (Meta's OpenZL, Oct 2025, is the industry's confirmation of exactly this thesis — and of
-  narc's planned two-phase analyze-then-compress design).
+  nova's planned two-phase analyze-then-compress design).
 
 ---
 
@@ -47,14 +47,14 @@ Scope: codec landscape for Nova Arc (.narc), tier recommendations (fast/normal/m
   ~11× faster (1073 vs 93 MB/s).
 - **Long-range matching (`--long=N`):** separate LDM hash table finds matches up to 2 GB back
   (`--long=31`); default window 128 MB at `--long=27`. Decoder must be told the same window
-  (memory = window size on both sides). Critical for narc: big multi-file solid blocks and
+  (memory = window size on both sides). Critical for nova: big multi-file solid blocks and
   patch-like content dedup almost for free. [Manual](https://man.archlinux.org/man/zstd.1.en)
 - **Dictionaries:** `zstd --train` (COVER/fastCOVER) produces dictionaries that give 2–5× ratio
-  improvement on small files (<64 KB). Perfect for narc's "many small similar files" grouping phase.
+  improvement on small files (<64 KB). Perfect for nova's "many small similar files" grouping phase.
   v1.5.7 made dictionary compression ~5% faster at low levels.
 - **Seekable format:** `contrib/seekable_format` — frames + jump table in a skippable frame;
   random access at frame granularity. Not part of the core lib but a stable spec with third-party
-  implementations. Highly relevant for narc's random-access-into-huge-archive story.
+  implementations. Highly relevant for nova's random-access-into-huge-archive story.
   [Spec](https://github.com/facebook/zstd/blob/dev/contrib/seekable_format/zstd_seekable_compression_format.md)
 - **Multithreading:** native (`-T0`), job-based, scales well; MT is default in CLI since 1.5.7.
 - **Memory:** level-dependent, ~10 MB (L1) to ~650 MB (L22) compress side; decompress = window size
@@ -86,8 +86,8 @@ Scope: codec landscape for Nova Arc (.narc), tier recommendations (fast/normal/m
   ratio and decode speed, but compresses ~4× slower than LZMA -9 for a slightly worse ratio.
 - **Large-window brotli (up to 1 GB window)** exists but is explicitly a research derivative, not
   for production. Standard window is only 16 MB — weak for big archives.
-- **Verdict for narc:** dominated by zstd (speed side) and LZMA (ratio side) for archiver use.
-  Its niche (web assets, small-window streaming, 96% browser support) is not narc's niche.
+- **Verdict for nova:** dominated by zstd (speed side) and LZMA (ratio side) for archiver use.
+  Its niche (web assets, small-window streaming, 96% browser support) is not nova's niche.
   Only value: 7z-compat (sevenz-rust2 supports brotli-in-7z as an extension). License: MIT.
 
 ### 2.4 bzip3
@@ -139,7 +139,7 @@ Scope: codec landscape for Nova Arc (.narc), tier recommendations (fast/normal/m
   abandoned — not usable.
 - **Rust: `ppmd-rust`** (hasenbanck) — pure-Rust port of 7-Zip's PPMd7(H)+PPMd8(I), Miri-validated,
   **CC0-1.0/MIT-0**, maintained (it's the PPMd engine inside sevenz-rust2). This makes PPMd
-  essentially free to adopt for both 7z-compat and narc's own text tier.
+  essentially free to adopt for both 7z-compat and nova's own text tier.
   [ppmd-rust](https://github.com/hasenbanck/ppmd-rust)
 
 ### 2.8 Context mixing: zpaq / zpaqfranz, paq8px, cmix, mcm
@@ -152,12 +152,12 @@ Scope: codec landscape for Nova Arc (.narc), tier recommendations (fast/normal/m
 | cmix v21 (2024) | active (research) | 108.0 MB | ~1.6 KB/s, 31 GB RAM | GPL |
 | mcm v0.84 | dormant since 2016 | — | ~1 MB/s class CM-LZP | GPL |
 
-- zpaqfranz matters to narc **not as a codec but as a competitor**: journaling append-only archive
-  + CDC dedup + MT — the closest existing thing to the .narc concept. Its *compression* tiers,
+- zpaqfranz matters to nova **not as a codec but as a competitor**: journaling append-only archive
+  + CDC dedup + MT — the closest existing thing to the .nva concept. Its *compression* tiers,
   however, top out at zpaq method 5 (slow, streaming-CM).
   [zpaqfranz](https://github.com/fcorbelli/zpaqfranz)
 - paq8px/cmix: 1.5–3 orders of magnitude too slow to ship; GPL; RAM in tens of GB. They are the
-  reference ceiling (0.86–1.0 bpb on enwik9) against which narc's max tier can be honest about
+  reference ceiling (0.86–1.0 bpb on enwik9) against which nova's max tier can be honest about
   what it is *not*.
 
 ### 2.9 NN/LLM compressors: nncp, ts_zip
@@ -170,7 +170,7 @@ Scope: codec landscape for Nova Arc (.narc), tier recommendations (fast/normal/m
   [bellard.org/ts_zip](https://bellard.org/ts_zip/)
 - **Verdict:** deterministic and reproducible, yes — but GPU-dependent speed, no format stability,
   text-only, and multi-day archive jobs make these research vehicles, not archiver codecs.
-  Nothing here is shippable in narc through at least the 2020s. (FineZip and other LLM-compression
+  Nothing here is shippable in nova through at least the 2020s. (FineZip and other LLM-compression
   papers, 2024–2026, confirm: even "practical" LLM compression is ~10⁴× slower than zstd.)
 
 ### 2.10 OpenZL (context, not a codec to embed yet)
@@ -179,16 +179,16 @@ Meta open-sourced **OpenZL** (Oct 2025, BSD): a *format-aware* compression frame
 transforms described per data format, trained "compression plans", universal self-describing
 decoder, Pareto gains over zstd/xz on structured data.
 [Meta engineering blog](https://engineering.fb.com/2025/10/06/developer-tools/openzl-open-source-format-aware-compression-framework/)
-This is the strongest possible industry validation of narc's planned two-phase
+This is the strongest possible industry validation of nova's planned two-phase
 (analyze → per-type plan → compress) architecture. Worth tracking; possibly worth embedding for
 columnar/structured data once its API stabilizes.
 
-### 2.11 The old guard narc must beat (for calibration)
+### 2.11 The old guard nova must beat (for calibration)
 
 - **FreeArc** (Bulat Ziganshin): last stable 0.666 (2010), FreeArc-Next 0.11 (Oct 2016), site dead
   since 2016, repo unmaintained — **abandoned**. Its magic was per-type method dispatch + filters
   (dict, delta, BCJ, mm, precomp integration) over tornado/LZMA/PPMd/GRZip — i.e. exactly the
-  "analysis phase" narc plans, with 2010-era codecs. [FreeArc (Wikipedia)](https://en.wikipedia.org/wiki/FreeArc)
+  "analysis phase" nova plans, with 2010-era codecs. [FreeArc (Wikipedia)](https://en.wikipedia.org/wiki/FreeArc)
 - **RAZOR** (Christian Martelock, v1.03.7): excellent ROLZ/LZ ratio + fast decode, but
   closed-source, dormant hobby project — study, don't depend.
 
@@ -251,14 +251,14 @@ MT flattens the *compression*-time gap; it does nothing for the fundamental deco
 
 ---
 
-## 4. Recommendation: narc codec tiers
+## 4. Recommendation: nova codec tiers
 
-Principle: **narc's edge is the analyzer + container, not exotic codecs.** Every tier must keep
+Principle: **nova's edge is the analyzer + container, not exotic codecs.** Every tier must keep
 decompression fast except where the user explicitly opts into symmetric codecs for text.
 
 | Tier | Codec(s) | Settings sketch | Why |
 |---|---|---|---|
-| **store** | none (+ CDC dedup) | — | .narc log handles it |
+| **store** | none (+ CDC dedup) | — | .nva log handles it |
 | **fast** | **zstd** | levels 1–6, `-T0`, LDM auto-on for blocks >128 MB | 400+ MB/s in, 1.3 GB/s out; nothing else is close |
 | **normal** (default) | **zstd** | levels 15–19, `--long=27`, trained dictionaries for small-file groups | 25–26% Silesia with still-instant extraction; dictionary + LDM synergize with CDC chunking |
 | **max** | **LZMA2 + filters**; analyzer routes: text→**PPMd8** or BWT, exe→BCJ/BCJ2+LZMA2, already-compressed→store/recompression path | LZMA2 dict 64–768 MB, MT block split; PPMd order 8–16 | Matches 7-Zip's ratio with fast (90+ MB/s) extraction; PPMd wins plain text cheaply |
@@ -270,14 +270,14 @@ only 3 codec families, and matches 7-Zip max while extracting equally fast. The 
 recompression filters (precomp/brunsli/packMP3 class), covered in a separate research doc; the
 analyzer must detect such data and *never* waste LZMA time on it (7-Zip's classic failure).
 
-## 5. Should narc write its own entropy codec? **No.**
+## 5. Should nova write its own entropy codec? **No.**
 
 - Modern entropy coding is solved: FSE/huff0 (zstd), rANS (kanzi, many), range coder (LZMA),
   CM arithmetic (bzip3). All sit within 1–3% of the modeling-determined optimum; the *model*
   decides the ratio, the entropy stage decides only speed.
 - A new entropy codec = years of fuzzing/hardening (see bzip3 CVEs 2023, xz CVE-2025-31115 — even
   mature codecs still ship decoder bugs) for ≈0% user-visible gain.
-- Where narc should spend that budget instead: (a) content analysis + routing, (b) CDC/dedup,
+- Where nova should spend that budget instead: (a) content analysis + routing, (b) CDC/dedup,
   (c) recompression filters for JPEG/MP3/deflate, (d) BCJ/delta/table filters. This is the OpenZL
   thesis, now industry-proven.
 - If a future custom filter needs a raw entropy stage, use an existing rANS/FSE implementation
@@ -289,7 +289,7 @@ analyzer must detect such data and *never* waste LZMA time on it (7-Zip's classi
 |---|---|---|---|---|
 | zstd | BSD-3-Clause / GPL-2.0 dual | `zstd` crate (C FFI, MIT) — mature; `ruzstd` (pure Rust, MIT) — decode complete, ~1.4–3.5× slower, encoder young; Trifecta Tech "zstd in Rust" underway | High | Seekable: `zeekstd` (BSD-2, active, spec-current); `zstd-seekable`, `zstd-framed` less active |
 | LZMA/LZMA2 (xz) | **0BSD** (liblzma) | `liblzma` crate (maintained fork of dormant `xz2`); `xz` crate (c2rust pure-Rust liblzma); **`lzma-rust2`** (pure Rust enc+dec, powers sevenz-rust2, ~50% decode speedups recently) | High | 0BSD = zero obligations. Pure-Rust encoder exists — rare luxury |
-| PPMd7/8 | 7-Zip public-domain lineage | **`ppmd-rust`** (pure Rust, CC0-1.0/MIT-0, Miri-validated, maintained) | Good | Same crate serves 7z- and zip-compat and narc's own text tier |
+| PPMd7/8 | 7-Zip public-domain lineage | **`ppmd-rust`** (pure Rust, CC0-1.0/MIT-0, Miri-validated, maintained) | Good | Same crate serves 7z- and zip-compat and nova's own text tier |
 | brotli | MIT | `brotli` (Dropbox, pure Rust, BSD-3/MIT, maintained, safe-by-default) | High | Not needed in tiers; free to expose for 7z-ext compat |
 | bzip2 (compat only) | bzip2-style | `bzip2` crate; `libbz2-rs-sys` pure-Rust backend (Trifecta) | High | Legacy compat only — dominated by everything |
 | libbsc | Apache-2.0 | **none** — self-maintained bindgen FFI required | C API clean | Best ultra-text candidate; CUDA optional |
@@ -298,10 +298,10 @@ analyzer must detect such data and *never* waste LZMA time on it (7-Zip's classi
 | zpaq/libzpaq | Public domain / MIT (zpaqfranz) | none | — | Competitor study, not a codec |
 | paq8px / cmix | GPL | none | — | 3.4 KB/s / 1.6 KB/s — non-shippable |
 | nncp / ts_zip | Bellard, source available | none | — | GPU, KB/s–1 MB/s, format-unstable |
-| OpenZL | BSD | none yet (C/C++) | New (2025) | Watch; architectural validation of narc |
+| OpenZL | BSD | none yet (C/C++) | New (2025) | Watch; architectural validation of nova |
 
 Ecosystem synergy note: **sevenz-rust2** (pure-Rust 7z read/write: LZMA/LZMA2/PPMd/BCJ/BCJ2/delta,
-plus zstd/brotli extensions) already exists and is active — narc's mandated 7z pack/unpack support
+plus zstd/brotli extensions) already exists and is active — nova's mandated 7z pack/unpack support
 and its own max tier can share the exact same `lzma-rust2` + `ppmd-rust` crates.
 [sevenz-rust2](https://github.com/hasenbanck/sevenz-rust2)
 

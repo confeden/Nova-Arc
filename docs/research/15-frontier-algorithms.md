@@ -20,12 +20,12 @@ Everything the reviewer changed or added is tagged **[REVIEW]**.
 > **Sceptic's review pass, 2026-08-17 (second reviewer).** Every ship-now/prototype
 > verdict was re-attacked: benchmark reproducibility, project liveness and licence,
 > survival under *our* constraints, decode cost. §1's mechanism was re-measured with a
-> **real `preset_dict` call in narc's own codec** (`lzma-rust2`, not liblzma) and the
+> **real `preset_dict` call in nova's own codec** (`lzma-rust2`, not liblzma) and the
 > author's proxy held to 0.3% — but all three of the actionable verdicts moved down, and
 > §1's *value proposition* changed even though its mechanism survived. Corrections are marked **[REVIEW]** throughout;
 > the reviewer's own numbers are marked **RE-MEASURED**.
 
-| # | Idea | Realistic gain for narc | Cost | Verdict |
+| # | Idea | Realistic gain for nova | Cost | Verdict |
 |---|------|------------------------|------|---------|
 | 4 | **Cross-unit references (preset dictionaries / RLZ)** | mechanism verified; **−12% to −13% in bounded form**, same ratio a 32-64 MiB independent unit already gets — the real win is *keeping 4-16 MiB edit granularity at that ratio* | ~2-3 weeks *plus* an unsolved `compact` liveness problem; encoder RAM ~2×; decode RAM 2-3× unit | **prototype** (was ship-now) |
 | 6 | **Similarity ordering of files before packing** (simhash/nilsimsa) | unmeasured *over extension-sort*, which we already do; the cited −10.2% IS extension-sort | ~3 days to measure, and it must be measured before it is believed | **prototype** (was ship-now) |
@@ -39,7 +39,7 @@ Everything the reviewer changed or added is tagged **[REVIEW]**.
 
 ---
 
-## 1. THE central result: where narc's 36% source-tree gap actually comes from
+## 1. THE central result: where nova's 36% source-tree gap actually comes from
 
 The ROADMAP currently attributes the gap to "our compression unit is capped at 32 MiB".
 **That attribution is wrong, and the correct one changes the plan.** I separated the two
@@ -52,7 +52,7 @@ order — i.e. exactly 7-Zip's `-mqs=on` solid ordering. Compressor held constan
 `xz --format=raw --lzma2=preset=9e -T1` throughout, so only geometry varies.
 
 Anchor: owner's earlier measurement on this same tree — 7-Zip 26.02 `-mx9` = **8.8 MiB**,
-narc max = **12 MiB** (36% worse). My one-stream/16 MiB-dict figure below (8.824 MiB)
+nova max = **12 MiB** (36% worse). My one-stream/16 MiB-dict figure below (8.824 MiB)
 reproduces the 7-Zip anchor to within 0.3%, which validates the methodology.
 
 ### 1.2 Experiment A — one solid stream, sweep the *window*
@@ -68,7 +68,7 @@ reproduces the 7-Zip anchor to within 0.3%, which validates the methodology.
 prize behind a giant dictionary on a source tree; this corroborates 7-Zip's own doc note
 that `-mqs` and `-md` are substitutes ([7-Zip `-m` switch docs](https://documentation.help/7-Zip-18.0/method.htm)).
 
-### 1.3 Experiment B — independent units (narc's actual constraint)
+### 1.3 Experiment B — independent units (nova's actual constraint)
 
 Same blob, cut into fixed units, each compressed **alone** with `dict = unit size`:
 
@@ -97,7 +97,7 @@ range-coder probabilities and cannot reference any earlier unit. That is 21.5% o
    almost entirely **missing back-references**, i.e. window *content*.
 2. *"The penalty is not the window"* is a false dichotomy. For an **independent** unit,
    window size and unit size are the same knob — the 16 MiB-window-on-one-stream row is
-   not a design narc can reach. The two reachable designs are (a) bigger independent
+   not a design nova can reach. The two reachable designs are (a) bigger independent
    units and (b) cross-referencing units. Table 1.3 is therefore the relevant table, and
    it says the ROADMAP's attribution ("our compression unit is capped") is **correct**:
    4 MiB → 14.99, 32 MiB → 9.41, 64 MiB → 9.26. Enlarging the unit is a real lever worth
@@ -115,7 +115,7 @@ encoding, not emitted in the output. liblzma exposes `preset_dict` / `preset_dic
 container** ([liblzma API docs](https://tukaani.org/xz/liblzma-api/structlzma__options__lzma.html);
 confirmed by the XZ Utils author on
 [SourceForge](https://sourceforge.net/p/lzmautils/discussion/708858/thread/e40fbf99/)).
-narc already writes raw LZMA2 payloads, so this is available to us today.
+nova already writes raw LZMA2 payloads, so this is available to us today.
 
 I estimated per-unit warm cost as `C(D‖U) − C(D)` (standard proxy; see caveat below),
 units fixed at 16 MiB:
@@ -155,17 +155,17 @@ Per-unit detail for the adjacent chain (MiB): 1.385, 0.907, 1.517, 1.388, 1.306,
   concatenation does not. Expect the real number to land 1-3% *worse* than the proxy.
   **Re-measure with an actual `preset_dict` call before committing format bytes.**
   → **[REVIEW] Done. The proxy holds; see §1.4b.**
-- Ordering is 7-Zip's `-mqs` (extension, path). narc's current solid grouping is similar
-  but not identical, and narc routes big files through FastCDC, so its unit boundaries are
+- Ordering is 7-Zip's `-mqs` (extension, path). nova's current solid grouping is similar
+  but not identical, and nova routes big files through FastCDC, so its unit boundaries are
   content-defined rather than aligned. The gains transfer directionally, not exactly.
 - The corpus is one source tree. Silesia already sits at ratio parity with 7-Zip, so this
   lever will show little there; that is expected and fine.
 
-### 1.4b [REVIEW] RE-MEASURED with a real `preset_dict`, in narc's own codec
+### 1.4b [REVIEW] RE-MEASURED with a real `preset_dict`, in nova's own codec
 
-**First correction, and it invalidates a source, not a number: narc does not link
+**First correction, and it invalidates a source, not a number: nova does not link
 liblzma.** It uses `lzma-rust2` 0.19 (pure Rust, Apache-2.0) — see
-`crates/narc-core/Cargo.toml`. The §1.4 argument "liblzma exposes `preset_dict`, narc
+`crates/nova-core/Cargo.toml`. The §1.4 argument "liblzma exposes `preset_dict`, nova
 already writes raw LZMA2, so the mechanism is available today" is right by luck: the
 mechanism does exist, but the evidence for it is `lzma-rust2`'s own API
 (`LzmaOptions::preset_dict` on `Lzma2Writer`, `Lzma2Reader::new(inner, dict_size,
@@ -206,7 +206,7 @@ warm `1.381 0.905 1.512 1.385 1.304 1.462 0.734 0.098`.
    **"the ratio of a 64 MiB unit at a 4-16 MiB edit granularity"** — which is still the
    single best idea in this report, because cheap edits are the product.
 3. **The gain is a function of dictionary BYTES, not of chain depth**, and the author's
-   proposed format field cannot express that. At narc's real max-tier geometry (FastCDC
+   proposed format field cannot express that. At nova's real max-tier geometry (FastCDC
    1/4/16 MiB, average ~4 MiB) a single-ancestor dictionary is only ~4 MiB and yields
    9.962; reaching 8.805 needs ~16 MiB of ancestors, i.e. a **cumulative multi-ancestor**
    dictionary. `dict: Option<ChunkId>` + `dict_depth: u8` describes a *parent pointer*;
@@ -273,7 +273,7 @@ record a "cold size" so a repair tool knows the loss is bounded.
    **pinned alive as a dictionary** for every later unit that referenced it. Today
    `compact` reclaims that space; with dictionary edges it must either keep dead plaintext
    forever (archives stop shrinking — the feature quietly leaks) or **re-encode every
-   referrer**, which is a partial repack, i.e. the exact cost narc exists to avoid.
+   referrer**, which is a partial repack, i.e. the exact cost nova exists to avoid.
    Neither branch is written down in §1. This is the single unsolved design problem and
    the reason the verdict moved to *prototype*: it must be answered before format bytes.
 2. **The dictionary-size invariant breaks.** `codec.rs::lzma2_dict_size()` deliberately
@@ -342,7 +342,7 @@ capture the remaining 1-3% is to write our own LZ encoder with N-best arrivals �
 months, and it would have to beat a 25-year-tuned encoder to break even.
 
 **Verdict: watch.** The 1-3% here is 6-18× smaller than the 18% sitting in §1, for 10× the
-work. Revisit only if narc ever grows its own LZ backend for other reasons.
+work. Revisit only if nova ever grows its own LZ backend for other reasons.
 
 *One cheap exception worth 30 minutes*: liblzma exposes `nice_len` (2-273, default 64) and
 `depth`. The ROADMAP says max tier already raises `nice_len`. Confirm we are at 273 with
@@ -392,7 +392,7 @@ chain coding, actively released, 0.4.x), `ans` (minimal rANS, `no_std`, zero dep
 explicitly *not* tANS), `rans` (FFI over ryg-rans-sys, has interleaved streams).
 **No native Rust tANS/FSE exists** — everyone binds zstd's C implementation.
 
-**Verdict: reject as a ratio play.** narc's max tier is CPU-bound on LZMA2/PPMd, and its
+**Verdict: reject as a ratio play.** nova's max tier is CPU-bound on LZMA2/PPMd, and its
 fast tier is already zstd. Replacing an entropy backend buys 0% ratio. The *only*
 legitimate future use is if we ever want a GPU-friendly or SIMD-interleaved codec, which is
 research 08's territory.
@@ -439,25 +439,25 @@ useful part:
 They also flag that **decompression is much slower** for parse-heavy formats like CSV,
 because parsing happens on the decode path too.
 
-### 4.3 Should narc adopt the model?
+### 4.3 Should nova adopt the model?
 
-**No, and here is the precise reason.** narc's three real corpora are source trees, prose,
+**No, and here is the precise reason.** nova's three real corpora are source trees, prose,
 and binaries — exactly the three cases where OpenZL degrades to "call zstd". Its wins are
 in columnar/tabular/numeric-array data (Parquet, telemetry, scientific grids), which is
 not what a desktop archiver sees. Adopting it would mean vendoring a C/C++ library whose
 "API, compressed format, and set of codecs are all subject to change", inside a
 `#![forbid(unsafe_code)]` core, to gain ~0% on our benchmarks.
 
-**What to steal instead — the idea, not the code.** narc's `analyze::plan()` is already a
+**What to steal instead — the idea, not the code.** nova's `analyze::plan()` is already a
 one-level version of this: content class → codec + filter. OpenZL's contribution is
 (i) *typed* transforms composed into a graph, and (ii) *the graph is written into the
-frame*, so the decoder is generic. narc's per-chunk `(codec_id, filter_id)` byte pair is a
+frame*, so the decoder is generic. nova's per-chunk `(codec_id, filter_id)` byte pair is a
 depth-2 fixed graph. Generalizing it to a short **transform list** (e.g.
 `[delta(4), bcj, lzma2]` encoded as a few bytes) is a genuinely good format decision that
 costs almost nothing now and prevents a format break later when we add
 transpose/split-by-field for numeric data. Do that. Skip the dependency.
 
-**Verdict: watch.** Re-evaluate if narc ever targets database dumps, Parquet, logs, or
+**Verdict: watch.** Re-evaluate if nova ever targets database dumps, Parquet, logs, or
 scientific arrays. Track the format-stability statement — it is currently a blocker for an
 archive format that must read its own files in ten years.
 
@@ -503,7 +503,7 @@ Distrust any BWT-vs-LZMA number that does not state thread count and block size.
 | Random access inside a block | streaming from block start | must inverse-transform the **whole block** |
 | Non-text data | strong | weak — "BWT excels in text and only in text" (encode.su) |
 
-This is a direct conflict with narc's hard constraint "extraction must run in bounded
+This is a direct conflict with nova's hard constraint "extraction must run in bounded
 memory on a weak PC (today ~10-80 MiB)". A 16 MiB BWT block needs ~80 MiB to invert. At our
 current chunk sizes that is *at the ceiling*, not beyond it — but it removes all headroom,
 and it makes decode as slow as encode.
@@ -540,10 +540,10 @@ The sizes in §5.1 are correct — I re-checked every row against
 `-b1000 -e2` = 20,786,794 / 163,884,462; bzip3 `-b 511` = 20,749,611 / 169,990,721;
 xz 5.2.1 `--lzma2=preset=9e,dict=1GiB,lc=4,pb=0` = 24,703,772 / 197,331,816. The page also
 confirms "Not all tests are done on the same computer", so §5.1's timing caveat is fair.
-What does not survive is the *inference* from those rows to narc:
+What does not survive is the *inference* from those rows to nova:
 
 1. **Block size.** Those margins are measured at **1000 MB and 511 MB blocks** on a single
-   stream of pure XML text. narc's units are 4-32 MiB — 30-250× smaller. BWT ratio is a
+   stream of pure XML text. nova's units are 4-32 MiB — 30-250× smaller. BWT ratio is a
    strong function of block size (bzip3's own manual: bigger block = better compression,
    and it exposes `-b` *instead of* levels for that reason), so the 17% is an upper bound
    measured in a regime we cannot enter. Nobody has published bsc/bzip3 at 16-32 MiB
@@ -573,7 +573,7 @@ What does not survive is the *inference* from those rows to narc:
 
 **Revised verdict: watch**, gated on one cheap measurement — run `bsc -b16/-b32` and
 `bzip3 -b16` against LZMA2 and PPMd7 on `test/corpus` and on `test/enwik8` slices at
-*narc's* unit sizes. If BWT does not win there, the 3-4 weeks are dead, and the DwarFS
+*nova's* unit sizes. If BWT does not win there, the 3-4 weeks are dead, and the DwarFS
 data point says it probably will not win on anything but pure prose.
 
 ---
@@ -622,7 +622,7 @@ We already sort solid-block members by extension. The upgrade path:
    DwarFS has `--max-similarity-size` for exactly this.
 2. Order by recursive clustering, not by full pairwise TSP. DwarFS's divide-and-conquer
    (cluster to ≤ `max-children` centroids, recurse) is deterministic and parallel;
-   that determinism matters for us because narc's chunk hashes must be reproducible.
+   that determinism matters for us because nova's chunk hashes must be reproducible.
    Note that the naive TSP framing (Xerox US 5,787,420 uses `1 − ρᵢ·ρⱼ` as a TSP distance
    and breaks the cycle at maximum dissimilarity) is unnecessary — clustering suffices.
 3. Keep extension as a *tie-break and a group boundary*, not the primary key: BCJ/delta
@@ -639,8 +639,8 @@ can *reference* its neighbour. Ship §1 first, then ordering, and measure the pa
 
 The evidence problem is worse than §6.1's own caveat admits.
 
-1. **The one quantified number cited is the thing narc already does.** The 7-Zip
-   −10.2% is *sort by name* → *sort by extension* (`-mqs=on`). narc's solid blocks are
+1. **The one quantified number cited is the thing nova already does.** The 7-Zip
+   −10.2% is *sort by name* → *sort by extension* (`-mqs=on`). nova's solid blocks are
    already sorted by extension (`archive.rs::solid_group_key`). So the cited −10.2% is the
    baseline, not the upgrade. The delta of **simhash/nilsimsa over extension-sort** — the
    actual proposal — is unmeasured by 7-Zip, by DwarFS, and by this report.
@@ -718,7 +718,7 @@ On the 10 GB benchmark, exdupe `-x3` = .3671 vs 7zip `-mx` = .3595 vs zpaq `-m5`
 ([10gb.html](https://mattmahoney.net/dc/10gb.html)) — but these are old versions
 (exdupe 0.5.0b, zpaq 6.49, 7-Zip 9.20); treat as directional only.
 
-**narc already has exact chunk dedup via blake3.** What we lack is *similar*-chunk delta.
+**nova already has exact chunk dedup via blake3.** What we lack is *similar*-chunk delta.
 
 ### 7.4 Verdict and the trap to avoid
 
@@ -749,7 +749,7 @@ engine should be `bidiff`-style suffix-sort delta feeding into LZMA2, not a besp
 
 ### 8.1 Current position
 
-narc keeps the whole manifest in RAM (MessagePack + zstd), which the ROADMAP notes is
+nova keeps the whole manifest in RAM (MessagePack + zstd), which the ROADMAP notes is
 "fine ≤ ~1 TB archives". The DwarFS data point for scale: it looks up 1.9M files in 2.8 s
 (SquashFS: 5.3 s) and mounts a 1.9M-file image in 0.42 s, with metadata for ~200,000 files
 (Ubuntu 20.04.2.0 desktop ISO) compressing from 5.3 MB to 57% with zstd / 49% with LZMA.
@@ -765,7 +765,7 @@ Rust crates, checked 2026-08-17:
 
 | Crate | Notes |
 |---|---|
-| [`sucds`](https://github.com/kampersanda/sucds) | broad succinct collection, **pure Rust, avoids `unsafe`** (matches `narc-core`'s `forbid(unsafe_code)`), good sparse `SArray` |
+| [`sucds`](https://github.com/kampersanda/sucds) | broad succinct collection, **pure Rust, avoids `unsafe`** (matches `nova-core`'s `forbid(unsafe_code)`), good sparse `SArray` |
 | `vers` | praised for performance and minimal overhead over the raw bit vector; better construction design; wavelet matrix |
 | QWT | Quad Wavelet Tree (Ceregini, Kurpicz, Venturini 2024), 4-ary, lower latency |
 | [`fm-index`](https://github.com/ajalab/fm-index) | count + locate; **no extract-from-arbitrary-position**; updated 2025 |
@@ -773,7 +773,7 @@ Rust crates, checked 2026-08-17:
 
 ### 8.3 Verdict
 
-**watch.** The real win would be *paged, mmap-able* metadata so `narc list` and the GUI's
+**watch.** The real win would be *paged, mmap-able* metadata so `nova list` and the GUI's
 virtualized list do not need the whole manifest resident — and for that, a sorted packed
 array + Elias-Fano offsets (from `sucds`) is enough. An FM-index only pays for itself if we
 want substring search over paths inside a huge archive, which is a GUI feature nobody has
@@ -794,7 +794,7 @@ asked for. `sucds`'s pure-Rust/no-`unsafe` stance is the deciding factor if we d
 - **A giant LZMA2 dictionary (≥128 MiB).** MEASURED HERE: saturates at 64 MiB and buys
   3.3% over 16 MiB on a source tree (§1.2). Confirms and sharpens the existing ROADMAP
   entry. The lever is cross-unit reference, not window size.
-- **Training a synthetic dictionary for narc's units.** MEASURED HERE: a 16 MiB strided
+- **Training a synthetic dictionary for nova's units.** MEASURED HERE: a 16 MiB strided
   sample compresses the units best (7.582 MiB) but costs 2.202 MiB to store, netting worse
   than a depth-capped chain of existing units (§1.4). Separately, zstd's own documentation
   puts dictionary gains at **~500% for <1 KB files but only ~10% at 64 KiB**
@@ -814,7 +814,7 @@ asked for. `sucds`'s pure-Rust/no-`unsafe` stance is the deciding factor if we d
 - **OpenZL as a dependency.** See §4.3.
 - **rANS/tANS for ratio.** See §3.2.
 - **[REVIEW] Tuning `lc`/`lp`/`pb` per content class.** The obvious cheap idea, since
-  LTCB's own xz entry runs `lc=4,pb=0` and narc sets none of these (`codec.rs` only touches
+  LTCB's own xz entry runs `lc=4,pb=0` and nova sets none of these (`codec.rs` only touches
   preset, `nice_len` and `dict_size`, though `lzma-rust2` exposes `lc`/`lp`/`pb`/`mode`/
   `mf`/`depth_limit`). RE-MEASURED 2026-08-17 at 16 MiB units: source tree 10.690 →
   **10.683** MiB (−0.07%) cold and 8.781 → 8.779 warm; `test/enwik8` text units 28.179 →
@@ -886,21 +886,21 @@ mechanism work" but "is it worth the format bytes given the alternative". Reorde
 
 ## 11. [REVIEW] What this report missed
 
-Ranked by (value to narc) ÷ (effort). Items 1-3 are free: the code is already vendored.
+Ranked by (value to nova) ÷ (effort). Items 1-3 are free: the code is already vendored.
 
 1. **DwarFS "segmentation" — the 15.19 GiB line quoted in §6.1 and never explained.** It is
    not dedup, not ordering, and not a preset dictionary: it is a rolling-hash *cyclic
    lookahead matcher* that finds duplicate byte **ranges across files inside one large
    filesystem block**, emitting references instead of bytes. On DwarFS's own headline corpus
    it is the second-largest saving after exact dedup, larger than anything §1-§8 proposes.
-   For narc it is the container-level version of §1: cross-unit reuse expressed as explicit
+   For nova it is the container-level version of §1: cross-unit reuse expressed as explicit
    references in the manifest rather than as codec state, which means a unit stays decodable
    from data we can name, `compact` can reason about it with the liveness machinery that
    already exists for dedup, and the corruption blast radius is enumerable. This deserved a
    section of its own; it is a genuine alternative to §1, not a footnote.
 2. **Seven BCJ filters and BCJ2 are already vendored and unused.** `lzma-rust2` 0.19 ships
    `new_x86 / new_arm / new_arm64 / new_arm_thumb / new_ppc / new_sparc / new_ia64 /
-   new_riscv` plus a whole `filter/bcj2` module; narc's `Filter` enum has exactly
+   new_riscv` plus a whole `filter/bcj2` module; nova's `Filter` enum has exactly
    `BcjX86` + `Delta(1..32)`. ARM64 is not exotic in 2026 — Apple Silicon binaries, Linux
    aarch64 packages, every `.so` in an APK, Windows-on-ARM. The ROADMAP measures BCJ x86 at
    **+4.4-5.7%** on real executables; that number is currently unavailable on ARM content.
@@ -914,7 +914,7 @@ Ranked by (value to narc) ÷ (effort). Items 1-3 are free: the code is already v
    codec sits in `Cargo.lock`.
 4. **No ceiling measurement anywhere in the report.** Every number is relative to 7-Zip
    `-mx9` (8.8 MiB) or to xz on one stream (8.534 MiB). Nobody ran a *stronger* archiver on
-   `test/corpus`: `zpaq -m5` (fragment dedup + CM — the closest thing in existence to narc's
+   `test/corpus`: `zpaq -m5` (fragment dedup + CM — the closest thing in existence to nova's
    design goal), `kanzi -e TPAQX`, `bsc -b32`, `rar -m5`, `nanozip`. Without that, the
    report cannot say whether 8.5 MiB is the floor (in which case §1's remaining prize is 4%)
    or whether a CM archiver reaches 6.5 MiB (in which case the entire plan is aiming too
@@ -932,15 +932,15 @@ Ranked by (value to narc) ÷ (effort). Items 1-3 are free: the code is already v
    `lzma-rust2` ships `Lzma2Writer`'s `chunk_size` (independent LZMA2 chunks inside one
    stream) and `Lzma2ReaderMt`, i.e. the standard mechanism for a large unit that still
    decodes on N cores. That changes the cost side of "just use 64 MiB units" (§1.4b row 4)
-   and it is worth measuring, since narc already found parallel extraction *slower* for
+   and it is worth measuring, since nova already found parallel extraction *slower* for
    small chunks.
 7. **The OpenZL lesson was taken at the wrong altitude.** §4.3 concludes "generalise
    `(codec, filter)` to a transform list" — fine, but the place OpenZL's actual technique
-   applies inside narc is the **manifest**: paths are a front-codable sorted string column,
+   applies inside nova is the **manifest**: paths are a front-codable sorted string column,
    and sizes/mtimes/permissions/chunk-ids are integer columns that want transpose + delta +
    varint before zstd. §8 dismisses the manifest by looking only at *lookup speed*
    ("1.9M files in 2.8 s"), never at its *size* on a multi-million-file archive. That is the
-   one corpus in narc that is genuinely columnar and where §4's rejected library would have
+   one corpus in nova that is genuinely columnar and where §4's rejected library would have
    won.
 8. **Opportunity cost against research 02 is never stated.** §10 proposes ~8-10 weeks
    chasing 12-18% on one synthetic source blob. `docs/research/02-recompression.md` already

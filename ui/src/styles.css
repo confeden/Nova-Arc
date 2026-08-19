@@ -339,21 +339,21 @@ tr.sel svg.ico {
     var(--accent) 0 10px,
     transparent 10px 22px
   );
-  animation: narc-indeterminate 0.9s linear infinite;
+  animation: nova-indeterminate 0.9s linear infinite;
 }
 .progress.indeterminate > #progress-read {
   opacity: 0;
 }
-@keyframes narc-indeterminate {
+@keyframes nova-indeterminate {
   from { background-position: 0 0; }
   to { background-position: 22px 0; }
 }
 /* One unit of a max-tier pack is 32-64 MiB and takes tens of seconds, during
    which there is genuinely nothing to report. Pulsing says so. */
 .progress.stalled > #progress {
-  animation: narc-pulse 1.6s ease-in-out infinite;
+  animation: nova-pulse 1.6s ease-in-out infinite;
 }
-@keyframes narc-pulse {
+@keyframes nova-pulse {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.45; }
 }

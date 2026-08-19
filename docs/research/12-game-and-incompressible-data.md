@@ -1,6 +1,6 @@
 # Research 12 — Game Files and "Incompressible" Data
 
-*Nova Arc research report. Live-web research August 2026. Every number below is tagged
+*Nova Prism research report. Live-web research August 2026. Every number below is tagged
 **[measured]** (published benchmark from a primary source), **[claimed]** (vendor/author assertion,
 no independent table), or **[estimate]** (my reasoning from format structure — must be measured
 locally before it goes in a roadmap).*
@@ -18,7 +18,7 @@ MP3/WAV/video recompression and the preflate-rs + lepton_jpeg tooling decision. 
 > measured **≈32 %** rather than a hedge (§6.1); the GDeflate chain is **not** bit-exact end to end
 > because un-swizzled GDeflate is not RFC 1951 (§4.5); the 60 GB Unreal composition audit is not a
 > usable source (§2); one exe-filter datapoint was withdrawn (§9); and a new **§11.1** checks every
-> recommendation against narc's chunking, dedup and bounded-extraction invariants. Verified as
+> recommendation against nova's chunking, dedup and bounded-extraction invariants. Verified as
 > stated and unchanged: the xtool CRC-mismatch changelog line, Yann Collet's zstd
 > no-reproducibility statement, the Ström & Wennersten bpp figures, BC7Prep's 5–15 %, Titanfall's
 > 35 GB, the ARM64/RISC-V kernel filter gains, 7-Zip's Swap4 behaviour, `pco`'s 29–94 %, and the
@@ -35,13 +35,13 @@ matters least. Three findings drive everything:
 1. **The single biggest lever is not a new codec — it is undoing the container.** Modern installs
    are ~45–75 % texture + audio **[estimate — the range is my own, spanning two datapoints of
    unequal quality; see the §2 source warning]**, and almost all of it is already inside a per-block
-   LZ container (Oodle, LZ4, zlib, GDeflate, zstd). Whether narc can beat 7-Zip on a game folder is
-   decided almost entirely by *how many of those containers narc can open bit-exactly*.
+   LZ container (Oodle, LZ4, zlib, GDeflate, zstd). Whether nova can beat 7-Zip on a game folder is
+   decided almost entirely by *how many of those containers nova can open bit-exactly*.
 2. **Raw BCn texture data has a genuine, cheap, bit-exact win of ~12 %** that no mainstream
    archiver applies, and the transform is ~200 lines of code with no dependency. (12.3 % is derived
    in §3.1 from the one published field-level measurement; the widely repeated "~10 %" figure is
    unsourced.) Chained after preflate on a Bethesda `.ba2` or a UE4 `.pak`, it compounds — but see
-   §11.1: narc's content-defined chunking must be taught about block phase first, or the gain is
+   §11.1: nova's content-defined chunking must be taught about block phase first, or the gain is
    lost without any correctness error to warn you.
 3. **Oodle is a wall.** Kraken/Mermaid/Leviathan streams — the dominant format in AAA PC games
    since ~2021 — cannot be recompressed by any legal, maintainable FOSS mechanism. Accept it,
@@ -87,19 +87,19 @@ Composition, from the only itemized public audit I could find plus corroborating
 > The load-bearing composition claim therefore rests on **Titanfall** (73 % audio, multiply
 > corroborated from a named engineer) and on Tripwire's cross-generation growth figures — both of
 > which point at **audio**, not textures, as the historically dominant share. "Textures are 47 %" is
-> plausible for a 4K-texture UE build and matches the direction of the Tripwire numbers, but narc
+> plausible for a 4K-texture UE build and matches the direction of the Tripwire numbers, but nova
 > should not build priorities on it. **Action: before scheduling phase B, measure a real install
 > tree locally** (`.dds`/`.ktx2`/`.wem`/`.bnk`/`.uasset`/`.ucas` byte shares over 3–4 installed
 > games). That is one afternoon of `du`, and it replaces the shakiest input in this report.
 
 **Operational conclusion:** textures and audio together dominate; executables are noise. Any effort
 spent on exe filters instead of texture/audio/container handling is misallocated for this workload —
-see §9. Which of texture vs audio leads is **title-dependent and currently unmeasured for narc**,
+see §9. Which of texture vs audio leads is **title-dependent and currently unmeasured for nova**,
 which is another reason phase B (BCn) and WAV→FLAC should be scheduled close together.
 
 ### 2.1 Container inventory — what actually wraps the bytes
 
-| Engine / game family | Container | Payload codec | narc's realistic move |
+| Engine / game family | Container | Payload codec | nova's realistic move |
 |---|---|---|---|
 | UE4 (≤ 4.19 default, and most non-AAA UE4 to this day) | `.pak` | **zlib/deflate**, 64 KB–256 KB blocks | **preflate** — full win |
 | UE4.20+ / UE5 shipping AAA | `.pak` + `.ucas`/`.utoc` (IoStore) | **Oodle Kraken** — Epic's docs call Kraken "the usual default" and give level by build config (Debug/Development **3**, Test/Shipping **5**, Distribution **7**). `-compressionblocksize=256KB` appears in Epic's **recommended example settings**, not as a documented default — verified 2026-08 ([Epic docs](https://dev.epicgames.com/documentation/en-us/unreal-engine/oodle-data)). Independently, `ooz`'s `kraken.cpp` comments the container as "Header in front of each 256k block" | **store** (§4.3) |
@@ -109,7 +109,7 @@ which is another reason phase B (BCn) and WAV→FLAC should be scheduled close t
 | Skyrim SE | `.bsa` v105 | **LZ4** | §4.4 |
 | Fallout 4 / 76 | `.ba2` v1/v7/v8, GNRL + DX10 | **zlib** (DX10 = zlib-compressed **DDS chunks**) | **preflate → then BCn transform** — the compounding case |
 | Starfield | `.ba2` v2/v3 | **LZ4** (ratio-tunable), zstd in newer variants | §4.4 |
-| Source / Source 2 | `.vpk` | **uncompressed** ([Valve wiki](https://developer.valvesoftware.com/wiki/VPK_(file_format))) | full normal path — best case for narc |
+| Source / Source 2 | `.vpk` | **uncompressed** ([Valve wiki](https://developer.valvesoftware.com/wiki/VPK_(file_format))) | full normal path — best case for nova |
 | Respawn (Titanfall/Apex) | modified `.vpk`, `.rpak` | proprietary, undocumented | store |
 | id Tech (Quake 3 → Doom 3) | `.pk3`/`.pk4` | **zip/deflate** | **preflate** — full win |
 | Quake 1/2 | `.pak` | uncompressed | full normal path |
@@ -170,7 +170,7 @@ Primary source: [`dxt-lossless-transform-bc1` README](https://github.com/Sewer56
 | 1. **Split blocks** | all `[c0,c1]` pairs into one plane, all `indices` into another | **yes** — pure permutation |
 | 2. **Split endpoints** | `colour0` plane and `colour1` plane stored separately. Author: helps **~78 % of the time** **[claimed]** | **yes** |
 | 3. **YCoCg-R decorrelation** of the RGB565 endpoints (upper 5 bits of green; low bit untouched) | removes inter-channel correlation | **yes** — YCoCg-R is a lifting transform, exactly invertible |
-| 4. **Solid-block normalization** (canonicalize solid blocks to `C0 = colour, C1 = 0, indices = 0`; fully-transparent blocks to all-`0xFF`) | creates long `0x00`/`0xFF` runs | **NO — visually lossless only.** Rewrites BCn bits. Excluded from narc. |
+| 4. **Solid-block normalization** (canonicalize solid blocks to `C0 = colour, C1 = 0, indices = 0`; fully-transparent blocks to all-`0xFF`) | creates long `0x00`/`0xFF` runs | **NO — visually lossless only.** Rewrites BCn bits. Excluded from nova. |
 
 Headline gain claimed for the ladder: **"~10 % saving at ~60 GB/s on a single thread"** for BC1–BC3
 **[claimed, author — NOT VERIFIED: I could not locate this exact figure in either the repo root
@@ -178,8 +178,8 @@ README or the BC1 README as of 2026-08. Treat it as folklore.]** Two further cau
 
 - the crate describes *itself* as "a fast, **visually lossless** transform for the BC1 block
   format", so any headline number it publishes plausibly **includes step 4 (normalization)**, which
-  narc must exclude. The reversible-subset gain is not separately published by the author.
-- therefore the number narc should plan against is the **12.3 %** derived in §3.1 from the author's
+  nova must exclude. The reversible-subset gain is not separately published by the author.
+- therefore the number nova should plan against is the **12.3 %** derived in §3.1 from the author's
   own raw measurements, which covers steps 1–2 only and is arithmetic we can check.
 
 **Licensing:** `dxt-lossless-transform` is **GPL-3.0 ("Reloaded FAQ" variant)** and GitHub reports
@@ -189,7 +189,7 @@ above and is a byte permutation plus a published lifting transform — reimpleme
 safe Rust. Its sibling [`lossless-transform-utils`](https://github.com/Sewer56/lossless-transform-utils)
 *is* **MIT** (LICENSE file verified) and active (pushed 2026-06-22) — a ~2565 MiB/s
 LZ-compressibility estimator, 74.4 % agreement with zstd **[claimed]**. That one is directly usable
-in narc's analyzer for the "is this transform worth it" decision and for the incompressible fast
+in nova's analyzer for the "is this transform worth it" decision and for the incompressible fast
 path (§10). *Packaging gotcha:* the published crate declares `license-file = "LICENSE"` rather than
 an SPDX id, so crates.io reports its license as `non-standard` and `cargo-deny`/license audits will
 flag it until explicitly allow-listed. The estimator numbers themselves come from
@@ -254,7 +254,7 @@ already block-compressed source. An archiver cannot use any of them.
 
 ### 4.1 The general rule that decides every case
 
-A container payload is recompressible **iff** narc can regenerate the original compressed bytes.
+A container payload is recompressible **iff** nova can regenerate the original compressed bytes.
 There are exactly two mechanisms:
 
 - **(a) Parameter-recovery modelling** — decode to plaintext plus a small correction record that
@@ -330,11 +330,11 @@ frequently does *not* reproduce the original bytes. Encrypted or special-option 
 - Even a *decompress-only* path is useless for a lossless archiver: without a bit-exact encoder you
   cannot restore the file.
 
-**narc's correct behaviour:** detect Oodle-compressed containers in the analyzer, classify
+**nova's correct behaviour:** detect Oodle-compressed containers in the analyzer, classify
 `incompressible`, route to *store*, do not burn LZMA/PPMd time on them, and let CDC dedupe catch
 identical blocks across patch versions (which it will — 256 KB Oodle blocks are stable across
-patches for untouched assets, so narc's append-only edit story still shines here even at 0 %
-codec gain). **This is a feature to market, not a defeat: a UE5 game folder is where narc's
+patches for untouched assets, so nova's append-only edit story still shines here even at 0 %
+codec gain). **This is a feature to market, not a defeat: a UE5 game folder is where nova's
 "replace one asset in 1 s" beats 7-Zip's 20 s rewrite by the widest margin, precisely because
 neither tool can compress the payload.**
 
@@ -356,7 +356,7 @@ Mechanism (b) only. Both upstreams explicitly disclaim output stability:
 
 **Verdict: build the mechanism, expect a low hit rate, never assume success — and see §11.1(3),
 which is the stronger objection: mechanism (b) makes *extraction* run the original compressor, so a
-§4.4 archive extracts at compression speed and compression memory. That collides with narc's hard
+§4.4 archive extracts at compression speed and compression memory. That collides with nova's hard
 "extraction must always work on a weak PC" requirement, independently of hit rate.** Concretely:
 1. Vendor a small library of pinned encoders (one or two lz4 versions, one or two zstd versions,
    the LZMA SDK) behind a `transform_id` that records *exactly which* build was used.
@@ -370,7 +370,7 @@ Honest expectation: Unity ships a **forked** lz4; Bethesda's Archive2 and Starfi
 use unknown parameters; UE's zstd plugin version varies per title. **[estimate: single-digit
 percentage of blocks will round-trip on a first implementation.]** Do preflate, BCn and float
 filters first; revisit this only if measurement on a real corpus shows a worthwhile hit rate.
-Unity's *uncompressed* bundles and Source `.vpk` need none of this — they hand narc raw asset bytes
+Unity's *uncompressed* bundles and Source `.vpk` need none of this — they hand nova raw asset bytes
 and are the best-case input.
 
 ### 4.5 GDeflate — unexploited, but half as easy as it first looks
@@ -402,7 +402,7 @@ the serialization order is fully determined by the 32-bit refill rule
 >   header and the header is no longer required to be byte-aligned"*, so the whole page is one
 >   contiguous, non-byte-aligned bit stream.
 >
-> Consequences for narc:
+> Consequences for nova:
 > 1. An un-swizzled GDeflate page is **not a valid RFC 1951 stream**. `preflate-rs` cannot consume
 >    it as-is; it would need extended length/distance decoding and a 64 KB window.
 > 2. preflate is a model of a *specific* encoder family's parsing decisions (zlib's greedy/lazy
@@ -442,7 +442,7 @@ carries **Vorbis, FADPCM, PCM, MP3**, plus AT9/XMA on console and optional **AES
 for DRM banks. vgmstream's `wwise.c` documents the WEM codec tag map (`0xFFFF` = Vorbis,
 `0x0002`/`0x0069` = IMA ADPCM, `0x3039`/`0x3040`/`0x3041` = Opus variants, `0xFFFE` = PCM, XMA2,
 ATRAC9, …) ([source](https://github.com/losnoco/vgmstream/blob/master/src/meta/wwise.c)) — that map
-is a ready-made detection table for narc's analyzer.
+is a ready-made detection table for nova's analyzer.
 
 ### 5.2 Per-format verdict
 
@@ -471,7 +471,7 @@ product.)
 
 ## 6. Meshes, animation, and float arrays
 
-This is where narc can beat 7-Zip outright, because 7-Zip has **no float handling at all** (only a
+This is where nova can beat 7-Zip outright, because 7-Zip has **no float handling at all** (only a
 manual fixed-stride `Delta:N`).
 
 ### 6.1 The measured winner is embarrassingly simple
@@ -509,29 +509,29 @@ higher-dimensional grids
 > whole report — better supported than the BCn transform, and cheaper.
 >
 > Still measure locally: this corpus is grid/simulation state, not vertex buffers, and the numbers
-> are zstd-class. narc's max tier is LZMA2/PPMd7, where a byte-split changes the match structure
+> are zstd-class. nova's max tier is LZMA2/PPMd7, where a byte-split changes the match structure
 > differently — the filter must go through the existing per-unit trial-compression tournament rather
 > than being applied on faith.
 
-**Implementation for narc:** a 4-stream (f32) / 8-stream (f64) byte transpose plus optional
+**Implementation for nova:** a 4-stream (f32) / 8-stream (f64) byte transpose plus optional
 per-stream delta. ~50 lines, SIMD-friendly, exactly invertible, ~GB/s. Same code covers Parquet's
 `BYTE_STREAM_SPLIT`, which Apache added for precisely this reason: general-purpose text compressors
 *"do not handle FP data very well"* ([PARQUET-1716](https://issues.apache.org/jira/browse/PARQUET-1716)).
 Consider also 7-Zip's experimental **Swap4** (32-bit word byte-reversal — big-endian ordering
 compresses better under LZMA), which Igor Pavlov ships but does not enable by default because it
-helps only pure code/array sections and hurts everything else — a good argument for narc's
+helps only pure code/array sections and hurts everything else — a good argument for nova's
 per-unit trial-compression selection rather than global filter flags.
 
 ### 6.2 When to reach for a real numeric codec
 
-| Library | Language / licence | Numbers | Fit for narc |
+| Library | Language / licence | Numbers | Fit for nova |
 |---|---|---|---|
 | **[`pco` (pcodec)](https://github.com/pcodec/pcodec)** 1.0.3 | **pure Rust, Apache-2.0** | **29–94 % higher ratio than all alternatives** (Blosc+zstd, Parquet+zstd, TurboPFor+zstd, LZ4, Brotli) at similar compression time, even granting them 50 % more time; 23–48 % storage reduction. Taxi f64: pco **6.89–6.98** vs Parquet+zstd(22) **5.32** vs Blosc+zstd(9) **2.85** **[measured, paper + repo]** ([arXiv:2502.06112](https://arxiv.org/pdf/2502.06112), [benchmarks](https://github.com/pcodec/pcodec/blob/main/docs/benchmark_results.md)) | **strong candidate for detected numeric arrays.** Takes `&[f32]`/`&[f64]`, not bytes — so it needs §6.4 structure detection. Chunk per *column*: interleaving columns into one chunk "gives bad compression" per the docs. Only 11k LoC. |
 | **[`alp`](https://github.com/spiraldb/alp)** 0.0.2 (SpiralDB port of CWI's ALP) | **pure Rust, Apache-2.0** | ALP beats Gorilla/Chimp/Elf/Patas/PseudoDecimals and zstd on ratio *and* speed; reproducibility-reported at SIGMOD 2024. ALP-RD gets f64 to ~54 bits typical (~12.5 % saving) and terminates there **[measured, paper]** ([PACMMOD 10.1145/3626717](https://dl.acm.org/doi/10.1145/3626717), [repro report](https://dl.acm.org/doi/10.1145/3687998.3717057)) | classic ALP shines on *decimal-origin* doubles (rare in game data); ALP-RD's ~12.5 % on real doubles is weaker than byte-split+delta. **Second-tier.** Note the Rust port handles ±0/±inf/NaN correctly *because* Rust defines float→int cast semantics — relevant to bit-exactness. |
 | **[meshoptimizer](https://github.com/zeux/meshoptimizer)** vertex/index codecs | C/C++, **MIT**; Rust via [`meshopt`](https://github.com/gwihlidal/meshopt-rs) | *"The codec is lossless by itself"*; vertex 2–4× over already-quantized data, indices ~1 byte/index (1–3 bits with a general compressor on top), decode 3–6 GB/s. On Aras's non-mesh float data: 24.3 MB with zstd **[measured]** | **conditionally yes.** Requires the vertex **stride** and a vertex-cache/fetch-optimized ordering; unoptimized input compresses poorly. **Bit-exactness caveat: pin `meshopt_encodeVertexVersion`.** v1 is now default; upstream promises v0+v1 encode/decode "in perpetuity". Padding bytes must be zero-initialized. Its *filters* (oct/quat/exp) are **lossy — never use them.** |
 | **fpzip** | C++, BSD-ish | 24.8 MB vs 22.9 MB for byte-split+delta **[measured]** | loses to a 50-line filter. Skip. |
 | **zfp** lossless | C++ | **ratio < 1.0 on 1D/2D float game data** **[measured]** | **reject** |
-| **SPDP, ndzip, streamvbyte** | C/C++ | see table §6.1 | speed-tier only; narc already has zstd for that role |
+| **SPDP, ndzip, streamvbyte** | C/C++ | see table §6.1 | speed-tier only; nova already has zstd for that role |
 | **Draco** (glTF mesh compression) | C++, Apache-2.0 | — | **reject: quantizing, lossy.** Cannot reproduce input bytes. |
 
 ### 6.3 What in a game folder is a float array
@@ -547,7 +547,7 @@ per-unit trial-compression selection rather than global filter flags.
 - particle/simulation caches, heightmaps, navmeshes, physics collision data;
 - point clouds and photogrammetry intermediates in dev trees.
 
-### 6.4 Structure detection: the piece narc must build
+### 6.4 Structure detection: the piece nova must build
 
 Everything above hinges on knowing "this byte range is an array of N-byte elements". Three tiers,
 in confidence order:
@@ -560,14 +560,14 @@ in confidence order:
    *s* ∈ {2,3,4,6,8,12,16,20,24,32,48,64}, compute a cheap score over a sample window — e.g. mean
    |byte[i] − byte[i−s]| (autocorrelation of differences), or per-column byte entropy after a
    virtual transpose. Pick the *s* minimizing total estimated entropy; require a margin over
-   *s* = 1 before applying anything. Then **verify by trial compression** — narc already has the
+   *s* = 1 before applying anything. Then **verify by trial compression** — nova already has the
    trial-compression machinery from its analyzer, and `lossless-transform-utils` (MIT) gives a
    2.5 GB/s estimator so the search is affordable. Sewer56's
    [`struct-compression-analyzer`](https://crates.io/crates/struct-compression-analyzer) is prior
    art for the offline version of this workflow (declare a schema, get per-field zstd sizes) and is
    worth reading as a design reference.
 
-Report [04-freearc-lessons.md](04-freearc-lessons.md) already flags auto-stride delta as a narc
+Report [04-freearc-lessons.md](04-freearc-lessons.md) already flags auto-stride delta as a nova
 differentiator (FreeArc's `delta` filter auto-detected tables; 7-Zip only offers manual `Delta:N`).
 This section is the concrete plan for it. Expected **+5–30 % on structured binaries [estimate,
 per 04]**; the float measurements in §6.1 are the calibrated end of that range.
@@ -617,7 +617,7 @@ Measured numbers, most reliable first:
 
 | Filter | Gain | Source |
 |---|---|---|
-| **x86 BCJ vs no filter** | **6–8 %** on x86 executables | Igor Pavlov / [7-Zip docs](https://documentation.help/7-Zip/method.htm) **[claimed by author, widely reproduced; the mirror 403s, not re-verified in the 2026-08 pass]**. **Local cross-check: narc's own measurement is +4.4–5.7 % on a real `.exe` across every codec/level (ROADMAP) — i.e. the low end of the published range or slightly below. Quote our number, not Pavlov's.** |
+| **x86 BCJ vs no filter** | **6–8 %** on x86 executables | Igor Pavlov / [7-Zip docs](https://documentation.help/7-Zip/method.htm) **[claimed by author, widely reproduced; the mirror 403s, not re-verified in the 2026-08 pass]**. **Local cross-check: nova's own measurement is +4.4–5.7 % on a real `.exe` across every codec/level (ROADMAP) — i.e. the low end of the published range or slightly below. Quote our number, not Pavlov's.** |
 | **BCJ2 vs BCJ** | 7,485 KB `AcroRd32.exe`: BCJ → 2,460 KB, BCJ2 → **2,228 KB** ⇒ **~9.4 % smaller**. Pavlov cautions this test used an 8 MB dictionary and BCJ2's 3 streams/3 dictionaries inflate the advantage; **the gap shrinks with a large dictionary** ([thread](https://sourceforge.net/p/sevenzip/discussion/45797/thread/fd464404/)) **[measured, single file]** |
 | **ARM64 filter** | **~5 %** smaller compressed Linux kernel vs unfiltered XZ or plain LZMA — verified against Lasse Collin's own patch text ("xz: Adjust arch-specific options for better kernel compression", 2024; [LWN summary](https://lwn.net/Articles/982751/), [lore thread](https://lore.kernel.org/linux-kernel/20240320183846.19475-6-lasse.collin@tukaani.org/T/), [commit mirror](https://git.zx2c4.com/linux-rng/commit/?id=7472ff8adad8655f38b060a602f66e59c93c4793)) **[measured]** |
 | **RISC-V filter** | **~7 %** on the same basis, same patch **[measured]**. Same series notes matching LZMA2 alignment options are worth a further **0–2 %** (nothing on 1-byte-aligned x86, most on 4-byte-aligned archs) — see the alignment row below |
@@ -651,15 +651,15 @@ Half of "beating 7-Zip on game data" is *speed*, and the cheapest speed win is r
    Rust, active) reports ~74.4 % agreement with zstd at high levels **[claimed]** — enough to route
    a unit to *store* without a trial compression. Its sibling zstd-level-1 estimator runs at
    ~1060 MiB/s with 79.2 % agreement **[claimed]**.
-3. **Never expand.** A store fallback per unit is already narc's design; make sure it is also a
+3. **Never expand.** A store fallback per unit is already nova's design; make sure it is also a
    *per-transform* fallback (transform → verify → compare size → keep the smaller).
 4. **Dedupe still pays on incompressible data.** This is the point most reviewers miss: two patch
    versions of the same Oodle-compressed `.ucas` share the vast majority of their 256 KB blocks
-   byte-for-byte. narc's FastCDC + blake3-128 dedupe extracts value where every codec scores 0 %.
+   byte-for-byte. nova's FastCDC + blake3-128 dedupe extracts value where every codec scores 0 %.
 
 ---
 
-## 11. Recommended build order for narc
+## 11. Recommended build order for nova
 
 | Phase | Work | Why now |
 |---|---|---|
@@ -679,9 +679,9 @@ record `(transform_id, codec_version)` per stream with all old decoders kept cal
 §4.4's re-encode gamble this is not a best practice — it is the only thing that makes it legal to
 attempt at all.
 
-### 11.1 Collision check against narc's existing invariants (added in verification pass)
+### 11.1 Collision check against nova's existing invariants (added in verification pass)
 
-The transforms above were researched in the abstract. Checked against narc's actual format
+The transforms above were researched in the abstract. Checked against nova's actual format
 (`ROADMAP.md`: chunk = compression unit = edit granularity, max tier 1/4/16 MiB FastCDC; solid
 blocks 4/16/32 MiB from files < 256 KiB sorted by extension; `filter → compress`, `decompress →
 unfilter`; chunk hash covers the **original** bytes; *"all ops bounded by a few MAX_CHUNK buffers +
@@ -696,10 +696,10 @@ index bytes: the transform still round-trips (it is a permutation either way, so
 bug and no test failure**) but the 12 % silently becomes ~0 % or negative. This is the failure mode
 that would make phase B look like a dud for the wrong reason.
 
-Fix, and it is small: the per-chunk **param byte** (narc already has one for `delta(N)`) records
+Fix, and it is small: the per-chunk **param byte** (nova already has one for `delta(N)`) records
 `(BCn variant, phase)` where phase = `(chunk_file_offset − payload_start) mod block_size`, computed
 by the packer from the analyzer's DDS/KTX2 parse. Critically this is **dedup-safe**, unlike BCJ:
-narc's `start_offset 0` rule for BCJ exists because a deduped chunk is stored once and must unfilter
+nova's `start_offset 0` rule for BCJ exists because a deduped chunk is stored once and must unfilter
 correctly at every position it is referenced from. Here the unfilter is *self-describing* from the
 stored param byte, and the hash covers the original bytes, so a shared chunk round-trips correctly
 regardless of which reference's phase was used to pack it — only that one copy's ratio is
@@ -719,11 +719,11 @@ only to containers whose payload blocks are ≤ the tier's chunk size, and monol
 store.** Otherwise cheap edits and bounded memory both fall over on exactly the biggest files.
 
 **(3) Mechanism (b) (§4.4) taxes *extraction*, not just packing — this is a harder objection than
-the low hit rate.** Under (b) narc stores the plaintext plus "re-encode with encoder X vY params Z";
+the low hit rate.** Under (b) nova stores the plaintext plus "re-encode with encoder X vY params Z";
 regenerating the original bytes at **extract** time means *running the original compressor*. LZMA
 and zstd-19 encode at roughly 1–5 MB/s/core against 50–200 MB/s decode, with encoder-side memory of
 several times the dictionary. So a §4.4 archive extracts at compression speed and compression
-memory — a direct collision with narc's declared hard requirement that extraction always work on a
+memory — a direct collision with nova's declared hard requirement that extraction always work on a
 weak PC. The other transforms are safe on this axis: BCn split and byte-split+delta are memcpy-speed
 permutations, FLAC decode is fast, preflate's re-deflate is tens of MB/s, GDeflate re-swizzle is
 per-64 KB-page. **Add to §4.4's verdict: even a block that round-trips must be rejected if its
@@ -811,7 +811,7 @@ demotes §4.4 further, for a better reason than the one given there.
   lossless; the *filters* are not. Easy and fatal confusion.
 - **fpzip, SPDP, ndzip, streamvbyte** — all measurably worse than a 50-line byte-split+delta filter
   plus zstd on real game float data. Only ndzip/streamvbyte have a story, and it is throughput,
-  which zstd already covers for narc.
+  which zstd already covers for nova.
 - **AoS→SoA reordering *alone*, without delta** — measured to **hurt** high-level zstd and Kraken.
   The delta step is what makes the transposition pay.
 - **ALP classic mode for game data** — designed for doubles that originated as decimals
@@ -829,7 +829,7 @@ demotes §4.4 further, for a better reason than the one given there.
   useful action is *detection to skip*, which is a speed win.
 - **A "structure detector" without trial verification** — blind stride detection on a
   format-agnostic blob has a real false-positive rate. Every detected transform must be
-  round-trip-verified and size-compared, or narc will silently make files bigger and, worse,
+  round-trip-verified and size-compared, or nova will silently make files bigger and, worse,
   eventually corrupt one.
 
 ---

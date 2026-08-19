@@ -1,0 +1,16 @@
+[package]
+name = "nova-cli"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+description = "Command-line interface for the NOVA archive format (Nova Prism)"
+
+[[bin]]
+name = "nova"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+nova-core = { path = "../nova-core" }
+nova-platform = { path = "../nova-platform" }

@@ -2419,70 +2419,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "narc-bsc"
-version = "0.7.0"
-dependencies = [
- "anyhow",
- "cc",
-]
-
-[[package]]
-name = "narc-cli"
-version = "0.7.0"
-dependencies = [
- "anyhow",
- "clap",
- "narc-core",
- "narc-platform",
-]
-
-[[package]]
-name = "narc-core"
-version = "0.7.0"
-dependencies = [
- "anyhow",
- "blake3",
- "crossbeam-channel",
- "fastcdc",
- "filetime",
- "flate2",
- "jpeg-encoder",
- "lepton_jpeg",
- "lzma-rust2",
- "narc-bsc",
- "narc-platform",
- "ppmd-rust",
- "preflate-rs",
- "rmp-serde",
- "serde",
- "tempfile",
- "walkdir",
- "zstd",
-]
-
-[[package]]
-name = "narc-gui"
-version = "0.7.0"
-dependencies = [
- "anyhow",
- "narc-core",
- "narc-platform",
- "serde",
- "serde_json",
- "tauri",
- "tauri-build",
- "tauri-plugin-dialog",
- "tauri-plugin-opener",
-]
-
-[[package]]
-name = "narc-platform"
-version = "0.7.0"
-dependencies = [
- "windows-sys 0.60.2",
-]
-
-[[package]]
 name = "ndk"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2511,6 +2447,70 @@ name = "new_debug_unreachable"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
+
+[[package]]
+name = "nova-bsc"
+version = "0.7.0"
+dependencies = [
+ "anyhow",
+ "cc",
+]
+
+[[package]]
+name = "nova-cli"
+version = "0.7.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "nova-core",
+ "nova-platform",
+]
+
+[[package]]
+name = "nova-core"
+version = "0.7.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "crossbeam-channel",
+ "fastcdc",
+ "filetime",
+ "flate2",
+ "jpeg-encoder",
+ "lepton_jpeg",
+ "lzma-rust2",
+ "nova-bsc",
+ "nova-platform",
+ "ppmd-rust",
+ "preflate-rs",
+ "rmp-serde",
+ "serde",
+ "tempfile",
+ "walkdir",
+ "zstd",
+]
+
+[[package]]
+name = "nova-gui"
+version = "0.7.0"
+dependencies = [
+ "anyhow",
+ "nova-core",
+ "nova-platform",
+ "serde",
+ "serde_json",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-dialog",
+ "tauri-plugin-opener",
+]
+
+[[package]]
+name = "nova-platform"
+version = "0.7.0"
+dependencies = [
+ "windows-sys 0.60.2",
+]
 
 [[package]]
 name = "num-conv"

@@ -1,6 +1,6 @@
 # Research 02 — Lossless Recompression of Already-Compressed Data
 
-*Nova Arc research report. Status of the ecosystem as of August 2026. All liveness/license claims below were verified against live GitHub/crates.io data on 2026-08-16 (not from memory).*
+*Nova Prism research report. Status of the ecosystem as of August 2026. All liveness/license claims below were verified against live GitHub/crates.io data on 2026-08-16 (not from memory).*
 
 ## 1. The concept
 
@@ -16,8 +16,8 @@ Two hard requirements for an archiver:
    (transform → inverse → byte-compare) *at pack time*; on mismatch fall back to storing raw.
    Precomp's own community explicitly warns it is "proof-of-concept" without this discipline.
 2. **Format pinning.** Correction-record formats (preflate-rs, lepton) are not guaranteed stable
-   across library versions. `.narc` must record `(transform_id, codec_version)` per stream and
-   Nova Arc must keep old decoders callable forever, or old archives become unreadable.
+   across library versions. `.nva` must record `(transform_id, codec_version)` per stream and
+   Nova Prism must keep old decoders callable forever, or old archives become unreadable.
 
 ---
 
@@ -47,8 +47,8 @@ re-encoding requires modelling the original encoder and storing corrections.
 - Correction overhead: **0.01 % of uncompressed size (zlib) up to ~2.7 % worst case (miniz L2)**;
   most compressors < 1 %.
 - Ships a `container` crate that already scans ZIP/PNG/JPEG containers and orchestrates a
-  Zstd recompression pipeline — a working template for narc's analyzer.
-- Pure Rust, crates.io: `preflate-rs 0.7.6` — integration cost for Nova Arc is essentially zero.
+  Zstd recompression pipeline — a working template for nova's analyzer.
+- Pure Rust, crates.io: `preflate-rs 0.7.6` — integration cost for Nova Prism is essentially zero.
 
 ### Expected end-to-end gains (deflate payloads, after preflate + LZMA/zstd-19)
 
@@ -82,7 +82,7 @@ quantized DCT coefficients with context modelling + arithmetic coding.
 **Recommendation: `lepton_jpeg` crate as the primary JPEG transform.** It is the only
 actively-maintained, production-grade, *pure Rust*, Apache-2.0 option; supports **baseline and
 progressive** JPEG; guards against pathological files (dimension caps, zero-quant-table
-rejection). The Lepton container is a private storage format — exactly what narc needs
+rejection). The Lepton container is a private storage format — exactly what nova needs
 internally.
 
 **JPEG XL transcode as an alternative/secondary tier:** similar ratio (~20 %), but the stored
@@ -114,7 +114,7 @@ must all be fallback rungs of one ladder.
 
 - [packMP3](https://github.com/packjpg/packMP3) (Stirner): **~16 % average** saving
   (author's test over 6000 files), bit-exact. C++, **LGPL-3.0**, dormant (last push Apr 2020).
-- LGPL-3.0 in a Rust static-link world is awkward: narc would need dynamic linking or a
+- LGPL-3.0 in a Rust static-link world is awkward: nova would need dynamic linking or a
   relink-capable distribution to stay clean. Options: ship as an optional dynamically-loaded
   plugin DLL, or port the algorithm (it is well documented — Stirner's master's thesis).
 - **mp3packer** was investigated and **rejected**: it losslessly *rearranges* frames
@@ -134,7 +134,7 @@ must all be fallback rungs of one ladder.
   file-level identity.
 - Rust: [`flacenc` 0.5.1](https://crates.io/crates/flacenc) (pure Rust, Apache-2.0, active,
   SIMD + multithread) — but the maintainer **flags encoder instability** ("encoded file may
-  contain distortion"). With narc's mandatory verify-decode-compare this is survivable, but the
+  contain distortion"). With nova's mandatory verify-decode-compare this is survivable, but the
   safer default is **libflac via FFI** (`flac-bound`/`libflac-sys`, BSD) with `flacenc` as the
   pure-Rust experiment. Decode side: `claxon` (pure Rust, well-tested).
 
@@ -149,7 +149,7 @@ must all be fallback rungs of one ladder.
   Shelwien has private AAC/audio recompressors (closed). xtool never had video codecs.
 - Modern codecs (H.265/AV1) use adaptive arithmetic coding throughout; residual redundancy is
   small and the decode/re-encode surface is enormous (bug surface = corruption risk).
-- Correct narc behavior: **detect** video containers in the analyzer, classify as
+- Correct nova behavior: **detect** video containers in the analyzer, classify as
   "incompressible", route to the *store* tier (no LZMA time wasted), and let CDC chunking
   provide dedupe. Container-level metadata (moov atoms) is too small to matter.
 
@@ -167,16 +167,16 @@ These are the everyday jackpot: Office files are zip+deflate of highly-compressi
 - **Zip specifics**: reproduce member order, local-header quirks, data-descriptor presence,
   timestamps, "extra" fields, and non-deflate members (stored, zstd, lzma) byte-exact. The
   correction record is "zip metadata verbatim + per-member deflate corrections".
-- **APK**: same as zip; v2/v3 signatures cover the whole file, but since narc reconstructs
+- **APK**: same as zip; v2/v3 signatures cover the whole file, but since nova reconstructs
   bit-exact, signatures survive. Note: modern APKs store .so files aligned/uncompressed —
-  those go straight to the normal narc compressor.
-- **Interaction with .narc CDC dedupe**: chunk the *precompressed* (post-transform) data, not
+  those go straight to the normal nova compressor.
+- **Interaction with .nva CDC dedupe**: chunk the *precompressed* (post-transform) data, not
   the raw file — two docx that differ by one XML element then dedupe almost entirely, and the
   "replace 1 file in 700" edit path stays cheap.
 
 ---
 
-## 8. Recommended narc max-tier pipeline
+## 8. Recommended nova max-tier pipeline
 
 **Phase 1 — analyze** (cheap, parallel): magic + structure sniffing per file; recursive
 container walk; emit a stream map `(offset, len, type, confidence)` and per-file plan.
@@ -194,7 +194,7 @@ container walk; emit a stream map `(offset, len, type, confidence)` and per-file
 | — | video/AAC/opus, zstd/brotli/LZMA payloads, encrypted | none — store tier | — | 0 % |
 
 Then group transformed outputs by type (text-like, image-coefficients, binary), and hand groups
-to the normal narc codec selection (zstd/LZMA/etc. — topic of report 01/03). JXL transcode is an
+to the normal nova codec selection (zstd/LZMA/etc. — topic of report 01/03). JXL transcode is an
 optional user-facing alternative to Lepton (standard format at ~20 %).
 
 **Metadata**: each stream stores `(transform_id, codec_version, correction_blob)`; extraction

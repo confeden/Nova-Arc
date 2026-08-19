@@ -1,15 +1,15 @@
 # Research 10 — Adaptive dictionaries and alphabet/representation transforms
 
 Scope: (a) trained dictionaries, (b) alphabet / numeral-system / representation
-transforms, (c) a concrete design for narc. Everything labelled **MEASURED**
-was run on this machine against narc's own corpus during this study; everything
+transforms, (c) a concrete design for nova. Everything labelled **MEASURED**
+was run on this machine against nova's own corpus during this study; everything
 labelled **CLAIMED** is a citation whose number I did not reproduce.
 
 ---
 
 ## 0. Bottom line
 
-1. **The owner's core hypothesis is wrong at narc's current block size — and the
+1. **The owner's core hypothesis is wrong at nova's current block size — and the
    measurement is unambiguous.** The idea was: "a dictionary stored once and
    used by every chunk gives cross-file redundancy WITHOUT enlarging the
    compression unit, so edits stay cheap." At 32 MiB solid blocks the whole
@@ -22,14 +22,14 @@ labelled **CLAIMED** is a citation whose number I did not reproduce.
    is stated outright by zstd's author (quoted in §2.2) and is exactly what the
    measurements show: the dictionary's gain decays from −16% at 256 KiB units to
    0% at 32 MiB units.
-3. **But there is one place where it genuinely pays, and it is narc's
+3. **But there is one place where it genuinely pays, and it is nova's
    differentiator:** the *append/edit* path. Data added after creation forms
    small units, and there a dictionary trained from the archive's own content
    gives a **hold-out-validated 21-31% reduction**. That is the recommendation.
-4. **Unit size dominates dictionaries as a ratio lever — but narc's small-file
+4. **Unit size dominates dictionaries as a ratio lever — but nova's small-file
    path is already fine, and the 7-Zip gap is somewhere else entirely.**
    MEASURED: 4 MiB units cost **+50.0%** vs one solid stream, 32 MiB units
-   **+4.9%**, and narc's *realized* geometry (blocks hit the 64 MiB hard cap, not
+   **+4.9%**, and nova's *realized* geometry (blocks hit the 64 MiB hard cap, not
    the 32 MiB target) only **+1.3%**. §6.3's verification pass localizes the
    whole 7-Zip gap on this corpus to the **large-file path**: 12 files ≥ 1 MiB
    cost 5.495 MiB compressed one-by-one versus 2.229 MiB solid, a 3.27 MiB loss
@@ -47,8 +47,8 @@ labelled **CLAIMED** is a citation whose number I did not reproduce.
 
 ### 1.1 Corpus
 
-narc's own test corpus, restricted to files `< 256 KiB`, sorted by extension
-then path — narc's own solid-block ordering.
+nova's own test corpus, restricted to files `< 256 KiB`, sorted by extension
+then path — nova's own solid-block ordering.
 
 > **CORRECTED (verification pass).** 256 KiB is `Tier::solid_max_file()` for
 > **fast and normal**. This report is about the **max** tier, where
@@ -74,7 +74,7 @@ then path — narc's own solid-block ordering.
 
 The other 44 files in the tree (39.2 MiB) are ≥ 256 KiB; 32 of them (12.26 MiB)
 still go into solid blocks at the max tier and only 12 (26.91 MiB) go down
-narc's chunked path. They are out of scope here because a dictionary cannot help
+nova's chunked path. They are out of scope here because a dictionary cannot help
 a file that is already far larger than the dictionary.
 
 Scripts (all in the gitignored playground): `test/dict-bench.py` (A/B/C),
@@ -111,11 +111,11 @@ shows it differs sharply from what zstd's *dictionary API* does.
 > So a real `preset_dict` gains **≤** the proxy. That makes §2.6's negative
 > result *stronger* (the real API can only do worse), but it means §2.7's
 > "training is worth 2-3× a raw sample" and any other positive LZMA2 number here
-> is an upper bound. `crates/narc-core/examples/dict_probe.rs` already drives the
+> is an upper bound. `crates/nova-core/examples/dict_probe.rs` already drives the
 > real `preset_dict` API through `lzma-rust2`; run it before trusting any
 > positive LZMA2 dictionary number.
 
-### 1.4 Anchors — the numbers narc must beat
+### 1.4 Anchors — the numbers nova must beat
 
 MEASURED, same 5707 files. 7-Zip figures include stored path metadata (~5707
 paths); the raw-stream figures do not, which is worth ~0.14 MiB.
@@ -127,7 +127,7 @@ paths); the raw-stream figures do not, which is worth ~0.14 MiB.
 | 7z `-mx9 -m0=PPMd:o=16:mem=256m` (solid) | 8.120 MiB | 10.94% | 9.9 s |
 | 7z `-mx9 -ms=off` (non-solid) | 15.563 MiB | 20.96% | 11.6 s |
 | LZMA2 `-9e` raw, one solid stream | 5.540 MiB | 7.46% | — |
-| LZMA2 `-9e` raw, 32 MiB blocks (narc max) | 5.812 MiB | 7.83% | — |
+| LZMA2 `-9e` raw, 32 MiB blocks (nova max) | 5.812 MiB | 7.83% | — |
 | zstd-19, 64 MiB blocks (2 blocks) | 5.943 MiB | 8.00% | — |
 | zstd-19, one stream | **5.816 MiB** | **7.83%** | — |
 | zstd-19, per file | 15.743 MiB | 21.21% | 34 s |
@@ -144,7 +144,7 @@ Two things to note immediately:
 - **Non-solid 7-Zip (20.96%) ≈ per-file zstd-19 (21.21%).** Solidity is worth
   **2.7×** on this corpus. That is the size of the prize.
 - **PPMd is 43% worse than LZMA2 on this source tree** (10.94% vs 7.66%).
-  narc's max tier runs a per-unit LZMA2/PPMd tournament and keeps the smaller,
+  nova's max tier runs a per-unit LZMA2/PPMd tournament and keeps the smaller,
   so this should not hurt — but it is a reminder that PPMd's win in the ROADMAP
   (`-24%` on prose) does not transfer to source code.
 
@@ -184,11 +184,11 @@ interpretation flipped between `DICT_TYPE_FULLDICT` and `DICT_TYPE_RAWCONTENT`,
 
 **Verdict:** the entropy tables are worth ~4% of the dictionary's total value
 overall, ~15% of it on sub-4-KiB files. The content is what matters. This is
-good news for narc: a **raw-content dictionary is codec-agnostic**, so one
+good news for nova: a **raw-content dictionary is codec-agnostic**, so one
 stored blob can serve zstd and LZMA2 alike.
 
 > **CORRECTED — not PPMd.** The original text said the blob serves "zstd, LZMA2
-> and PPMd alike". Verified against narc's actual dependency: `ppmd-rust` 1.4.0
+> and PPMd alike". Verified against nova's actual dependency: `ppmd-rust` 1.4.0
 > exposes only `Ppmd7Encoder::new(writer, order, mem_size)` /
 > `Ppmd7Decoder::new(reader, order, mem_size)` — **there is no priming or
 > preset-dictionary API on either side.** The only way to prime a PPMd model is
@@ -221,8 +221,8 @@ And Yann Collet (zstd's author) in
 > similar records together, for example because the records must be sent
 > immediately and can't wait inside a batch queue."
 
-**narc can concatenate.** It already does — that is what a solid block is.
-So narc is not in the regime dictionaries were designed for. Everything below
+**nova can concatenate.** It already does — that is what a solid block is.
+So nova is not in the regime dictionaries were designed for. Everything below
 is the quantification of that sentence.
 
 ### 2.3 Verifying the "10× on small files" claim
@@ -255,7 +255,7 @@ quantitative. **The magnitude of the folklore figures does not reproduce:**
 1.6× at the small end, not 5×. The 5-10× figures require *near-duplicate*
 records, and
 Collet confirms that for such data plain concatenation would exceed 10× anyway.
-Treat "10× on small files" as true-but-inapplicable marketing for narc's data.
+Treat "10× on small files" as true-but-inapplicable marketing for nova's data.
 
 ### 2.4 Dictionary size vs gain — and a trap
 
@@ -335,7 +335,7 @@ dictionary makes a 32 MiB block **15% larger**. §3.4 dissects that.
 
 ### 2.6 THE DECISIVE TABLE — LZMA2, 32 MiB blocks, storage included
 
-narc's max tier compresses 32 MiB solid blocks with LZMA2/PPMd. This is the
+nova's max tier compresses 32 MiB solid blocks with LZMA2/PPMd. This is the
 configuration that matters. The dictionary must be stored in the archive, so its
 compressed size is charged against it.
 
@@ -419,7 +419,7 @@ dictionary, eight largest extension groups:
 
 Storing 8 dictionaries instead of 1 costs 770 KiB extra but saves 1176 KiB →
 **net −405 KiB**. Per-group dictionaries are the right structure *if* you build
-dictionaries at all. narc already sorts small files by extension, so the
+dictionaries at all. nova already sorts small files by extension, so the
 grouping exists for free.
 
 ### 2.9 Brotli's built-in dictionary — a free partial win
@@ -439,7 +439,7 @@ format*. MEASURED, per file:
 
 Brotli's free dictionary captures **roughly half** of what a corpus-trained
 dictionary achieves (−12.1% vs −22.2%), for zero storage, zero training and zero
-format-versioning risk. It is a legitimate cheap option for narc's *small
+format-versioning risk. It is a legitimate cheap option for nova's *small
 appended text units* — but note brotli loses to LZMA2/PPMd on large units, so it
 would be a niche fourth codec, and Python's `brotli` module exposes no custom
 dictionary API (custom dictionaries need brotli ≥1.1.0 C API or CLI).
@@ -452,7 +452,7 @@ dictionary API (custom dictionaries need brotli ≥1.1.0 C API or CLI).
 | `xz` CLI | **no option at all** | — | — |
 | 7-Zip / `.7z` | not exposed | not exposed | **no** |
 | CPython `lzma` | **no** (verified: rejects `preset_dict`) | no | — |
-| **`lzma-rust2` 0.19 (narc's crate)** | **yes** | **yes** | narc's own container — so yes |
+| **`lzma-rust2` 0.19 (nova's crate)** | **yes** | **yes** | nova's own container — so yes |
 | zstd | yes | yes | out-of-band, identified by `Dictionary_ID` |
 | brotli ≥ 1.1.0 | yes | yes | out-of-band (RFC 9842 for HTTP) |
 
@@ -464,7 +464,7 @@ dictionary identity yourself
 ([liblzma docs](https://tukaani.org/xz/liblzma-api/structlzma__options__lzma.html),
 [xz-utils discussion](https://sourceforge.net/p/lzmautils/discussion/708858/thread/e40fbf99/)).
 
-**Good news for narc, verified by reading the crate source** (re-verified in the
+**Good news for nova, verified by reading the crate source** (re-verified in the
 verification pass against the vendored `lzma-rust2-0.19.0` in the cargo
 registry — the exact version `Cargo.toml` pins; **Apache-2.0**, upstream
 `hasenbanck/lzma-rust2`, released 2026-08-16 and actively maintained, with
@@ -472,7 +472,7 @@ releases 0.16.x→0.19.0 in the last three months): `lzma-rust2` 0.19
 supports `preset_dict` on both sides —
 `enc/lzma2_writer.rs:31` (`pub preset_dict: Option<Vec<u8>>`), applied at
 `:227-228` via `lzma.lz.set_preset_dict(...)`; and `lzma2_reader.rs:95-97` /
-`lzma_reader.rs:98,166-182` on the decode side. narc writes raw LZMA2 chunks in
+`lzma_reader.rs:98,166-182` on the decode side. nova writes raw LZMA2 chunks in
 its own container, so the `.xz`/`.7z` limitation does not apply.
 
 Two gotchas found in that source:
@@ -484,21 +484,21 @@ Two gotchas found in that source:
   dictionary is never evicted mid-unit. Upstream gives the same two rules.
 - `enc/lzma2_writer_mt.rs:76` does `single_chunk_options.lzma_options.preset_dict
   = None` — **the multi-threaded LZMA2 writer drops the preset dictionary.**
-  narc parallelizes across chunks itself, so it should use the single-threaded
+  nova parallelizes across chunks itself, so it should use the single-threaded
   writer anyway, but this would silently produce larger output if the MT writer
   were used.
 
 Also relevant: preset-dictionary encoder setup is not free — the dictionary must
-be run through the match finder on every unit. For narc that is 1 MiB of extra
+be run through the match finder on every unit. For nova that is 1 MiB of extra
 match-finder work per 32 MiB block (tolerable) but 1 MiB per 13 KiB file if
 applied per-file (catastrophic — a 80× overhead).
 
-### 2.11 Interaction with dedup — a non-issue for narc, and the real hazard
+### 2.11 Interaction with dedup — a non-issue for nova, and the real hazard
 
 The question was: "what happens to dedup when chunks are compressed against a
 shared dictionary?"
 
-**For narc: nothing.** ROADMAP invariant — `chunk hash = blake3(uncompressed)
+**For nova: nothing.** ROADMAP invariant — `chunk hash = blake3(uncompressed)
 [..16]`, and "Chunk hash covers the ORIGINAL bytes, so dedup and integrity are
 filter-independent". A dictionary changes only the compressed representation, so
 dedup and integrity are untouched. This is a genuine architectural advantage
@@ -641,7 +641,7 @@ small gain instead of a large loss.
 
 ## 4. Part (b) — Alphabet and representation transforms
 
-All MEASURED against the same codec on the same bytes, at settings narc uses.
+All MEASURED against the same codec on the same bytes, at settings nova uses.
 A transform counts only if it beats the untransformed baseline *after* the codec.
 
 ### 4.1 base64 and hex — the one real win, and its limit
@@ -671,7 +671,7 @@ blobs). A hex decoder is not worth writing. Both must be exactly reversible
 including line breaks, padding and whitespace — the round-trip metadata can
 easily cost more than the gain on small inputs.
 
-> **CORRECTED — narc's architecture limits where this can fire.** A `Filter` is
+> **CORRECTED — nova's architecture limits where this can fire.** A `Filter` is
 > a per-*unit* property, and at the max tier every file < 1 MiB is concatenated
 > into a solid block whose plan is chosen **once for the whole block** from a
 > 64 KiB head sample (`archive.rs` `flush_solid` → `analyze::plan(&buf[..
@@ -771,8 +771,8 @@ Table II ablation (10 MB subset) separates the two stages:
    distributions, and LZMA uses range coding with sophisticated context
    modeling, so both capture some of the structure our preprocessing provides."
 2. **PPMd-16 raw (22.83%) is the best practical compressor in the table, and the
-   transform makes it worse.** narc's max tier routes text to PPMd. So this
-   entire family of transforms is a *negative* for narc's strongest text path.
+   transform makes it worse.** nova's max tier routes text to PPMd. So this
+   entire family of transforms is a *negative* for nova's strongest text path.
 3. **BWT-based bz2 gains nothing**, because "BWT already groups similar contexts
    and assigns small integers via move-to-front" — the transform is redundant
    with what the codec does natively.
@@ -782,7 +782,7 @@ Historical context for the word-based variants: Kruse & Mukherjee reached up to
 against weak or BWT back-ends and both requiring an *external language-specific*
 dictionary. XWRT is still used as a text filter inside PAQ variants, so the
 family is not dead — but its remaining headroom is against `zlib`-class and
-BWT-class back-ends, which narc does not use.
+BWT-class back-ends, which nova does not use.
 
 Also worth knowing: Delétang et al. showed tokenization does **not** improve
 *neural* compressors either, for the same reason — the model already captures
@@ -810,7 +810,7 @@ states, ~0.001 at 8-16×" figures are not in that paper's abstract and no source
 is given for them here. Treat the magnitude as unverified; the *sign* (tANS has
 non-zero excess rate vs arithmetic coding) is not in dispute. So swapping an
 entropy coder for rANS buys throughput
-and *loses* a hair of ratio. narc's codecs already use the right coders (zstd
+and *loses* a hair of ratio. nova's codecs already use the right coders (zstd
 FSE/tANS + Huffman; LZMA2 and PPMd7 range coding with adaptive models). An
 "adaptive alphabet" in rANS means periodically re-transmitting frequency tables
 — which is what zstd already does per block, and what PPMd's model does
@@ -832,7 +832,7 @@ continuously and better.
 | bijective base conversion | — | — | cannot work (information-theoretic) |
 | rANS/tANS swap | — | — | speed only; slight ratio *loss* |
 
-narc already ships the two representation transforms that actually pay — **BCJ
+nova already ships the two representation transforms that actually pay — **BCJ
 x86** (+4.4-5.7% on real `.exe`, per ROADMAP) and **delta**. Those are
 *structure-aware* transforms that convert absolute values into predictable
 relative ones. That is the category that works; generic alphabet shuffling is
@@ -854,15 +854,15 @@ not.
 content-derived (hash) or an opaque immutable id, and the dictionary is fetched
 out of band. Where dictionaries were not needed (restic, borg) the reason was
 always the same — *the system already batches, so it does not need one*, which is
-narc's situation too.
+nova's situation too.
 
-Note that restic's *format-version* gate is the right model for narc: a
+Note that restic's *format-version* gate is the right model for nova: a
 capability that changes what decoders must implement belongs to a version bump,
 not to a per-chunk flag alone.
 
 ---
 
-## 6. Part (c) — Concrete proposal for narc
+## 6. Part (c) — Concrete proposal for nova
 
 ### 6.1 What to actually build (and what not to)
 
@@ -871,12 +871,12 @@ decisive: net loss at every dictionary size. This is the owner's original idea
 and it does not survive measurement.
 
 **DO** consider a dictionary for exactly one case: **units created by `add`
-after the archive already exists.** This is narc's differentiator and the one
+after the archive already exists.** This is nova's differentiator and the one
 regime where the numbers are strong:
 
 - A file edited or appended later cannot join an existing committed block
   (committed bytes are never rewritten). It becomes a small unit — the per-file
-  regime. **CORRECTED — this holds only for `narc add <archive> <a few files>`.**
+  regime. **CORRECTED — this holds only for `nova add <archive> <a few files>`.**
   Read `Archive::add` and `AddCtx::add_small_file`: an `add` walks whatever input
   it is given, sorts it, and fills the solid builder from *that* input. If the
   user re-adds the whole tree after editing one file — which is the flow the
@@ -898,11 +898,11 @@ example does not support the recommendation.** Three problems: (a) that ~98 KiB
 comes from the *tree re-save* flow, which produces a full-size solid block, not a
 per-file unit (see above); (b) an unknown and possibly dominant share of it is
 the re-written manifest, which no dictionary touches; (c) the −21% is a
-**zstd-19** number, while narc's max tier compresses these units with LZMA2/PPMd
+**zstd-19** number, while nova's max tier compresses these units with LZMA2/PPMd
 — and PPMd cannot use a dictionary at all (§2.1 correction). The per-file gains
 in §2.4 are real for zstd; **no measurement in this study establishes the gain
 for an LZMA2 preset dictionary on a ~13 KiB unit.** Run
-`crates/narc-core/examples/dict_probe.rs` at per-file granularity before
+`crates/nova-core/examples/dict_probe.rs` at per-file granularity before
 committing to any number here.
 
 This inverts the original framing in a useful way: **the dictionary is not a
@@ -916,7 +916,7 @@ maintenance.**
 1. New manifest section `dicts: Vec<DictRecord>` with
    `{ id: u32, hash: [u8;16], class: ClassId, len: u32, chunk: ChunkIdx }`.
    `id` is dense and assigned on append; `hash` is `blake3(content)[..16]`,
-   matching narc's existing convention and giving content-addressed identity as
+   matching nova's existing convention and giving content-addressed identity as
    RFC 9842 does.
 2. Dictionary bodies are stored as **ordinary chunks** in the append-only log —
    so they inherit crash-safety, integrity checking and the existing writer
@@ -975,11 +975,11 @@ maintenance.**
   but costs 351 KB stored and 3× the training time; make it `--dict-size`.
   Always verify the returned length (§2.4's collapse trap).
 - Granularity: **one dictionary per content class**, not one per archive —
-  measured 10.4% better and net-positive after storage (§2.8). narc's analyzer
+  measured 10.4% better and net-positive after storage (§2.8). nova's analyzer
   already produces a content class per file, and small files are already sorted
   by extension.
 
-### 6.3 The real lever — where narc is actually losing to 7-Zip
+### 6.3 The real lever — where nova is actually losing to 7-Zip
 
 This belongs in this report because it is the honest alternative to the
 dictionary, and it is worth far more.
@@ -998,18 +998,18 @@ MEASURED cost of fragmenting this corpus, LZMA2 `-9e`:
 recovers 50%; the best measured dictionary gain anywhere in this study was 16%.
 
 Now the arithmetic that does not add up. From the ROADMAP, on the full 114 MiB
-tree: narc max = 12 MiB, 7z `-mx9` = 8.8 MiB. This study measures 7z solid =
-5.684 MiB on the `<256 KiB` part, so 7z's remainder ≈ 3.1 MiB. If narc's
+tree: nova max = 12 MiB, 7z `-mx9` = 8.8 MiB. This study measures 7z solid =
+5.684 MiB on the `<256 KiB` part, so 7z's remainder ≈ 3.1 MiB. If nova's
 small-file part matched plain LZMA2 at 32 MiB blocks (5.812 MiB) and its
-remainder matched 7z (~3.1-3.5 MiB), narc would land at **~9.2-9.5 MiB**, not
+remainder matched 7z (~3.1-3.5 MiB), nova would land at **~9.2-9.5 MiB**, not
 12 MiB. **~2.5 MiB (≈ 25%) is unexplained by the block-size cap.**
 
 > **CORRECTED — the arithmetic above is wrong and the conclusion it reaches is
 > wrong. The verification pass ran the measurement this section asked for, and
 > the entire gap is in the BIG-file path, not the small-file/block path.**
 
-**MEASURED (verification pass), realized geometry from `narc info` on the
-max-tier archive of this corpus** (`test/diag.narc`, 5751 files, 11.9 MiB):
+**MEASURED (verification pass), realized geometry from `nova info` on the
+max-tier archive of this corpus** (`test/diag.nva`, 5751 files, 11.9 MiB):
 
 ```
 Solid blocks: 2 (min 22.5 MiB, median 64.0 MiB, max 64.0 MiB)
@@ -1020,32 +1020,32 @@ Blocks are **not** below the 32 MiB target — they sit at the `2 × target`
 hard flush (`archive.rs:1008`), i.e. 64 MiB. Candidate cause (1) below is
 refuted before it was tested.
 
-**MEASURED, LZMA2 `-9e`, split at narc's real max-tier cutoff of 1 MiB**
+**MEASURED, LZMA2 `-9e`, split at nova's real max-tier cutoff of 1 MiB**
 (`test/verify10.py`, `test/verify10b.py`):
 
 | set | configuration | size | vs solid |
 |---|---|---|---|
 | 5739 small files, 86.50 MiB | one solid stream | 6.531 MiB | — |
-| same | **2 blocks, narc's realized geometry** | **6.619 MiB** | **+1.3%** |
+| same | **2 blocks, nova's realized geometry** | **6.619 MiB** | **+1.3%** |
 | same | 3 blocks of ≤ 32 MiB | 6.829 MiB | +4.6% |
 | 12 big files, 26.91 MiB | one solid stream | 2.229 MiB | — |
-| same | **each file compressed alone (narc's path)** | **5.495 MiB** | **+146.5%** |
+| same | **each file compressed alone (nova's path)** | **5.495 MiB** | **+146.5%** |
 | same | 7z `-mx9` | 2.201 MiB | — |
 | whole corpus, 113.41 MiB | 7z `-mx9` | **8.705 MiB** | — |
 
 **The decomposition now closes exactly.** 6.619 + 5.495 = **12.11 MiB** against
-narc's actual **11.8 MiB live** — narc is slightly *better* than that floor
+nova's actual **11.8 MiB live** — nova is slightly *better* than that floor
 (dedup plus PPMd winning some units). 7-Zip's 8.705 MiB = the same small part
 (~6.5) plus a big part of only 2.2 MiB. **The gap is 5.495 − 2.229 = 3.27 MiB
 of lost cross-file redundancy among the 12 large files, versus a total gap of
 ~3.1 MiB.** The small-file path — the entire subject of this report — is within
 **1.3%** of its own solid ceiling and contributes essentially nothing to the gap.
 
-Why: the 12 files ≥ 1 MiB are 9 `.exe` builds of narc itself plus 3 generated
+Why: the 12 files ≥ 1 MiB are 9 `.exe` builds of nova itself plus 3 generated
 `.rs` tables. The `.exe`s are near-duplicates of one another. 7-Zip puts them in
-one solid stream with a 64 MiB window and collapses them; narc chunks each file
+one solid stream with a 64 MiB window and collapses them; nova chunks each file
 independently, and CDC dedup catches almost nothing because a recompile shifts
-bytes throughout. **Caveat: this corpus is narc's own `target/` directory, so
+bytes throughout. **Caveat: this corpus is nova's own `target/` directory, so
 the near-duplicate-binary effect is unusually strong here.** It is a real
 phenomenon in build trees and backups, but do not assume a 3.3 MiB prize on
 arbitrary data — re-measure on a corpus that is not our own build output.
@@ -1058,7 +1058,7 @@ Candidate causes as originally listed, with verdicts:
    next step in this whole area" has been run and it closed the question in the
    opposite direction.
 2. **The max-tier tournament picking PPMd.** Still open, and now the most
-   plausible remaining small lever: `narc info` shows **ppmd7 holding 3.0 MiB of
+   plausible remaining small lever: `nova info` shows **ppmd7 holding 3.0 MiB of
    11.8**. The tournament keeps the smaller *per unit*, so it cannot lose against
    its own alternatives — but confirm PPMd is not winning solid source blocks,
    where 7z PPMd measured 43% worse than LZMA2 (10.94% vs 7.66%).
@@ -1068,7 +1068,7 @@ Candidate causes as originally listed, with verdicts:
    for the extra window to reach. `codec.rs:95-98` already sets
    `dict_size = unpacked_len` (clamped to `[4 KiB, 64 MiB]`), always ≥ the unit.
    7-Zip's 64 MiB dictionary matters because its *stream* is the whole archive,
-   not because of a per-unit setting. Raising narc's per-unit `dict_size` would
+   not because of a per-unit setting. Raising nova's per-unit `dict_size` would
    only raise decoder memory.
 4. ~~**Per-extension grouping splitting blocks.**~~ **CORRECTED — does not
    happen.** `add_small_file` (`archive.rs:966-1012`) flushes only on the
@@ -1081,7 +1081,7 @@ files.** Options worth measuring, in cost order: group large files of the same
 content class into shared solid units the way small files already are; or raise
 the chunked path's effective window so consecutive similar files share history.
 Both trade directly against cheap edits — that is the real design tension in
-narc, and it is a *different* tension from the one this report set out to study.
+nova, and it is a *different* tension from the one this report set out to study.
 Neither dictionaries (≤5%, plus a format change, an immutability invariant and a
 `compact` hazard) nor small-file block geometry (1.3% and already spent) is the
 answer.
@@ -1093,7 +1093,7 @@ restic/borg/zstd-based systems handle this?"**
 
 They avoid the problem entirely (restic and borg use no dictionary; zstd pushes
 it out of band). Nobody solved it, because nobody with an immutable chunk store
-needed to. For narc the answer is the per-unit `dict_id` in §6.2: **the
+needed to. For nova the answer is the per-unit `dict_id` in §6.2: **the
 dictionary set only ever grows, and each unit permanently records which member
 it used.** Old chunks stay valid because their dictionary is never touched.
 
@@ -1122,7 +1122,7 @@ old chunk*, which:
 - turns `compact`'s "drop unreferenced chunks" into a correctness bug of the
   worst kind (the old file's data is logically deleted but physically required);
 - makes extraction of one file require decoding a chain of ancestors, breaking
-  narc's bounded-memory extraction invariant;
+  nova's bounded-memory extraction invariant;
 - grows that chain without bound over repeated edits.
 
 If it is ever attempted, it needs an explicit chain-depth cap and a pinning
@@ -1131,14 +1131,14 @@ mechanism in the reachability walk. Not for v0.3.
 ### 6.5 Recommended sequence
 
 1. ~~**Measure the realized solid-block size histogram.**~~ **DONE in the
-   verification pass** (`narc info` now reports it): 2 blocks, median 64.0 MiB —
+   verification pass** (`nova info` now reports it): 2 blocks, median 64.0 MiB —
    blocks sit at the `2 × target` cap, and realized geometry costs only +1.3%
    versus one solid stream (§6.3). This lever is spent.
 2. ~~Fix block geometry so realized blocks approach the 32 MiB target; consider
    raising the target.~~ **DROPPED — the premise was false** (they already exceed
    it) and the wording was wrong on three counts anyway: (a) edit cost is
    proportional to block size — editing one member rewrites its whole block, so a
-   larger target directly taxes narc's differentiator; (b) the "64 MiB is 2.3%
+   larger target directly taxes nova's differentiator; (b) the "64 MiB is 2.3%
    behind" figure came from the **zstd** sweep (`dict-B.log`), not the LZMA2
    sweep, which has no 64 MiB row; (c) `MAX_CHUNK = 32 MiB` is a format-level
    constant used for hostile-manifest plausibility checks *and* the memory model,
@@ -1147,10 +1147,10 @@ mechanism in the reachability walk. Not for v0.3.
    — measured at 3.27 MiB on this corpus, i.e. the entire 7-Zip gap (§6.3).
    Design it against the cheap-edit invariant from the start.
 3. Verify the max-tier tournament is not selecting PPMd for source-code blocks
-   (`narc info` shows ppmd7 holding 3.0 of 11.8 MiB).
+   (`nova info` shows ppmd7 holding 3.0 of 11.8 MiB).
 4. Add a **base64 detector + decoder filter** (§4.1): −28% on base64 payloads,
    self-contained, no format-compatibility risk beyond a new filter id, and it
-   fits narc's existing filter framework alongside BCJ and delta. **Scope it
+   fits nova's existing filter framework alongside BCJ and delta. **Scope it
    honestly first** — see the §4.1 correction: at the max tier every file
    < 1 MiB is inside a solid block that gets **one** plan for the whole block,
    so this filter can only fire on standalone units ≥ 1 MiB that are
@@ -1159,7 +1159,7 @@ mechanism in the reachability walk. Not for v0.3.
 5. Only then, and only if the edit workload justifies it, implement §6.2's
    dictionary support scoped to post-create appends — and first measure an
    **LZMA2** preset dictionary on per-file units with
-   `crates/narc-core/examples/dict_probe.rs`, because every positive per-file
+   `crates/nova-core/examples/dict_probe.rs`, because every positive per-file
    number in this report is zstd's and PPMd cannot use a dictionary at all
    (§2.1, §6.1 corrections).
 6. Do not implement: alphabet remapping, MTF, BWT, RLE, bijective base
@@ -1212,15 +1212,15 @@ Ordered by how much time a wrong lead would cost.
   REJECTED, not available.** liblzma's `preset_dict` "works correctly only with
   raw encoding and decoding"; no liblzma container can decode with one; `xz` has
   no CLI option; `.7z` has no field for it; CPython rejects the filter key
-  outright (verified). Only viable via raw LZMA2 — which narc can do because
-  `lzma-rust2` 0.19 supports it on both sides in narc's own container (§2.10).
+  outright (verified). Only viable via raw LZMA2 — which nova can do because
+  `lzma-rust2` 0.19 supports it on both sides in nova's own container (§2.10).
 - **The LZMA2 multi-threaded writer with a preset dictionary. REJECTED, silently
   drops it.** `enc/lzma2_writer_mt.rs:76` sets `preset_dict = None`.
 - **Dictionaries as a fix for the many-small-files gap vs 7-Zip. REJECTED,
-  wrong target.** Best dictionary gain measured anywhere: 16%, and 0.6% at narc's
+  wrong target.** Best dictionary gain measured anywhere: 16%, and 0.6% at nova's
   unit size.
 - **"The 7-Zip gap is the many-small-files path / small-file block geometry."
-  REFUTED BY MEASUREMENT (§6.3).** narc's realized solid blocks sit at the 64 MiB
+  REFUTED BY MEASUREMENT (§6.3).** nova's realized solid blocks sit at the 64 MiB
   hard cap, and that geometry costs **+1.3%** versus one solid stream — the
   small-file path is essentially optimal. The whole gap is the **large-file
   path**: 12 files ≥ 1 MiB cost 5.495 MiB compressed individually versus
@@ -1228,13 +1228,13 @@ Ordered by how much time a wrong lead would cost.
   The earlier "≈ 25% unexplained" figure came from a mismatched file-size split
   and was never a measurement. Two of the four original candidate causes
   (per-unit LZMA2 `dict_size`, extension-group flushing) are also disproven by
-  reading the code, and a third (block sizes below target) by `narc info`.
+  reading the code, and a third (block sizes below target) by `nova info`.
 - **`zstd --patch-from`-style chaining to an old file version for edits.
   REJECTED for v0.3.** Makes chunk decodability depend on a specific other
   chunk: breaks `compact`'s unreferenced-chunk pruning, breaks bounded-memory
   extraction, and grows unbounded chains over repeated edits (§6.4).
 - **Fear that dictionaries break dedup. REJECTED as a concern — it does not
-  apply.** narc hashes *uncompressed* bytes, so dedup and integrity are
+  apply.** nova hashes *uncompressed* bytes, so dedup and integrity are
   unaffected. The real hazard is immutability: a dictionary is decode-critical
   shared state with a huge blast radius, and `compact` will delete it unless the
   reachability walk is extended (§2.11).
@@ -1249,8 +1249,8 @@ Ordered by how much time a wrong lead would cost.
 - **Frequency remapping / alphabet reduction / symbol renumbering. REJECTED,
   measured zero.** ±0.0% for zstd on source text (§4.3). The literature agrees
   and quantifies the trend: +7.08 pp for zlib but +0.76 pp for zstd and
-  **−0.44 pp for PPMd** (§4.4) — negative for narc's strongest text codec.
-- **Word-level / BPE tokenization + frequency-ordered ids. REJECTED for narc.**
+  **−0.44 pp for PPMd** (§4.4) — negative for nova's strongest text codec.
+- **Word-level / BPE tokenization + frequency-ordered ids. REJECTED for nova.**
   Published gains are for zlib-class back-ends; tokenization *alone* is negative
   for zstd (−0.38 pp), LZMA (−0.26 pp) and PPMd (−1.64 pp). Also needs a
   language-specific vocabulary shipped and versioned (§4.4).
@@ -1281,7 +1281,7 @@ Ordered by how much time a wrong lead would cost.
   **no upstream source** (not in `zstd(1)`, checked twice — §2.3); the ~10× that
   is real comes from the README's ~10K near-duplicate 1 KB JSON API records, and
   for such data concatenation alone beats the dictionary (§2.3).
-- **Brotli as narc's main small-file codec. REJECTED (noted as an option).**
+- **Brotli as nova's main small-file codec. REJECTED (noted as an option).**
   Its free built-in 122 KiB dictionary is genuinely useful — −12.1% vs zstd-19
   per file — but that is only half of a trained dictionary's −22.2%, and brotli
   loses badly to LZMA2/PPMd on large units (§2.9).
@@ -1315,7 +1315,7 @@ Ordered by how much time a wrong lead would cost.
 - [Large Text Compression Benchmark](https://mattmahoney.net/dc/text.html) — enwik8 reference ratios
 - [Sequence Compression Benchmark](http://kirr.dyndns.org/sequence-compression-benchmark/) and [Kryukov et al.](https://www.biorxiv.org/content/10.1101/642553v1.full.pdf) — specialized vs general-purpose on FASTA
 
-**narc source read during this study**
+**nova source read during this study**
 - `lzma-rust2` 0.19: `src/enc/lzma2_writer.rs:31,227-228`; `src/enc/lzma2_writer_mt.rs:76`;
   `src/lzma2_reader.rs:95-97`; `src/lzma_reader.rs:98,166-182`; `src/lz/lz_encoder.rs:224,255-265`
 

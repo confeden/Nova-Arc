@@ -50,7 +50,7 @@ type OpResult = { op: string; ok: boolean; message: string; details: string[] };
 const IN_APP = "__TAURI_INTERNALS__" in window;
 
 const DEMO: ArchiveInfo = {
-  path: "D:/demo/пример.narc",
+  path: "D:/demo/пример.nva",
   generation: 3,
   files: 4,
   chunks: 7,
@@ -101,7 +101,7 @@ const state = {
   busy: false,
   menuTarget: "" as string,
   /** Last reading, and when it arrived. The clock lives here, not in the core:
-   *  narc-core reports on data movement, and speed/ETA/"nothing for a while"
+   *  nova-core reports on data movement, and speed/ETA/"nothing for a while"
    *  all need arrival times, which the webview knows for free. */
   prog: null as OpProgress | null,
   progAt: 0,
@@ -152,7 +152,7 @@ function iconKind(path: string): keyof typeof ICONS {
   if (/^(jpg|jpeg|png|gif|bmp|webp|heic|avif|tif|tiff|svg|dds|tga)$/.test(ext)) return "image";
   if (/^(mp3|flac|wav|ogg|m4a|aac|opus|mid)$/.test(ext)) return "audio";
   if (/^(mp4|mkv|avi|mov|webm|wmv|m4v)$/.test(ext)) return "video";
-  if (/^(zip|7z|rar|gz|xz|bz2|zst|narc|tar|cab|iso)$/.test(ext)) return "archive";
+  if (/^(zip|7z|rar|gz|xz|bz2|zst|nva|tar|cab|iso)$/.test(ext)) return "archive";
   if (/^(exe|dll|so|dylib|msi|sys|bin|elf)$/.test(ext)) return "exe";
   if (/^(pdf|doc|docx|odt|rtf|txt|md|log)$/.test(ext)) return "doc";
   if (/^(rs|c|h|hpp|cpp|py|js|ts|tsx|java|go|cs|rb|php|json|toml|yaml|yml|xml|html|css|sh|ps1|bat)$/.test(ext))
@@ -377,7 +377,7 @@ async function loadArchive(path: string) {
 async function pickArchiveToOpen() {
   const path = await openDialog({
     multiple: false,
-    filters: [{ name: "Архив Nova Arc", extensions: ["narc"] }],
+    filters: [{ name: "Архив Nova Prism", extensions: ["nva"] }],
   });
   if (typeof path === "string") await loadArchive(path);
 }
@@ -391,8 +391,8 @@ async function createArchive(inputs?: string[]) {
     inputs = Array.isArray(chosen) ? chosen : [chosen];
   }
   const target = await saveDialog({
-    defaultPath: "archive.narc",
-    filters: [{ name: "Архив Nova Arc", extensions: ["narc"] }],
+    defaultPath: "archive.nva",
+    filters: [{ name: "Архив Nova Prism", extensions: ["nva"] }],
   });
   if (!target) return;
   const o = packOpts();
@@ -538,7 +538,7 @@ el.menu.addEventListener("click", async (ev) => {
 void getCurrentWebview().onDragDropEvent(async (event) => {
   if (event.payload.type !== "drop" || state.busy) return;
   const paths = event.payload.paths;
-  if (paths.length === 1 && paths[0].toLowerCase().endsWith(".narc")) {
+  if (paths.length === 1 && paths[0].toLowerCase().endsWith(".nva")) {
     await loadArchive(paths[0]);
   } else if (state.archive) {
     await addToArchive(paths);
@@ -547,7 +547,7 @@ void getCurrentWebview().onDragDropEvent(async (event) => {
   }
 });
 
-void listen<OpProgress>("narc://progress", (ev) => {
+void listen<OpProgress>("nova://progress", (ev) => {
   const p = ev.payload;
   const now = performance.now();
   // Events arrive up to ~20 times a second and must not each drag three DOM
@@ -565,7 +565,7 @@ void listen<OpProgress>("narc://progress", (ev) => {
   state.progAt = now;
 });
 
-void listen<OpResult>("narc://done", async (ev) => {
+void listen<OpResult>("nova://done", async (ev) => {
   const r = ev.payload;
   setBusy(false);
   // setBusy hides the track; on success bring it back full for a moment. The
@@ -589,7 +589,7 @@ void (async () => {
   const m = await invoke<{ cores: number; memory_total: number | null; budget: number }>("machine_info");
   el.machine.textContent = `${m.cores} потоков · бюджет памяти ${human(m.budget)}`;
   refreshButtons();
-  // Opened with a path argument (double-click a .narc, or the shell
+  // Opened with a path argument (double-click a .nva, or the shell
   // association)? Pull it now that listeners and state are ready.
   try {
     const startup = IN_APP ? await invoke<string | null>("startup_archive") : DEMO.path;

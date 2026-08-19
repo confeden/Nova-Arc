@@ -1,7 +1,7 @@
 # 16 — Frontier: structure-aware and learned transforms
 
 **Question.** What does the 2026 frontier of "teach the compressor what the data
-IS" offer Nova Arc that we are not using? Which parts ship, which parts are
+IS" offer Nova Prism that we are not using? Which parts ship, which parts are
 research demos?
 
 **Method.** Primary sources (arXiv / USENIX / ACM / IEEE with dates), the Large
@@ -16,22 +16,22 @@ labelled **MEASURED (earlier session)** come from `test/dict-*.log` and
 
 ---
 
-## 0. Bottom line, ranked by expected gain for narc
+## 0. Bottom line, ranked by expected gain for nova
 
 > **[REVIEW 2026-08-17] Three of the four `ship-now` rows did not survive
 > verification.** Every filter number in this report was measured against
-> **LZMA2 alone**, but narc's max tier runs a *tournament* (LZMA2 vs PPMd7
+> **LZMA2 alone**, but nova's max tier runs a *tournament* (LZMA2 vs PPMd7
 > order 10 vs order 16) and keeps the smallest. Re-measured through the real
-> tournament in narc's own codec settings (`test/skeptic/`), **PPMd7 wins both
+> tournament in nova's own codec settings (`test/skeptic/`), **PPMd7 wins both
 > files the transpose filter was supposed to help, by 13–14 %**, and the
 > transpose makes the tournament result *worse*. See §1.2b. The dictionary row
 > is not new work and is superseded by research 15 §1.4b, which measured the
 > real `preset_dict` API rather than a proxy. Corrected rows below.
 
-| # | Idea | Expected gain in narc | Effort | Verdict |
+| # | Idea | Expected gain in nova | Effort | Verdict |
 |---|------|----------------------|--------|---------|
 | 1 | Transpose (byte-shuffle) filter + make the existing `Delta` filter selectable, chosen by a gated two-stage trial | ~~−1.1 % of total archive~~ → **REFUTED: −0.006 % with a correct selector, +0.6 % with the selector this report specifies** (§1.2b) | S | ~~ship-now~~ → **reject** (transpose); **prototype** (delta only, and only if the selector trials all three codecs) |
-| 2 | In-archive shared preset dictionary for LZMA2 (`lzma-rust2` already supports it; narc passes `None`) | ~~−5.3 % on 32 MiB solid blocks~~ → **gross −5.25 %, net +0.51 % once the dictionary's own 351 KB is charged** (§6.2b) | M | ~~ship-now~~ → **reject** as specified; the in-archive *unit-as-dictionary* form is research 15's, already measured |
+| 2 | In-archive shared preset dictionary for LZMA2 (`lzma-rust2` already supports it; nova passes `None`) | ~~−5.3 % on 32 MiB solid blocks~~ → **gross −5.25 %, net +0.51 % once the dictionary's own 351 KB is charged** (§6.2b) | M | ~~ship-now~~ → **reject** as specified; the in-archive *unit-as-dictionary* form is research 15's, already measured |
 | 3 | Two-stage filter/codec selector: cheap order-1-entropy shortlist → trial-compress the shortlist | ~~0 regret on 11/11~~ → **+5.26 % regret on `x-ray`** as specified; 0 regret only if the trial runs the **whole tournament** (§4.2b) | S | ~~ship-now~~ → **prototype** |
 | 4 | ARM64 BCJ filter (we only have x86) | +4.4 % measured on a linked ARM64 binary (external); ~0 on `.o`/`.a`/`.ko` | **XS — already implemented in `lzma-rust2` 0.19, no porting** | **ship-now** (the one survivor) |
 | 5 | base64/hex representation undo | −25 % on base64-wrapped binaries (PEM, MIME, data-URIs, `.ipynb`) | M | **prototype** |
@@ -100,8 +100,8 @@ License: BSD-3. Language: C11/C++17. Rust bindings exist but are embryonic:
 `openzl-sys` 0.1.2+openzl.0.1.0 (LDeakin, ~858 downloads) and the higher-level
 `rust-openzl` (vitorpy).
 
-**Verdict for narc: watch, do not embed.** Putting a pre-1.0, explicitly
-unstable wire format inside `.narc` would violate the one thing an archiver
+**Verdict for nova: watch, do not embed.** Putting a pre-1.0, explicitly
+unstable wire format inside `.nva` would violate the one thing an archiver
 must guarantee — that an archive written today opens in ten years. What we
 *should* take from OpenZL is its transform library, which is where §1.2 comes
 from.
@@ -110,7 +110,7 @@ from.
 
 OpenZL's heavy machinery is out of reach, but its two cheapest transforms
 (transpose = byte-shuffle, and delta at a detected stride) are ~30 lines of
-Rust each and fit narc's existing per-chunk filter byte exactly.
+Rust each and fit nova's existing per-chunk filter byte exactly.
 
 I swept both over Silesia's structured files, 4 MiB slices, `zstd ‑19` and
 `LZMA2 preset 6` (`test/struct-exp/stride.py`). Percentages are change in
@@ -138,7 +138,7 @@ Whole-file confirmation at `LZMA2 preset 9`:
 | `sao` | 7 251 944 | 4 415 011 | none | 4 415 011 | 0 |
 | `osdb` | 10 085 684 | 2 849 848 | none | 2 849 848 | 0 |
 
-**Effect on a real narc archive: −0.52 MiB on the 47 MiB Silesia archive =
+**Effect on a real nova archive: −0.52 MiB on the 47 MiB Silesia archive =
 −1.12 % of total size, for a selector costing ~11 ms/MiB.** That is a bigger
 ratio win than most of the codec tuning left on the table, and it is nearly
 free.
@@ -148,14 +148,14 @@ free.
 > correctly; the inference from "LZMA2 gets smaller" to "the archive gets
 > smaller" does not hold.
 
-### 1.2b [REVIEW] MEASURED through narc's actual tournament — the gain is not there
+### 1.2b [REVIEW] MEASURED through nova's actual tournament — the gain is not there
 
-The measurements above use LZMA2 as the back end. narc's max tier does not: for
+The measurements above use LZMA2 as the back end. nova's max tier does not: for
 every unit it runs `Tier::candidates()` = **LZMA2 + PPMd7 order 10 + PPMd7
 order 16** and keeps the smallest (`analyze.rs:73-84`). Nothing in this report
 checked which one wins the files it recommends filtering.
 
-Re-measured with narc's exact settings — LZMA2 preset 6 with `nice_len 273` and
+Re-measured with nova's exact settings — LZMA2 preset 6 with `nice_len 273` and
 `dict = unit len` (`codec.rs:118-136`), PPMd7 orders 10/16 with pool `32 ×
 len` capped at 256 MiB (`codec.rs:190`) — on 2026‑08‑17, code in
 `test/skeptic/`:
@@ -167,7 +167,7 @@ len` capped at 256 MiB (`codec.rs:190`) — on 2026‑08‑17, code in
 | `x-ray` | 4 483 867 | **3 850 778** (−14.1 % vs LZMA2) | 3 850 778 | 4 053 512 **+5.26 %** | 3 999 427 **+3.86 %** |
 | `mr` | 2 751 293 | **2 317 181** (−15.8 % vs LZMA2) | 2 317 181 | 2 409 835 **+4.00 %** | 2 314 138 **−0.13 %** |
 
-**First 4 MiB (narc's average max-tier chunk), same conclusion:**
+**First 4 MiB (nova's average max-tier chunk), same conclusion:**
 
 | File | tournament baseline (winner) | + transpose | + delta |
 |---|---|---|---|
@@ -191,7 +191,7 @@ len` capped at 256 MiB (`codec.rs:190`) — on 2026‑08‑17, code in
    tournament is worth −3 043 B on the entire 47 MiB archive (−0.006 %).** The
    only positive cell left is `delta 2` on `mr`, and it is 0.13 % — noise.
 
-The transpose filter is therefore **reject for narc as it stands**. It becomes
+The transpose filter is therefore **reject for nova as it stands**. It becomes
 interesting again only in a configuration where LZMA2 is the sole back end
 (the fast/normal tiers, where filters are not currently selected at all and the
 codec is zstd), or if a future tier drops PPMd7.
@@ -213,7 +213,7 @@ codec is zstd), or if a future tier drops PPMd7.
    text (`dickens`, `webster`), markup (`xml`), tarballs (`samba`), record text
    (`nci`) and database dumps (`osdb`) all reject both transforms.
 
-**Implementation note.** narc's `Filter` enum already has `Delta(1..=32)` with
+**Implementation note.** nova's `Filter` enum already has `Delta(1..=32)` with
 ids 2..=33, round-trip tests, and format documentation — **but
 `analyze::plan()` never returns it.** Grep confirms the only filters the
 analyzer can emit are `None` and `BcjX86`. So the delta filter is currently
@@ -264,11 +264,11 @@ decide.** See §4.2 for the selector that works.
 | **TDT** (arXiv:2506.18062, 2025‑06‑22) | typed data transformation, groups related bytes | geomean **1.16×** ratio over zstd, 1.18–3.79× throughput |
 | **Blosc bitshuffle** | bit-level rather than byte-level shuffle | 1.4–2.4× ratio over plain shuffle on numeric data at 2–4× filter cost; AVX‑512 in c-blosc2 2.11 recovered ~20 % of the speed |
 
-**Reading for narc.** The literature's general-purpose recommendation is
+**Reading for nova.** The literature's general-purpose recommendation is
 literally "bitshuffle then zstd" — i.e. §1.2's transpose filter, one level
 finer. Two cautions: bitshuffle's advantage over byte shuffle shrinks or
 reverses at high zstd levels (Blosc's own guidance says test bytedelta or plain
-shuffle for ZSTD at high clevels), and narc's max tier runs LZMA2/PPMd7 where
+shuffle for ZSTD at high clevels), and nova's max tier runs LZMA2/PPMd7 where
 §1.2 already shows transposition sometimes flips sign. So: **byte transpose
 first, bitshuffle only as a second candidate in the same tournament.**
 
@@ -296,13 +296,13 @@ honest caveat from the FSST literature itself: FSST-style compressors *lose on
 pure ratio* to block compressors, because block compressors exploit redundancy
 across larger byte ranges; they trade ratio for random access.
 
-There is also a Rust proof-of-concept in exactly narc's shape:
+There is also a Rust proof-of-concept in exactly nova's shape:
 **DataCortex** — schema inference + columnar reorganisation + typed encoding for
 JSON/NDJSON, claiming 2–3× over zstd on structured data and byte-exact
 round-trips, citing ALP/FSST/BtrBlocks/CLP. Unvetted, but it is direct evidence
 the approach is implementable in Rust.
 
-**Verdict.** The random-access motivation does not apply to us — narc decodes a
+**Verdict.** The random-access motivation does not apply to us — nova decodes a
 whole 4–32 MiB unit anyway. So the columnar literature's ratio wins mostly come
 from the *encodings* (delta, transpose, bitpack, dictionary), which §1.2 covers,
 not from the columnar layout per se. Full per-field splitting for arbitrary
@@ -314,7 +314,7 @@ files is the OpenZL/SDDL project: **watch**.
 existing model of "many small transforms, auto-selected per block" in a
 general-purpose compressor. Its transform set is worth reading as a menu:
 
-| Transform | What it does | Relevance to narc |
+| Transform | What it does | Relevance to nova |
 |---|---|---|
 | **EXE** | relative→absolute jump addresses, **x86 *and* ARM64** | We only have x86. Direct gap. |
 | **FSD** ("MM") | "decorrelate values separated by a constant distance (step) and encode residuals" — fixed-step delta with detected stride | Exactly §1.2's delta, already shipping elsewhere |
@@ -391,22 +391,22 @@ at 9.4 ns/byte ≈ 106 MB/s, 2× faster than xz's 20 ns/byte**. That is a genuin
 attractive asymmetric point for an archiver, which decompresses many times and
 compresses once.
 
-### 2.2 Why it is still a reject for narc
+### 2.2 Why it is still a reject for nova
 
 Three independent killers:
 
 1. **Compression speed: 11 771 ns/byte ≈ 85 KB/s.** enwik9 takes ~3.3 hours.
-   narc's whole max tier does Silesia in 6.8 s. Even accepting a slow max tier,
+   nova's whole max tier does Silesia in 6.8 s. Even accepting a slow max tier,
    85 KB/s is two to three orders of magnitude off.
 2. **Memory: 15 331 MB for a 1 GB input (~15× input).** Re-Pair's classic
    figure is ~5× input for linear time, and one comparison measured a real
    implementation at ~30×n bytes; the best practical low-space variant (Bille,
    Gørtz & Prezza, arXiv:1704.08558) gets to about (1.5+ε)n *words* including
-   the text. Even at 5× input, narc's 16 MiB unit needs 80 MB per worker.
+   the text. Even at 5× input, nova's 16 MiB unit needs 80 MB per worker.
 3. **The gain comes from the window, and our architecture removes the window.**
    The DCC 2016 paper deliberately benchmarks against a *large-window* LZMA
    variant so that memory limits do not distort the enwik9 comparison — the
-   whole point is that GLZA exploits redundancy across the entire 1 GB. narc's
+   whole point is that GLZA exploits redundancy across the entire 1 GB. nova's
    compression unit is capped at 16 MiB (32 MiB solid blocks). This is the
    **identical mechanism** that already killed LZMA2 as our universal text
    codec (ROADMAP negative knowledge: "its edge comes from >4 MiB dictionaries,
@@ -431,7 +431,7 @@ same ratio band at vastly better compression cost.
 
 **Side note worth a separate look (not this topic).** libbsc's row above is the
 interesting accident of this table: **163.9 MB vs ppmd J1's 184.0 MB — 11 %
-better than PPMd var J at 43 MB/s.** narc currently routes text to PPMd7. This
+better than PPMd var J at 43 MB/s.** nova currently routes text to PPMd7. This
 is a 1 GB-block number and will not transfer directly to 32 MiB units (BWT's
 advantage also grows with block size), so it is unverified for us — but it
 belongs in research 01's queue.
@@ -456,7 +456,7 @@ padding and table ordering when reconstructing `glyf`, so the output is
 functionally identical and a few bytes different. WOFF 1.0 round-trips exactly;
 WOFF2 does not.
 
-For narc this means: usable only if we also store the housekeeping diff
+For nova this means: usable only if we also store the housekeeping diff
 (padding bytes, original table order, checksum adjustments). That is doable but
 it is a font-format-specific project for a file type that is a rounding error
 in a general archive. **Reject on priority, not on principle.**
@@ -489,7 +489,7 @@ original size, with bit-exact restoration guaranteed (unlike a
 `pdftk uncompress`/recompress round-trip, which cannot be restored losslessly).
 
 **Verdict: prototype, and hand it to research 02.** The licensing and
-`forbid(unsafe_code)` alignment with `narc-core` is unusually good.
+`forbid(unsafe_code)` alignment with `nova-core` is unusually good.
 
 ### 3.3 XML / JSON: EXI, CBOR, and structural compressors
 
@@ -507,7 +507,7 @@ The structural-JSON family (JSON BinPack, DataCortex, PIDS, JSON Tiles/JSONB)
 has the same problem in a different costume: the wins come from discarding
 key order, whitespace and number formatting.
 
-Where this *does* apply is `narc`-external: **CLP** (OSDI 2021) reaches an
+Where this *does* apply is `nova`-external: **CLP** (OSDI 2021) reaches an
 average **32:1 on text logs vs 16:1 for gzip** (43:1 on Hadoop logs), and
 **LogGrep** (EuroSys 2023) is a further **2.14× average over CLP** at **0.10×
 gzip's compression speed**. **LogShrink** (ICSE 2024) reports 4.57× average over
@@ -516,7 +516,7 @@ ratios are not byte-exact-archiver ratios; also a documented instability —
 LogShrink's ratio on HealthApp swings from 13 to 65, and 13 is *worse* than a
 general-purpose compressor.
 
-**Verdict: reject for `.narc`.** The only byte-exact-safe idea in this family is
+**Verdict: reject for `.nva`.** The only byte-exact-safe idea in this family is
 "split a text file into streams at detected delimiters", which is a much weaker
 transform than any of the above and is well covered by §1.2's measurement that
 `nci` and `xml` want no filter.
@@ -562,7 +562,7 @@ path, with the caveat that PPMd7 (our text codec) already models words, so the
   MiDedup; BED) is about registry-side dedup, and its central finding is a
   warning for us: **gzip-compressed files have very low deduplication ratios**,
   so dedup must operate on decompressed content — and naive fine-grained dedup
-  causes up to **8× restore I/O slowdowns**. narc already stores `.tar.gz`
+  causes up to **8× restore I/O slowdowns**. nova already stores `.tar.gz`
   layers as opaque blobs; making layers dedup-able means decompressing them,
   which is research 02's recompression pipeline again. **Reject as a separate
   idea; it is a downstream benefit of gzip recompression.**
@@ -571,7 +571,7 @@ path, with the caveat that PPMd7 (our text codec) already models words, so the
 
 ## 4. Learned / AI-assisted transform selection
 
-This is narc's `analyze.rs` question: can a model beat magic-bytes + trial
+This is nova's `analyze.rs` question: can a model beat magic-bytes + trial
 compression?
 
 ### 4.1 What the literature actually says
@@ -657,7 +657,7 @@ Four design rules fall out of this:
    +42 % on `nci`.
 4. **This is measured in NumPy Python.** A Rust implementation of `H1`
    (one 256×256 bincount) and the transforms will be several times faster;
-   11 ms/MiB → ~2–4 ms/MiB, i.e. under 1 s over Silesia against narc's current
+   11 ms/MiB → ~2–4 ms/MiB, i.e. under 1 s over Silesia against nova's current
    6.8 s. Gate it to the max tier if even that is too much.
 
 ### 4.2b [REVIEW] The "0 regret" claim, corrected
@@ -670,7 +670,7 @@ would have chosen PPMd7 on the *unfiltered* bytes. Measured regret is
 **+5.26 %** on that file (§1.2b), not 0.
 
 The ground truth in the table above is `LZMA2 preset 6 on the full unit`. That
-is the oracle *for LZMA2*, not the oracle for narc, so the whole row "0 regret
+is the oracle *for LZMA2*, not the oracle for nova, so the whole row "0 regret
 vs oracle on 11/11" measures agreement with the wrong reference.
 
 A correct selector must score each candidate transform through **all three
@@ -694,7 +694,7 @@ prediction). For error-bounded lossy scientific compression there is a real
 black-box estimator (SVD truncation + quantised entropy in a linear model),
 robust across compressors.
 
-narc already does the useful version of this: `analyze::compresses()` runs
+nova already does the useful version of this: `analyze::compresses()` runs
 `zstd level 1` on a 64 KiB sample and stores raw below 3 % savings. **That is
 the right design and the literature does not offer better.** The refinement
 worth making is not a better estimator — it is extending the *same* probe to
@@ -745,7 +745,7 @@ The rest of the family confirms the picture — all the recent work buys
 | SeqCDC (Middleware 2024) | 1.5–3.1× chunking throughput, "similar space savings"; throughput *increases* with chunk size | speed |
 | VectorCDC (FAST 2025) | 15× over unaccelerated, 1.2–1.35× over other vectorised CDC | speed |
 
-**Verdict: reject, unambiguously.** narc's chunker is not the bottleneck by
+**Verdict: reject, unambiguously.** nova's chunker is not the bottleneck by
 three orders of magnitude. FastCDC runs at ~1–2 GB/s; our max-tier codecs run at
 single-digit MB/s. Every published advance here trades implementation
 complexity for throughput we do not need, and the independent survey says none
@@ -764,7 +764,7 @@ This *is* where the ratio is, and it is a mature line of work:
 | **Palantir** | ASPLOS 2024 | hierarchical detection: **+27.4 % similarity coverage** over N-transform and Odess, +95.8 % over Finesse, ≤7.7 % throughput penalty, false-positive filter worth up to +6.4 % ratio |
 | **Argus** | ACM ToS 2025 | bin-wise partitioning: up to **2.29× higher delta ratio** than Finesse/Odess/N-transform, 1.18× faster feature generation than Odess |
 
-**Verdict: watch, prototype at best — because it collides with two narc
+**Verdict: watch, prototype at best — because it collides with two nova
 invariants.**
 
 - **Bounded extraction memory / self-contained chunks.** Today a chunk is
@@ -802,7 +802,7 @@ The evidence against an external corpus the decompressor must also hold:
   **not** change monotonically as the dictionary is pruned.
 - **Large dictionaries have their own costs:** more expensive lookups, and every
   reference into a big dictionary costs more bits, which can erase the gain.
-- **It breaks the one property an archive must have.** A `.narc` that needs an
+- **It breaks the one property an archive must have.** A `.nva` that needs an
   external 500 MB corpus is not an archive; it is half of a backup.
 
 The modern web version does work (Compression Dictionary Transport, shared
@@ -819,7 +819,7 @@ dictionary generation can be appended for later units without touching old ones.
 
 **Three facts make this a `ship-now`:**
 
-1. **The plumbing already exists.** narc depends on `lzma-rust2` 0.19, which
+1. **The plumbing already exists.** nova depends on `lzma-rust2` 0.19, which
    supports preset dictionaries on **both** sides:
    `Lzma2Options.lzma_options.preset_dict: Option<Vec<u8>>` on the encoder and
    `Lzma2Reader::new(inner, dict_size, preset_dict: Option<&[u8]>)` on the
@@ -925,7 +925,7 @@ Three problems, in ascending order of seriousness.
    one regime where a stored dictionary *is* strong and this report never
    mentions: **units created by `add` after the archive exists** — the
    per-file regime, hold-out gain −20.8 % (110 KiB dict) / −30.8 % (1 MiB
-   dict). That is narc's differentiator and it is the case worth building.
+   dict). That is nova's differentiator and it is the case worth building.
 
 **Corrected verdict: reject the "train a dictionary and store it in the
 archive" design. The live questions are (a) unit geometry and (b) priming from
@@ -949,7 +949,7 @@ arguably duplicated.
 
 ### 6.3 Related: file ordering inside solid blocks
 
-Adjacent, cheap, and currently unexamined. narc sorts small files **by
+Adjacent, cheap, and currently unexamined. nova sorts small files **by
 extension** before packing them into solid blocks. The one published
 measurement I found argues that is not obviously right: on an LLVM source
 snapshot, **plain lexical path order gave the best result, beating sort-by-size
@@ -960,7 +960,7 @@ The MinHash-clustering idea has strong support only in genomics, where
 sketch-distance clustering plus reference-based compression gives 20–30 % on
 NCBI / 1000 Genomes sets. Górny's data suggests the effect is largest where path
 order does *not* correlate with content — hash-named blobs, flat document dumps,
-container layers — and smallest on source trees, which is narc's main
+container layers — and smallest on source trees, which is nova's main
 many-small-files case.
 
 **Verdict: prototype.** It is a comparison of three sort keys on an existing
@@ -971,7 +971,7 @@ costs an afternoon and might silently be worth a percent.
 
 ## 7. Negative knowledge (tested/published and disproven — do not retry)
 
-1. **Grammar compression (GLZA / Re-Pair / Sequitur) in narc.** GLZA is 18 %
+1. **Grammar compression (GLZA / Re-Pair / Sequitur) in nova.** GLZA is 18 %
    below xz on enwik9 but needs 85 KB/s compression and 15.3 GB for a 1 GB
    input, and its edge comes from a 1 GB window that our 16 MiB units delete —
    the same mechanism that already disqualified LZMA2 as our text codec.
@@ -1010,7 +1010,7 @@ costs an afternoon and might silently be worth a percent.
     LinkedIn measured ~7 h per dictionary regeneration and named versioning as
     a blocker; and the win is available in-archive without giving up
     self-containment.
-12. **Embedding OpenZL's wire format in `.narc`.** No 1.0; README states the
+12. **Embedding OpenZL's wire format in `.nva`.** No 1.0; README states the
     compressed format is subject to change; `dev` branch offers no guarantees.
     *(Verified 2026‑08‑17: latest release is **v0.2.0, 2026‑05‑07**; the README
     promises release-tagged frames stay decompressible "for at least the next
@@ -1018,7 +1018,7 @@ costs an afternoon and might silently be worth a percent.
 
 **Added by the review pass (all MEASURED 2026‑08‑17, `test/skeptic/`):**
 
-13. **Byte-transpose as a pre-filter anywhere in narc's max tier.** PPMd7
+13. **Byte-transpose as a pre-filter anywhere in nova's max tier.** PPMd7
     beats LZMA2 by 13–16 % on exactly the fixed-width numeric files transpose
     targets (`x-ray`, `mr`), and transposing then costs +4.0…+5.3 % of the
     tournament result. The whole win reported in §1.2 is a win against a codec
@@ -1030,7 +1030,7 @@ costs an afternoon and might silently be worth a percent.
     bigger once PPMd7 is in the candidate set. Any future filter probe must
     score `filter × codec` jointly.
 15. **LZMA2 `lc`/`lp`/`pb` tuning as a free ratio knob on general data.**
-    `lzma-rust2` exposes all three and narc could carry them in the per-chunk
+    `lzma-rust2` exposes all three and nova could carry them in the per-chunk
     `param` byte, which LZMA2 currently ignores — so this costs *no* format
     change. Measured over `{lc0lp1pb1, lc2lp1pb1, lc3lp0pb0, lc0lp0pb1,
     lc4lp0pb0}` on 4 MiB of `x-ray`/`mr`/`sao`/`osdb`/`ooffice`: best case
@@ -1070,7 +1070,7 @@ Verify byte-identical round-trip the way BcjX86 was verified against liblzma.
 
 > **[REVIEW] Cheaper than stated, and with two caveats this report omits.**
 > Nothing needs porting from Kanzi or liblzma: **`lzma-rust2` 0.19 — already a
-> narc dependency — ships `arm`, `arm64`, `riscv`, `ppc`, `sparc` and `ia64`
+> nova dependency — ships `arm`, `arm64`, `riscv`, `ppc`, `sparc` and `ia64`
 > BCJ filters** (`src/filter/bcj/{arm,riscv,ppc,sparc,ia64}.rs`, exposed as
 > `BcjWriter::new_arm64` / `new_riscv` / …, Apache-2.0, last release
 > 2026‑08‑16). The work is filter ids + machine-type detection + round-trip
@@ -1078,7 +1078,7 @@ Verify byte-identical round-trip the way BcjX86 was verified against liblzma.
 > code is worse than no filter** (measured on `barebox.bin`: unfiltered 84.7
 > KiB, `--arm` 85.5 KiB, `--arm64` 81.0 KiB — so misdetection is a regression,
 > not a no-op); (b) gains on **unlinked `.o` / `.a` / `.ko`** are much smaller
-> because address fields hold filler — relevant, since narc's small-file corpus
+> because address fields hold filler — relevant, since nova's small-file corpus
 > is a source tree. The +4.4 % figure is *linked binaries only*.
 
 **Step 3 — In-archive shared preset dictionary for LZMA2 (ship, biggest ratio lever).**
@@ -1127,17 +1127,17 @@ and ELF at `-mx9`. BCJ2 does not rewrite operands in place — it *splits* the
 call/jump targets into separate streams and compresses each with its own
 context, which is precisely the "per-field typed splitting" this report calls
 XL-effort and unreachable (§1.5, §8 of the verdict table) while a shipping
-implementation of it for machine code sits in 7-Zip and in narc's own crate's
+implementation of it for machine code sits in 7-Zip and in nova's own crate's
 decoder. It is also a plausible part of the unexplained gap on `mozilla` and
-`ooffice`, where 7-Zip uses BCJ2 and narc uses BCJ1.
+`ooffice`, where 7-Zip uses BCJ2 and nova uses BCJ1.
 
-Honest cost: BCJ2 emits **four streams**, which does not fit narc's
+Honest cost: BCJ2 emits **four streams**, which does not fit nova's
 one-chunk-one-payload record without a length-prefixed sub-container, and
 `lzma-rust2` has no BCJ2 *encoder*. So it is a prototype, not a ship-now — but
 it belongs in the table and it is a better use of the "structure-aware binary"
 budget than a transpose filter.
 
-### 8b.2 The report never ran narc
+### 8b.2 The report never ran nova
 
 Every number in it comes from Python (`test/struct-exp/*.py`), from `xz`, or
 from logs produced by other proxies. The repository has `test/bench.sh` and
@@ -1168,12 +1168,12 @@ STARLIT (Margaritov, 2021) reorders enwik9's articles to maximise mutual
 information between neighbours before cmix, and every subsequent winner carries
 it — fx2-cmix (accepted 2024‑10‑08, 110 351 665 B) and cmix-lex (announced
 2026‑06‑26, 109 190 109 B) both list *improved article sorting* as a source of
-gain. The stated mechanism transfers directly to narc: model state is finite,
+gain. The stated mechanism transfers directly to nova: model state is finite,
 so putting similar members near each other lets shared context be reused
 **before it is evicted** — which is exactly what a 32 MiB solid block fed to
 PPMd7's bounded pool does. That raises §6.3 from "might be worth a percent" to
 "the mechanism is proven at the top of the field"; it does not make it
-ship-now, because narc's members are source files, not encyclopaedia articles.
+ship-now, because nova's members are source files, not encyclopaedia articles.
 
 ### 8b.5 base64 undo has two shipping reference implementations
 
@@ -1185,10 +1185,10 @@ paq8px's is the one to read before writing ours.
 ### 8b.6 One number in the report is worth more than the report thinks
 
 The LWN/OpenZL table gives LZMA ‑9 on `sao` a ratio of 1.64×. Independently, on
-this machine, narc's own LZMA2 settings give 4 194 304 → 2 562 214 on the first
+this machine, nova's own LZMA2 settings give 4 194 304 → 2 562 214 on the first
 4 MiB of `sao` = **1.637×**. The external benchmark and our codec agree to three
 digits, which means **OpenZL's 2.06× on that file is a real, calibrated ~20 %
-gap against narc on record-structured numeric data**, not a marketing figure —
+gap against nova on record-structured numeric data**, not a marketing figure —
 and §1.2b proves a transpose filter cannot close it. That is the honest case for
 keeping OpenZL on "watch" and for treating typed field splitting (§1.5) as the
 only known route to it.
@@ -1255,7 +1255,7 @@ only known route to it.
 **Local measurements**
 - `test/struct-exp/stride.py`, `test/struct-exp/proxy.py` — this report
 - `test/dict-A.log` … `test/dict-T.log`, `test/alpha.log` — earlier session
-- `test/skeptic/` — **review pass, 2026‑08‑17**: narc's real max-tier
+- `test/skeptic/` — **review pass, 2026‑08‑17**: nova's real max-tier
   tournament (LZMA2 preset 6 + `nice_len 273` vs PPMd7 o10/o16, pool 32×len)
   with and without transpose/delta, whole-file and 4 MiB units (§1.2b, §4.2b)
 

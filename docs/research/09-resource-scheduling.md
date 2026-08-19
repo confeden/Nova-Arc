@@ -1,10 +1,10 @@
 # Research 09 — Resource scheduling: all cores, zero lag, bounded memory (Windows-first)
 
-*Nova Arc research report, 2026-08-16. All API semantics, pitfalls and product behaviors below were
+*Nova Prism research report, 2026-08-16. All API semantics, pitfalls and product behaviors below were
 verified against live sources (Microsoft Learn, MS DevBlogs, 7-Zip/WinRAR docs & changelogs,
 crates.io/lib.rs, community measurement reports) — links inline and in §12.*
 
-Scope: how narc v1 saturates every core while Windows stays responsive, and how its memory stays
+Scope: how nova v1 saturates every core while Windows stays responsive, and how its memory stays
 bounded and configurable. Concludes with an exact scheduling+memory policy (§11) with Windows API
 calls (all present in `windows-sys`) and default numbers.
 
@@ -30,7 +30,7 @@ calls (all present in `windows-sys`) and default numbers.
   measured at 1–3 % of disk when anything else is active — the archiver would starve itself).
 - **Memory bound = self-imposed budget, not OS working-set caps.** Job-object *commit* limit is a
   fine crash-guardrail; working-set caps just convert your RAM use into page-file I/O storms.
-  Because .narc compresses independent CDC chunks ≤ 4 MiB, extraction memory is *structurally*
+  Because .nva compresses independent CDC chunks ≤ 4 MiB, extraction memory is *structurally*
   bounded (~12 MiB per worker + queues) — a real differentiator vs. RAR 64 GiB dictionaries and
   LZMA2 256 MiB defaults which need dictionary-sized RAM to extract.
 - **Defaults:** threads = `available_parallelism()` (all logical cores); compression budget =
@@ -46,14 +46,14 @@ calls (all present in `windows-sys`) and default numbers.
 
 ### 2.1 Priority classes (verified against MS Learn "Scheduling Priorities" / `SetPriorityClass`)
 
-| Class | Base | Behavior for narc |
+| Class | Base | Behavior for nova |
 |---|---|---|
 | `REALTIME_PRIORITY_CLASS` | 24 | Forbidden territory (can hang mouse/disk flush). |
 | `HIGH_PRIORITY_CLASS` | 13 | No. |
 | `ABOVE_NORMAL_PRIORITY_CLASS` | 10 | No. |
-| `NORMAL_PRIORITY_CLASS` | 8 | narc `--full` mode (benchmarks, dedicated boxes). |
-| `BELOW_NORMAL_PRIORITY_CLASS` | 6 | **narc default.** Loses every contested slice to normal apps, wins vs. idle-class junk. |
-| `IDLE_PRIORITY_CLASS` | 4 | narc `--eco` component. Starved by *anything* ≥ normal, incl. other background tools. |
+| `NORMAL_PRIORITY_CLASS` | 8 | nova `--full` mode (benchmarks, dedicated boxes). |
+| `BELOW_NORMAL_PRIORITY_CLASS` | 6 | **nova default.** Loses every contested slice to normal apps, wins vs. idle-class junk. |
+| `IDLE_PRIORITY_CLASS` | 4 | nova `--eco` component. Starved by *anything* ≥ normal, incl. other background tools. |
 
 Windows schedules strictly by priority level with round-robin within a level: lower-priority
 threads run only when no higher-priority thread is runnable — that is exactly the "use idle cores,
@@ -76,7 +76,7 @@ the policy, not nice-to-haves.
   a 100 % all-core normal-priority antagonist and got 14–76 % foreground completion-time
   improvements; we start from the polite side).
 - Thread-level: worker threads stay `THREAD_PRIORITY_NORMAL` *within* the class (class already
-  moved the base). The GUI/progress thread of a future narc GUI gets
+  moved the base). The GUI/progress thread of a future nova GUI gets
   `THREAD_PRIORITY_ABOVE_NORMAL` relative to workers instead of raising the class.
 
 ---
@@ -98,7 +98,7 @@ in one shot. Verified facts and pitfalls:
    with thread-mode is explicitly unsupported (process `..._END` resets all threads' states).
 4. Not available for other processes → irrelevant for a GUI driving a worker exe anyway.
 
-**Verdict:** rejected. narc composes the equivalent from the à-la-carte APIs (class + I/O hint +
+**Verdict:** rejected. nova composes the equivalent from the à-la-carte APIs (class + I/O hint +
 memory priority), which are each reversible and tunable. `THREAD_MODE_BACKGROUND_BEGIN` remains
 acceptable *only* inside `--eco` for the checksum/housekeeping threads, never for pipeline workers.
 
@@ -132,9 +132,9 @@ Verified behavior:
   hardware mix ("various CPUs, incl. plain 6-core AMD").
 - Per-thread variant exists (`SetThreadInformation(ThreadPowerThrottling)`); also
   `PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION` opts out of timer-resolution coalescing
-  (irrelevant for narc — we have no high-res timers).
-- If narc does nothing, Windows heuristics may *still* green-leaf it. Explicitly setting
-  `StateMask = 0` (throttling off) is the documented way to pin HighQoS — narc's `--full` mode
+  (irrelevant for nova — we have no high-res timers).
+- If nova does nothing, Windows heuristics may *still* green-leaf it. Explicitly setting
+  `StateMask = 0` (throttling off) is the documented way to pin HighQoS — nova's `--full` mode
   should do this; default mode leaves the field untouched.
 
 **Verdict:** `--eco` flag = `IDLE_PRIORITY_CLASS` + EcoQoS on + I/O Very Low + memory priority
@@ -166,7 +166,7 @@ SetFileInformationByHandle(hFile, FileIoPriorityHintInfo, &hint, sizeof hint);
 - Set it on: source-file read handles, archive write handle. Not on: the tiny index/manifest
   handles at finalize time (finish fast, release locks).
 - Windows also offers `SetFileBandwidthReservation` (guaranteed *minimum* bandwidth) — rejected:
-  narc wants a ceiling-less floor-less polite mode, not reservations, and support is spotty.
+  nova wants a ceiling-less floor-less polite mode, not reservations, and support is spotty.
 
 CPU priority does not imply I/O priority (7-Zip feature request #1632 documents exactly this
 complaint about 7-Zip's own "Background" button: idle CPU class still issues Normal-priority I/O
@@ -185,7 +185,7 @@ user's browser tabs, without any hard cap or thrashing:
 - Default mode: process memory priority = `MEMORY_PRIORITY_BELOW_NORMAL` (4).
 - `--eco`: `MEMORY_PRIORITY_LOW` (2). (Very Low (1) reserved for a future "prefetch/readahead"
   thread whose pages are truly disposable.)
-- Cost: when the system is *not* under memory pressure, zero. Under pressure narc pays the page
+- Cost: when the system is *not* under memory pressure, zero. Under pressure nova pays the page
   faults instead of the user — which is the contract we advertise.
 
 ---
@@ -194,12 +194,12 @@ user's browser tabs, without any hard cap or thrashing:
 
 ### 7.1 OS mechanisms — what to use and what to reject
 
-| Mechanism | Semantics | Verdict for narc |
+| Mechanism | Semantics | Verdict for nova |
 |---|---|---|
-| Job object `JOB_OBJECT_LIMIT_PROCESS_MEMORY` (`ProcessMemoryLimit`) | Hard cap on **committed** virtual memory; further commits fail (allocation returns NULL / Rust alloc error) | **Use as guardrail** at 1.5–2× the self-budget: converts a leak/bug into a clean `narc: out of budget` error instead of system-wide swap death. Self-assign: `CreateJobObjectW` → `SetInformationJobObject` → `AssignProcessToJobObject(GetCurrentProcess())`. |
+| Job object `JOB_OBJECT_LIMIT_PROCESS_MEMORY` (`ProcessMemoryLimit`) | Hard cap on **committed** virtual memory; further commits fail (allocation returns NULL / Rust alloc error) | **Use as guardrail** at 1.5–2× the self-budget: converts a leak/bug into a clean `nova: out of budget` error instead of system-wide swap death. Self-assign: `CreateJobObjectW` → `SetInformationJobObject` → `AssignProcessToJobObject(GetCurrentProcess())`. |
 | Job `JOB_OBJECT_LIMIT_WORKINGSET` / `SetProcessWorkingSetSize` | Hard working-set cap; excess pages force-trimmed to standby/pagefile | **Rejected.** Doesn't reduce allocations, just converts them into page-file I/O churn — the process still "uses" the memory, now with disk amplification. Classic mistake (same failure mode as the `PROCESS_MODE_BACKGROUND_BEGIN` 32 MiB squeeze). |
 | Job CPU rate control (`JOBOBJECT_CPU_RATE_CONTROL_INFORMATION`) | Cap CPU % of the job | **Rejected.** Caps us even when all cores are idle — violates the "use everything that's free" requirement. Priorities already implement "yield only under contention". |
-| Self-imposed budget (allocator-side accounting) | narc decides worker count/queue depths from a byte budget | **Primary mechanism** (below). Only the app knows that N workers × cctx + queues = X. |
+| Self-imposed budget (allocator-side accounting) | nova decides worker count/queue depths from a byte budget | **Primary mechanism** (below). Only the app knows that N workers × cctx + queues = X. |
 
 ### 7.2 Codec memory — the real numbers (why budgets must be per-worker-aware)
 
@@ -215,7 +215,7 @@ user's browser tabs, without any hard cap or thrashing:
 - libzstd multithreading (`ZSTD_c_nbWorkers`) buffers ~`jobSize (≈ 4×window) + overlap` per
   worker → memory scales linearly with workers; and `ZSTD_estimateCCtxSize*()` **refuses** to
   estimate when `nbWorkers ≥ 1`.
-- **narc dodges almost all of this structurally:** we compress independent CDC chunks of
+- **nova dodges almost all of this structurally:** we compress independent CDC chunks of
   256 KiB–4 MiB, one plain single-threaded `ZSTD_CCtx` per worker, window auto-clamped to input
   size. Per-worker cost ≈ in-chunk 4 MiB + out-buffer ~4.1 MiB + cctx (a few MiB at L3, tens of
   MiB at L19 for a 4 MiB window) → **budget ~64 MiB/worker worst-case, ~16 MiB typical**. Compute
@@ -224,7 +224,7 @@ user's browser tabs, without any hard cap or thrashing:
 - Extraction: `DCtx` + window ≤ 4 MiB → **~12 MiB/worker**. This is the "weak PC can always
   extract" guarantee, and it holds *by format construction*, not by configuration.
 
-**LZMA/LZMA2** (7-Zip `-m` switch docs; if narc adds an LZMA2 max-tier):
+**LZMA/LZMA2** (7-Zip `-m` switch docs; if nova adds an LZMA2 max-tier):
 
 | Match finder | Compression RAM | Decompression RAM |
 |---|---|---|
@@ -233,7 +233,7 @@ user's browser tabs, without any hard cap or thrashing:
 
 7-Zip 24.09 raised 64-bit defaults to dict = 32 MiB (x5) … **256 MiB (x9)** → x9 ≈ **2.9 GiB per
 compressing stream** (×2 threads per LZMA2 chunk in x5+ modes; N chunks in parallel multiply it) and
-256 MiB just to *extract*. WinRAR 7 allows dictionaries to **64 GiB**. Lesson: if narc ever offers
+256 MiB just to *extract*. WinRAR 7 allows dictionaries to **64 GiB**. Lesson: if nova ever offers
 big-window/solid modes, the required extraction memory **must be recorded in the archive header**
 and checked against the extractor's budget with a clear error — both competitors landed on exactly
 this design (below).
@@ -245,8 +245,8 @@ this design (below).
 | 7-Zip (26.x) | "Number of CPU threads" dropdown (default = all logical); GUI shows live "Memory usage for Compressing/Decompressing" estimate | GUI "Memory usage" dropdown, default **80 % of RAM**; CLI `-mmemuse=p{N}` (percent) / `={N}g`; it *reduces dict/threads to fit* | `-smemx{N}g` limit for RAR unpack; GUI asks permission when RAR dict > 4 GiB |
 | WinRAR (7.x) | threads implicit; CLI `-ri<p>[:<s>]` sets priority 1–15 **and sleep-injection** ms per I/O | dict chosen vs. "physically available memory"; non-power-of-2 dicts > 4 GiB | Settings → "Maximum dictionary size allowed to extract" → GUI prompt; CLI **refuses > 4 GiB by default**, override `-md/-mdx` |
 
-narc copies: live memory estimate next to the level picker; percent-or-absolute `--memory`;
-header-recorded extraction requirement + default refusal above budget. narc rejects: WinRAR-style
+nova copies: live memory estimate next to the level picker; percent-or-absolute `--memory`;
+header-recorded extraction requirement + default refusal above budget. nova rejects: WinRAR-style
 sleep-injection (`-ri1:100`) as primary politeness tool — it wastes idle cores; priorities/QoS do
 this correctly (kept only as a last-resort hidden knob if some exotic driver ignores I/O hints).
 
@@ -267,7 +267,7 @@ Rules (each one exists to make memory a *closed formula*):
 2. A global byte-semaphore caps *in-flight chunk bytes* (acquired at read, released after write):
    `inflight_max = clamp(8 MiB · W, 32 MiB, budget / 3)`. This is what actually bounds RAM when
    chunks skew large or a worker stalls.
-3. Reorder buffer (results arrive out of order, .narc is append-only → writer needs sequence
+3. Reorder buffer (results arrive out of order, .nva is append-only → writer needs sequence
    order) is bounded by the same semaphore; a stalled chunk N blocks acceptance of N+2·W — that's
    the designed behavior, not a bug.
 4. Writer is a single thread; fsync policy and I/O priority hint live only there.
@@ -278,13 +278,13 @@ Rules (each one exists to make memory a *closed formula*):
 (blake3 already uses its own; future intra-chunk match finding), wrong as the pipeline backbone —
 `par_bridge`/`par_iter` have no backpressure or ordering guarantees and buffer unboundedly in the
 worst case, and rayon has no task priorities (own FAQ; the standard workaround is *separate
-pools*). If narc uses a rayon pool at all:
+pools*). If nova uses a rayon pool at all:
 
 ```rust
 rayon::ThreadPoolBuilder::new()
     .num_threads(w)
     .stack_size(2 * 1024 * 1024)
-    .thread_name(|i| format!("narc-worker-{i}"))
+    .thread_name(|i| format!("nova-worker-{i}"))
     .start_handler(|_| unsafe {
         // runs ON each new worker thread:
         // per-thread memory priority (process-wide setting covers this too)
@@ -298,7 +298,7 @@ rayon::ThreadPoolBuilder::new()
 Since the process priority class already covers CPU priority for all threads, per-thread
 `SetThreadPriority` calls are unnecessary in the default mode. The `thread-priority` crate
 (v3.1.1, Jun 2026, MIT, active, Windows supported) is a fine alternative to raw `windows-sys`
-here, but narc needs `windows-sys` anyway — one dependency fewer.
+here, but nova needs `windows-sys` anyway — one dependency fewer.
 
 For v1 the recommendation is a **hand-rolled fixed pool of `std::thread`s + crossbeam bounded
 channels** for the pipeline (deterministic memory, explicit shutdown, trivial to reason about),
@@ -322,16 +322,16 @@ rayon reserved for later CPU-only stages.
 
 ---
 
-## 10. Benchmarking "no system lag" (methodology narc CI can actually run)
+## 10. Benchmarking "no system lag" (methodology nova CI can actually run)
 
 Microsoft's Efficiency-Mode study is the template: antagonist load on all cores at 100 %, then
 measure *foreground activity completion time* (app launch, Start-menu open) vs. the no-load
-baseline; they report 14–76 % improvements from Low priority + EcoQoS. narc inverts it: narc *is*
+baseline; they report 14–76 % improvements from Low priority + EcoQoS. nova inverts it: nova *is*
 the antagonist; the acceptance criterion is that foreground metrics stay at baseline.
 
 Harness design (Windows box, admin once, then scripted):
 
-1. **Scenarios:** (a) narc compressing a 30 GiB mixed corpus from/to the system NVMe, default
+1. **Scenarios:** (a) nova compressing a 30 GiB mixed corpus from/to the system NVMe, default
    mode; (b) same in `--eco`; (c) same in `--full` (expected-fail control); (d) idle baseline.
 2. **Foreground probes, scripted and repeated ≥ 20×:**
    - App-launch time (cold-ish Notepad/Explorer window creation → first paint; measured via ETW).
@@ -344,19 +344,19 @@ Harness design (Windows box, admin once, then scripted):
    - Audio: LatencyMon session must stay green (no DPC/hard-pagefault regressions — catches the
      memory-priority mistakes, not just CPU).
 3. **Disk-contention probe:** copy a 10 GiB file on the *same* volume during scenario (a); require
-   copy-time degradation ≤ 15 % with I/O hint Low, and record narc's own throughput loss (expected
+   copy-time degradation ≤ 15 % with I/O hint Low, and record nova's own throughput loss (expected
    large — that's the contract).
 4. **Acceptance targets v1:** foreground app-launch and input p99 within **10 %** of idle
    baseline in default mode; zero `UIUnresponsiveness` events attributable to system-wide stalls;
-   narc throughput in default mode ≥ **90 %** of `--full` on an otherwise-idle machine (i.e.,
+   nova throughput in default mode ≥ **90 %** of `--full` on an otherwise-idle machine (i.e.,
    politeness must be ~free when nobody is looking — this is the headline claim vs. WinRAR's
    sleep-injection approach, which cannot achieve it).
-5. Publish the harness (`narc-bench-responsiveness`) — no mainstream archiver documents this;
+5. Publish the harness (`nova-bench-responsiveness`) — no mainstream archiver documents this;
    cheap credibility.
 
 ---
 
-## 11. The narc v1 policy (concrete)
+## 11. The nova v1 policy (concrete)
 
 ### 11.1 Modes
 
@@ -423,7 +423,7 @@ SetFileInformationByHandle(h, FileIoPriorityHintInfo,
 
 Cross-platform note: every call above is a no-op-able `#[cfg(windows)]` shim; Linux equivalents
 later are `nice(10)` / `sched_setattr(SCHED_BATCH)`, `ioprio_set(IOPRIO_CLASS_IDLE|BE)`,
-cgroup v2 `memory.high` — same policy shape, one trait (`ResourcePolicy`) in `narc-core`.
+cgroup v2 `memory.high` — same policy shape, one trait (`ResourcePolicy`) in `nova-core`.
 
 ---
 

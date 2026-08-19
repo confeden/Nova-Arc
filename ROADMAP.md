@@ -1,10 +1,10 @@
-# Nova Arc — working context (Claude-only, English)
+# Nova Prism — working context (Claude-only, English)
 
 ## Current state
 
-- Cargo workspace, Rust 1.95, edition 2021: `narc-core` (format,
-  `#![forbid(unsafe_code)]`), `narc-cli` (binary `narc`), `narc-platform` (OS
-  and unsafe), `narc-bsc` (libbsc FFI), `narc-gui` (Tauri 2). Frontend `ui/`
+- Cargo workspace, Rust 1.95, edition 2021: `nova-core` (format,
+  `#![forbid(unsafe_code)]`), `nova-cli` (binary `nova`), `nova-platform` (OS
+  and unsafe), `nova-bsc` (libbsc FFI), `nova-gui` (Tauri 2). Frontend `ui/`
   (TS + Vite, no framework).
 - Format v0.2 = v0.1 + solid blocks + per-chunk filter/param bytes + LZMA2/PPMd7
   + manifest `geometry`. Container VERIFIED: append-only chunk log, FastCDC,
@@ -19,7 +19,7 @@
   `--force` / `--skip-existing` (default: refuse to clobber).
 - `rename` moves an entry or a whole folder by rewriting the manifest ONLY:
   77 entries in 0.053 s, zero new units, byte-identical output.
-- GUI (narc-gui, VERIFIED running): open/create/add/extract/remove/compact,
+- GUI (nova-gui, VERIFIED running): open/create/add/extract/remove/compact,
   virtualized list with glyphs + unit badges, sortable columns, multi-select,
   context menu, double-click opens from a temp dir, Explorer drag&drop both ways,
   throttled progress, level/memory in toolbar (DEFAULT max), argv[1] opens.
@@ -30,7 +30,7 @@
   manifest, embedded/forged footer, writer lock, selectors, pre-1970 mtime,
   overwrite policy, compact-detects-corruption, the progress contract,
   deflate/JPEG/PDF round-trips, the PDF traps, one large file through the
-  decode lanes, and the `legacy-*.narc` fixtures.
+  decode lanes, and the `legacy-*.nva` fixtures.
 - Compression v2 DONE: codec+filter per content class, solid blocks by extension,
   LZMA2 + PPMd7 + bsc, BCJ x86 + delta (BCJ verified against liblzma).
 - Measured residue: BCJ on real .exe +4.4-5.7% vs unfiltered. PPMd7 vs zstd-19
@@ -49,7 +49,7 @@
   rewritten except by `compact`.
 - Commit = manifest write → fsync → footer write → fsync (the barrier is
   required: without it a valid footer can point at a torn manifest).
-- Footer self-hash covers its own absolute offset, so a `.narc` stored inside
+- Footer self-hash covers its own absolute offset, so a `.nva` stored inside
   another archive cannot be mistaken for a commit. Readers verify each footer
   candidate's manifest and resume the backward scan on failure (≤64).
 - Packing invariant: the writer appends chunks in submission order, so the
@@ -114,7 +114,7 @@
   never from the unit's head sample (`Packer::unit_plan`). One sub-4 KiB `.flac`
   sorted ahead of `.go` made the head sample say "already compressed" and 8.36
   MB of source was stored raw. Only a unit with NO voters reads the head.
-- REALIZED unit geometry (`NARC_UNIT_TRACE`, test/corpus at max): 6 units,
+- REALIZED unit geometry (`NOVA_UNIT_TRACE`, test/corpus at max): 6 units,
   size-weighted mean 41.42 MiB, 79% of bytes in units >= 16 MiB. So "units land
   in the 4-16 MiB penalty band" is FALSE.
 - Two-phase pipeline: `analyze::plan()` (magic → class → trial) gives
@@ -136,7 +136,7 @@
 
 ## Gotchas
 
-- `tempfile` is a REGULAR dep of narc-core (compact uses it), not a dev-dep.
+- `tempfile` is a REGULAR dep of nova-core (compact uses it), not a dev-dep.
 - Windows: cannot rename over an open file — compact consumes `self`, closes the
   handle, then replaces in place (atomic, no .bak window).
 - Windows file locks are MANDATORY per byte range: a whole-file `File::try_lock`
@@ -190,33 +190,33 @@
 - Solid block boundaries are content-defined PER FILE (cut prob = size/target
   from the file's own blake3). A size-accumulator rule cost 17 MiB for a
   one-line edit, because one file's length shifted every later boundary.
-- WHERE WE STAND (`test/bench-std.sh`). Competitor columns predate bsc; narc's
+- WHERE WE STAND (`test/bench-std.sh`). Competitor columns predate bsc; nova's
   are current. Max tier unless noted.
-  · enwik8  narc **21,506,314** · zpaqfranz -m5 19,625,056 · kanzi -l9
+  · enwik8  nova **21,506,314** · zpaqfranz -m5 19,625,056 · kanzi -l9
     20,035,684 · 7z -mx9 24,799,487 · xz 24,831,656
-  · Silesia narc **43,036,408** · zpaqfranz -m5 39,865,713 · kanzi -l9
+  · Silesia nova **43,036,408** · zpaqfranz -m5 39,865,713 · kanzi -l9
     41,857,930 · 7z -mx9 48,688,268 · xz 48,449,928
-  · enwik9  narc 195,010,922 (pre-bsc) · zpaqfranz -m5 168,590,780 · kanzi -l9
+  · enwik9  nova 195,010,922 (pre-bsc) · zpaqfranz -m5 168,590,780 · kanzi -l9
     173,379,111 · 7z -mx9 210,604,386
-  · Source tree: narc 9,292,017 vs 7z 9,131,720 → +1.8%.
+  · Source tree: nova 9,292,017 vs 7z 9,131,720 → +1.8%.
 - PPMd7 AS THE TEXT CODEC IS DOMINATED (enwik8): kanzi -l9 is smaller and faster
   both ways. bsc now out-votes it on text units; CM's model memory is the
   unknown left.
-- narc max is NOT faster than 7-Zip: Silesia 52.7 s vs 44.4 s, enwik8 77.7 s vs
+- nova max is NOT faster than 7-Zip: Silesia 52.7 s vs 44.4 s, enwik8 77.7 s vs
   43.3 s. The old "6.8 s vs 49 s" predates the tournament; never requote it.
-- DECODE is DATA-DEPENDENT: Silesia narc 1.8 s (was 6.5 before bsc) vs kanzi -l9
+- DECODE is DATA-DEPENDENT: Silesia nova 1.8 s (was 6.5 before bsc) vs kanzi -l9
   50.5 s; enwik8 4.6 s, and it cannot improve on one file (see below).
 - kanzi -l7: Silesia 47,308,780 B in 6.15 s — 7-Zip's ratio at seven times the
   speed; the fast tier's bar. CAVEAT: kanzi's default `-j` is HALF the cores, so
-  bench-std gave it 4 threads against narc's 8. bwt-sweep and scaling pass `-j`.
+  bench-std gave it 4 threads against nova's 8. bwt-sweep and scaling pass `-j`.
 - BWT IS A TOURNAMENT CANDIDATE: research 15 §5's "watch" is OVERTURNED by our
   own measurement (`test/bwt-sweep.sh`) — that verdict rested on someone else's
   bzip3 number on another corpus. BWT wins on SOME units and loses on others,
   which is what a per-unit tournament settles.
   · enwik8 block sweep: 8 MiB 23,593,148 · 32 21,983,674 · 128 20,803,016 —
     block sensitivity is MILD on text. Source tree is the OPPOSITE: bsc -b32
-    13,474,736 against narc's 9,292,017, 45% worse. Architecture, not codec.
-  · SHIPPED as codec id 4 (`crates/narc-bsc`, libbsc 3.3.12, Apache-2.0), a
+    13,474,736 against nova's 9,292,017, 45% worse. Architecture, not codec.
+  · SHIPPED as codec id 4 (`crates/nova-bsc`, libbsc 3.3.12, Apache-2.0), a
     fourth MAX candidate: enwik8 22,466,101 → **21,506,314 (−4.3%)** with bsc
     winning every unit · Silesia 43,674,657 → **43,036,408 (−1.5%)**, split
     lzma2 22.5 / bsc 18.6 MiB · source tree UNCHANGED. Encode +8%.
@@ -229,7 +229,7 @@
     source tree −6.2%, for 1.6-1.9x the encode. Normal now beats 7z -mx9 on
     Silesia in a SIXTH of its time.
   · TRAP: `bsc` decodes 100 MB in 0.9 s, which reads like 110 MB/s — but that is
-    multithreaded across blocks and narc disables libbsc's own threads. Single
+    multithreaded across blocks and nova disables libbsc's own threads. Single
     -threaded it is ~25 MB/s; treating it as fast in `extract_workers` made a
     normal Silesia archive extract in 8.7 s against zstd's 0.5. Quote the cost:
     normal-tier Silesia 0.5 → 2.1 s for −19%.
@@ -239,8 +239,8 @@
     workers, so a tree still pays: Silesia decode 0.46 → 3.19 s. Fast with bsc
     would be 47.8 MB / 2.90 s / 3.19 s against NORMAL's 46.4 / 7.0 / 2.09 —
     better only in pack time. Not a fast tier, a worse normal one.
-  · Wiring: libbsc is C++ and narc-core is `#![forbid(unsafe_code)]`, so the
-    binding needs its own crate beside narc-platform. No Rust port; `libsais-rs`
+  · Wiring: libbsc is C++ and nova-core is `#![forbid(unsafe_code)]`, so the
+    binding needs its own crate beside nova-platform. No Rust port; `libsais-rs`
     (383k recent downloads, same author) covers the suffix-array core.
 - Cut floor + byte-majority verdict, on test/corpus when they landed: fast −7.6%
   with its edit cost halved, normal −0.2%, max −4.0%. The fast win is the VOTE
@@ -258,12 +258,12 @@
   and a raw LZMA2 stream never can — so there is no format field and every
   manifest ever written still decodes. Front-coding paths: another 7,663 B, not
   done, a real format change.
-- narc's encoder is 0.24% BETTER than liblzma -9e on identical boundaries.
+- nova's encoder is 0.24% BETTER than liblzma -9e on identical boundaries.
 - Tournament on a source tree: LZMA2 wins 5 of 6 units = 99.94% of stored bytes;
   PPMd7 order 10 won one 35 KB unit, order 16 never won.
-- Diagnostics: `NARC_UNIT_TRACE=<file>` logs one line per unit as it is built
+- Diagnostics: `NOVA_UNIT_TRACE=<file>` logs one line per unit as it is built
   (idx, size, items, WHY it was cut, kind, ext histogram) — the cut reason exists
-  only at pack time. `narc info --units` dumps them back out with the winning
+  only at pack time. `nova info --units` dumps them back out with the winning
   codec. Benches: test/{bench-std,scaling,bwt-sweep,compare-7z,edit-cost}.sh.
 
 ## Recompression — DEFLATE, JPEG and PDF ARE LANDED (research 02, measured here)
@@ -276,10 +276,10 @@
   (own crate, outside the workspace) and round-trip what they measure.
 - MIN_STREAM = 64 bytes, MEASURED; 4096 cost 15 points. "A correction record
   cannot pay for itself on 2 KB" is true per FILE, false inside a unit.
-- SHIPPED. Deflate corpus: narc **2,408,247 B** vs 3,988,643 (zpaqfranz -m5) as
+- SHIPPED. Deflate corpus: nova **2,408,247 B** vs 3,988,643 (zpaqfranz -m5) as
   best of the rest → **−39.6%**. Byte-exact on all 28 files.
 - JPEG (lepton, id 35) SHIPPED, for standalone photographs. test/photos, 6
-  camera JPEGs: raw 17,324,730 · best of the rest 16,844,561 · **narc 13,990,872
+  camera JPEGs: raw 17,324,730 · best of the rest 16,844,561 · **nova 13,990,872
   (−16.9%)**. The bulk of a family archive and the one thing everyone gives up
   on.
   · The stored payload is the LEPTON FORM ITSELF: already entropy-coded, no
@@ -317,7 +317,7 @@
     PDF. Coverage: 74.1% FlateDecode (72.6% modelled), 18.5% DCTDecode.
     Diagnostics: `probe-preflate --bin {pdfscan,pdfhostile,lepton}`.
 - Installed-program corpus (test/firefox, 341.7 MiB, 68.6% .dll): 7z -mx9
-  87,566,439 B vs narc 95,721,462 → **+9.3%, our weakest case**. Findings:
+  87,566,439 B vs nova 95,721,462 → **+9.3%, our weakest case**. Findings:
   · FIXED: the codec+filter vote was cast once, into whichever unit was open
     when the file STARTED, so 150 MB of a 176 MB xul.dll landed in units with no
     BCJ. Now cast per CHUNK (`Packer::current` + `place`), worth 506,834 B.
@@ -367,7 +367,7 @@
   · THE CODED-LENGTH BOUND BELONGS IN `compress_job`, beside `filtered =
     data.len()`, and nowhere else: only that line knows the number that reaches
     the manifest, and `verify_chunk` REFUSES a coded length above the cap — an
-    unchecked one is an archive narc writes and cannot extract. Per-filter
+    unchecked one is an archive nova writes and cannot extract. Per-filter
     budgets do not substitute: `deflate_encode` charged plaintexts but not the
     container bytes `encode` also emits, so a ~57 MiB PDF cleared a 256 MiB
     budget and produced more.
@@ -385,10 +385,12 @@
   the END · PPMd7's pool must match EXACTLY (LZMA2 tolerates a wider window) and
   saturates at both ends, so a length bug passes on big units and fails only in a
   band, while LZMA2 with a narrow window fails as intermittent corruption.
-- COMPAT FIXTURES: `tests/fixtures/legacy-{max,normal,ppmd}.narc` are real
+- COMPAT FIXTURES: `tests/fixtures/legacy-{max,normal,ppmd}.nva` are real
   pre-recompression archives; `archives_from_before_recompression_still_extract`
   extracts them fully. Any change to the derived LZMA2 window or PPMd7 pool is
-  caught here and NOWHERE else.
+  caught here and NOWHERE else. Their magic was re-signed in place when the
+  format magic changed — header bytes plus BOTH footers, since the footer
+  self-hash covers the magic. Payload untouched, which is what the test is for.
 
 ## Negative knowledge
 
@@ -408,7 +410,7 @@
   in `RestoreMethod::CutOff` at 16 MiB (`probe-preflate --bin ppmd8min`).
 - Firefox's `omni.ja` is NOT recompressible: it parses as a zip but every entry
   is method 0, stored — Mozilla keeps it uncompressed so the browser can mmap it
-  at startup. No deflate to undo, which is why narc and 7-Zip land within 0.1%
+  at startup. No deflate to undo, which is why nova and 7-Zip land within 0.1%
   of each other. A tail-EOCD zip scan would find these files and gain nothing.
 - Shared/trained dictionaries at creation time — MEASURED NET LOSS at 32 MiB
   units (100.0-100.8% of the no-dictionary total). A dictionary SUBSTITUTES for
@@ -429,7 +431,7 @@
   unit gives up, because a unit has ONE codec and ONE filter. Voting by bytes
   does not rescue it — one winner cannot filter two classes.
 - Creating RAR archives is legally impossible (RARLAB license); only
-  extraction via unrar is allowed. Plan pack: zip/7z/narc; unpack adds rar.
+  extraction via unrar is allowed. Plan pack: zip/7z/nova; unpack adds rar.
 - `PROCESS_MODE_BACKGROUND_BEGIN` — Very Low I/O and memory priority (~250x
   slowdowns); compose the three APIs instead. IDLE/EcoQoS as DEFAULT — starved
   by daemons. IoPriorityHintVeryLow as default — 1-3% of disk. Job-object
@@ -452,7 +454,7 @@
   land near zstd-1..3 ratios. Blackwell HW decompression engine is
   datacenter-only (RTX 5060 Ti does NOT have it).
 - Dead/unusable GPU projects: dietgpu, Brotli-G, multians, CULZSS, GST, Gstd.
-  nvCOMP's proprietary codecs inside .narc would make archives unreadable
+  nvCOMP's proprietary codecs inside .nva would make archives unreadable
   without an NVIDIA GPU.
 
 ## Owner decisions
@@ -460,7 +462,7 @@
 - Language: Rust PREFERRED, not required. Owner-set: the GUI must be Rust and
   as much else as practical, but a codec may be C/C++ behind FFI if Rust has no
   usable implementation — do NOT reject an algorithm for want of a Rust crate.
-  Open repo `confeden/Nova-Arc`; no LICENSE file yet (owner will choose).
+  Open repo `confeden/Nova-Prism`; no LICENSE file yet (owner will choose).
   Zero telemetry/ads/analytics — ever. `.gitignore` is NOT tracked; the rules
   live in `.git/info/exclude` (owner's decision) — do not re-add the file.
 - BENCHMARK SET is plural, not just 7-Zip: 7z -mx9, xz -9e, brotli -q11,
@@ -473,11 +475,11 @@
   CEILING reference — how much redundancy is left — never as a target.
 - SCALING is an owner requirement at BOTH ends: work well on ONE core, use 8+
   efficiently. "Efficiently" means threads must not cost ratio — most archivers
-  cut data into smaller blocks and pay for every thread in compression. narc's
+  cut data into smaller blocks and pay for every thread in compression. nova's
   unit size comes from the geometry, so output must be BYTE-IDENTICAL at -j 1
   and -j 8. `test/scaling.sh`.
   Note: kanzi numbers here are the C++ build (flanglet/kanzi-cpp), not Go/Java.
-- SCALING (Silesia, `test/scaling.sh`, 1→8 threads, before bsc): narc 170.20 →
+- SCALING (Silesia, `test/scaling.sh`, 1→8 threads, before bsc): nova 170.20 →
   45.85 s = **x3.71**, output BYTE-IDENTICAL at every count · kanzi -l9 x3.90,
   identical · 7z -mx9 x1.79 and its output GROWS 1,407 B once threads > 1 ·
   xz x1.04, +18,324 B.
@@ -526,24 +528,20 @@
 
 DONE: v0.2 (pipeline, memory, priority) · v0.5 (filters, solid groups,
 LZMA2/PPMd) · v0.6 (tournament, geometry, cut floor, byte-majority verdict) ·
-v0.7 recompression — deflate id 34, JPEG id 35, x86 split id 36, PDF · GUI
-(basic) · manifest LZMA2.
+v0.7 recompression — deflate id 34, JPEG id 35, x86 split id 36, PDF images id
+37 · bsc codec id 4 · GUI (basic) · manifest LZMA2 · rename to the current name
+(magic NOVA/NOVAEND1, extension `.nva`, binary `nova`, GUI `nova-prism`).
 
 The standing direction is the owner's: beat 7-Zip where it has NOTHING, rather
 than out-tune LZMA. Remaining, in measured order of value:
 
 1. More formats where the competition stores bytes verbatim — the cheapest and
-   most exclusive win we have. Next: PDF images (`/DCTDecode` streams are whole
-   JPEGs and lepton is already wired), then audio.
-3. bsc (BWT) as a FOURTH tournament candidate at max — MEASURED to beat PPMd7
-   on text on ratio, encode AND decode at our own 32 MiB unit, while losing on
-   file trees, which the tournament settles per unit. libbsc is Apache-2.0 C++;
-   it needs its own crate because narc-core forbids unsafe. This supersedes
-   "replace PPMd7": do not remove PPMd7, out-vote it.
+   most exclusive win we have. Next: audio (FLAC/MP3/WAV), then a container
+   larger than 2x the unit, which today silently loses the feature.
 4. Executable modelling (BCJ2-class, section splitting) — 51% of the remaining
    headroom to paq8px on Silesia, five times images and tables combined.
 5. zip/7z unpack + zip pack (sevenz-rust2), rar unpack (unrar). GUI: shell
-   icons/thumbnails (research 06/07), .narc association + installer, folder tree,
+   icons/thumbnails (research 06/07), .nva association + installer, folder tree,
    RU localization. Later: GPU (research 08), encryption (XChaCha20-Poly1305),
    Explorer integration, installers, Linux/macOS/Android ports.
 

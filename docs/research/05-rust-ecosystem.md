@@ -1,8 +1,8 @@
-# 05 — Rust Ecosystem & Licensing Audit for Nova Arc
+# 05 — Rust Ecosystem & Licensing Audit for Nova Prism
 
 Research date: **2026-08-16**. All version numbers, dates and download counts were pulled live from the crates.io API and GitHub on this date (not from memory). Downloads are all-time / recent (last-90-days) as reported by crates.io.
 
-Scope: crate maturity, maintenance, license, pure-Rust vs FFI, RAR legalities, the 2024 xz lesson, and a dependency shortlist for the MVP and the max-compression tier. Nova Arc's own license is TBD, so both permissive and copyleft scenarios are analyzed.
+Scope: crate maturity, maintenance, license, pure-Rust vs FFI, RAR legalities, the 2024 xz lesson, and a dependency shortlist for the MVP and the max-compression tier. Nova Prism's own license is TBD, so both permissive and copyleft scenarios are analyzed.
 
 ---
 
@@ -27,8 +27,8 @@ Scope: crate maturity, maintenance, license, pure-Rust vs FFI, RAR legalities, t
 | [bzip3](https://crates.io/crates/bzip3) | 0.12.0 | **LGPL-3.0-only** | 2025-12-30 | 100.7K / 27.3K | No (C libbz3, cc) | Conditional (license risk, §5) |
 | libbsc (FFI) | — (no crate) | Apache-2.0 (upstream) | upstream active | — | No (C++, custom FFI) | **Build own FFI** (max tier) |
 | [ppmd-rust](https://crates.io/crates/ppmd-rust) | 1.4.0 | CC0-1.0 OR MIT-0 | 2026-01-24 | 16.4M | Yes | **Use** (max tier, text) |
-| [fastcdc](https://crates.io/crates/fastcdc) | 4.0.1 | MIT | 2026-04-26 | 1.4M / 843K | Yes | **Use** (.narc core) |
-| [blake3](https://crates.io/crates/blake3) | 1.8.6 | CC0-1.0 OR Apache-2.0 (± LLVM-exc.) | 2026-08-05 | 164.4M / 38.3M | Mostly (C/asm SIMD via cc by default; pure fallback exists) | **Use** (.narc core) |
+| [fastcdc](https://crates.io/crates/fastcdc) | 4.0.1 | MIT | 2026-04-26 | 1.4M / 843K | Yes | **Use** (.nva core) |
+| [blake3](https://crates.io/crates/blake3) | 1.8.6 | CC0-1.0 OR Apache-2.0 (± LLVM-exc.) | 2026-08-05 | 164.4M / 38.3M | Mostly (C/asm SIMD via cc by default; pure fallback exists) | **Use** (.nva core) |
 | [memmap2](https://crates.io/crates/memmap2) | 0.9.11 | MIT OR Apache-2.0 | 2026-06-22 | 311.1M / 69.4M | Yes (syscalls only) | **Use** |
 | [rayon](https://crates.io/crates/rayon) | 1.12.0 | MIT OR Apache-2.0 | 2026-04-14 | 497.4M / 111.4M | Yes | **Use** |
 | [notify](https://crates.io/crates/notify) | 8.2.0 | CC0-1.0 | 2026-05-02 | 139.2M / 35.3M | Yes | **Use** (GUI phase) |
@@ -38,7 +38,7 @@ Scope: crate maturity, maintenance, license, pure-Rust vs FFI, RAR legalities, t
 | [windows](https://crates.io/crates/windows) | 0.62.2 | MIT OR Apache-2.0 | 2025-10-06 | 295.7M / 66.9M | Yes (bindings; links system DLLs, no C toolchain) | **Use** |
 | [clap](https://crates.io/crates/clap) | 4.6.6 | MIT OR Apache-2.0 | 2026-08-06 | 1,048.0M / 215.7M | Yes | **Use** |
 
-All of the above except `bzip3` and `unrar`'s vendored C++ are unproblematic for **either** a permissive or a copyleft Nova Arc license (details in §5).
+All of the above except `bzip3` and `unrar`'s vendored C++ are unproblematic for **either** a permissive or a copyleft Nova Prism license (details in §5).
 
 ---
 
@@ -47,7 +47,7 @@ All of the above except `bzip3` and `unrar`'s vendored C++ are unproblematic for
 ### zip (zip-rs/zip2) — read/write ZIP
 - Repo: <https://github.com/zip-rs/zip2>, MIT, MSRV 1.88, OpenSSF Best Practices badge, fuzzed with cargo-afl. The original `zip-rs/zip-old` repo was declared unmaintained ([issue #446](https://github.com/zip-rs/zip-old/issues/446)); zip2 is the continuation and publishes to the same `zip` crate name (now at 8.x — release cadence is fast, expect frequent semver-major bumps).
 - **Read & write:** Stored, Deflate, Bzip2, Zstandard, XZ, PPMd. **Read-only:** Deflate64, LZMA, Implode, Shrink, Reduce. AES encryption (AE-1/AE-2), legacy ZipCrypto decryption. Multi-disk archives NOT supported.
-- Security history: **CVE-2025-29787** (zip-slip via symlinks, versions 1.3.0–2.2.x, fixed in 2.3.0; Snyk severity 7.3). Current 8.x is fixed, but Nova Arc must still do its own extraction-path sandboxing (defense in depth) since we drive extraction ourselves.
+- Security history: **CVE-2025-29787** (zip-slip via symlinks, versions 1.3.0–2.2.x, fixed in 2.3.0; Snyk severity 7.3). Current 8.x is fixed, but Nova Prism must still do its own extraction-path sandboxing (defense in depth) since we drive extraction ourselves.
 - Note: enabling its `zstd` feature pulls the C `zstd` crate; the deflate path via `flate2`/`miniz_oxide` and bzip2 via `libbz2-rs-sys` stay pure Rust.
 
 ### sevenz-rust2 — read/write 7z, pure Rust
@@ -76,10 +76,10 @@ Source: RARLAB's `license.txt` shipped with the unrar sources (mirror: <https://
 
 > "Distribution of modified UnRAR source code in separate form or as a part of other software is permitted, provided that full text of this paragraph ... is included in license, or in documentation if license is not available"
 
-Conclusions for Nova Arc:
+Conclusions for Nova Prism:
 1. **Extraction: allowed.** Shipping unrar-based RAR extraction is free of charge and explicitly permitted, including inside other software packages. We must reproduce the license paragraph in our licensing docs.
-2. **Creation: legally impossible for us.** The RAR compression algorithm is proprietary; the license explicitly forbids using the unrar sources to build a RAR-compatible archiver or reverse-derive the algorithm. RARLAB does not license the algorithm to third parties — the only legal way to *create* RAR is RARLAB's own `rar.exe`/WinRAR under a paid license held by the end user. Even a "shell out to rar.exe if installed" integration is possible technically, but Nova Arc cannot ship or bundle rar.exe. Recommendation: **do not offer RAR creation at all** (matches 7-Zip's position).
-3. **License compatibility:** the unrar license's field-of-use restriction makes it non-free (not OSI). It coexists fine with a permissive Nova Arc license (the restriction just rides along), but it is **GPL-incompatible** — if Nova Arc chooses GPL, unrar must be isolated (separate process/helper binary or dlopen'd plugin with its own license), or Nova Arc's GPL must carry an explicit additional-permission exception. Keep `unrar` behind a cargo feature + subprocess boundary from day one; that keeps every licensing option open.
+2. **Creation: legally impossible for us.** The RAR compression algorithm is proprietary; the license explicitly forbids using the unrar sources to build a RAR-compatible archiver or reverse-derive the algorithm. RARLAB does not license the algorithm to third parties — the only legal way to *create* RAR is RARLAB's own `rar.exe`/WinRAR under a paid license held by the end user. Even a "shell out to rar.exe if installed" integration is possible technically, but Nova Prism cannot ship or bundle rar.exe. Recommendation: **do not offer RAR creation at all** (matches 7-Zip's position).
+3. **License compatibility:** the unrar license's field-of-use restriction makes it non-free (not OSI). It coexists fine with a permissive Nova Prism license (the restriction just rides along), but it is **GPL-incompatible** — if Nova Prism chooses GPL, unrar must be isolated (separate process/helper binary or dlopen'd plugin with its own license), or Nova Prism's GPL must carry an explicit additional-permission exception. Keep `unrar` behind a cargo feature + subprocess boundary from day one; that keeps every licensing option open.
 
 ---
 
@@ -91,7 +91,7 @@ Conclusions for Nova Arc:
 ### Zstd: zstd (C FFI) + ruzstd (pure decoder)
 - `zstd` 0.13.3 binds real libzstd via `zstd-sys` (bundled source, built with `cc` → needs MSVC). MIT wrapper; libzstd itself is dual BSD-3-Clause/GPLv2 (use the BSD leg). Multithreaded compression via the `zstdmt` feature. Last publish 2025-02-20 — cadence is slow (tracks upstream libzstd releases) but the repo (651★) has CI green across Linux/Windows/macOS/WASM; treat as stable-mature, not abandoned.
 - `ruzstd` 0.9.0 — actively developed pure-Rust *decoder*; useful if we ever want a zero-FFI build profile, not a substitute for writing.
-- For .narc's default codec we want real libzstd (speed, levels 1–22, dictionaries, long-distance matching). Accept the FFI.
+- For .nva's default codec we want real libzstd (speed, levels 1–22, dictionaries, long-distance matching). Accept the FFI.
 
 ### XZ/LZMA: liblzma (successor of xz2) and lzma-rust2 (pure Rust)
 - **xz2 0.1.7 is frozen since 2022-06-06 — do not use.**
@@ -99,7 +99,7 @@ Conclusions for Nova Arc:
 - `lzma-rust2` 0.18.1 (hasenbanck) — pure-Rust LZMA/LZMA2/LZIP/XZ ported from tukaani "XZ for Java"; it is what sevenz-rust2 uses, very actively published (2026-08-05), Apache-2.0. Slower than native liblzma but removes the C dependency entirely.
 - Strategy: MVP gets LZMA support "for free" through sevenz-rust2/zip (lzma-rust2 underneath). Max-compression tier adds `liblzma` with `parallel` for fastest/strongest xz when a C toolchain is present.
 
-**The 2024 xz backdoor lesson (CVE-2024-3094).** Malicious maintainer "Jia Tan" backdoored xz-utils 5.6.0/5.6.1 (discovered 2024-03-29 by Andres Freund); the payload hid in *binary test files* activated by build scripts. The same poisoned test files even landed in the Rust `liblzma-sys` crate (0.3.0–0.3.2; removed in 0.3.3 on 2024-04-10 — the activating build logic was never present, so Rust users were not exploited, per Snyk/The Hacker News). Durable lessons for Nova Arc:
+**The 2024 xz backdoor lesson (CVE-2024-3094).** Malicious maintainer "Jia Tan" backdoored xz-utils 5.6.0/5.6.1 (discovered 2024-03-29 by Andres Freund); the payload hid in *binary test files* activated by build scripts. The same poisoned test files even landed in the Rust `liblzma-sys` crate (0.3.0–0.3.2; removed in 0.3.3 on 2024-04-10 — the activating build logic was never present, so Rust users were not exploited, per Snyk/The Hacker News). Durable lessons for Nova Prism:
 1. Prefer pure-Rust codec implementations where performance allows (lzma-rust2, zlib-rs, libbz2-rs-sys, brotli, ppmd-rust) — smaller supply-chain and memory-safety surface.
 2. Every `-sys` crate we ship must pin an exact version, be covered by `cargo audit` + `cargo vet`/`cargo deny` in CI, and be built from reviewed, checked-in sources (no network fetch at build time).
 3. Treat opaque binary blobs in dependencies (test fixtures included) as a red flag; keep the dependency tree auditable.
@@ -124,9 +124,9 @@ Conclusions for Nova Arc:
 
 ---
 
-## 5. License compatibility matrix (Nova Arc license TBD)
+## 5. License compatibility matrix (Nova Prism license TBD)
 
-| Dependency license | If Nova Arc = MIT/Apache-2.0 | If Nova Arc = GPL-3.0 | Notes |
+| Dependency license | If Nova Prism = MIT/Apache-2.0 | If Nova Prism = GPL-3.0 | Notes |
 |---|---|---|---|
 | MIT / Apache-2.0 / BSD-3 / Zlib (almost everything) | OK | OK | No obligations beyond attribution |
 | CC0-1.0 (notify, blake3, ppmd-rust) | OK | OK | Public-domain-equivalent |
@@ -135,7 +135,7 @@ Conclusions for Nova Arc:
 | **LGPL-3.0-only (bzip3 crate + libbz3)** | Risky if statically linked: must permit user relinking (§4 LGPL) — ship .obj files or dylib | OK (GPLv3 subsumes) | Main argument to prefer libbsc |
 | **UnRAR freeware license (vendored in unrar crate)** | OK, must include license paragraph; restriction (no RAR archiver) rides along | **Incompatible** — isolate in separate process/plugin or add GPL exception | See §3 |
 
-Bottom line: if every dependency except `bzip3` and `unrar` is used, Nova Arc can still pick **any** license later. Keep `unrar` behind a process boundary and prefer `libbsc` over `bzip3`, and the choice stays fully open.
+Bottom line: if every dependency except `bzip3` and `unrar` is used, Nova Prism can still pick **any** license later. Keep `unrar` behind a process boundary and prefer `libbsc` over `bzip3`, and the choice stays fully open.
 
 ---
 
@@ -149,11 +149,11 @@ Practical consequence: the **MVP can build with nothing but `rustup` + MSVC Buil
 
 ---
 
-## 7. Infrastructure crates for .narc
+## 7. Infrastructure crates for .nva
 
-- **fastcdc 4.0.1** (nlfiedler/fastcdc-rs, MIT, publish 2026-04-26) — canonical pure-Rust FastCDC; implements both the 2016 and the improved 2020 (normalized chunking) variants, plus streaming. Exactly what the .narc append-only log needs for content-defined chunking. 1.4M downloads — modest but it's *the* reference implementation.
-- **blake3 1.8.6** — official crate, SIMD + rayon-based multithreaded hashing of large files; the natural chunk-ID/integrity hash for .narc (faster than SHA-256 by ~×5–10 on large inputs). License CC0/Apache — clean.
-- **memmap2 0.9.11** — the maintained successor of the abandoned `memmap` (RazrFalcon fork); the standard choice for mapping huge archives. Remember: on Windows, a mapped file section blocks truncation — compaction must unmap first (design note for .narc compactor).
+- **fastcdc 4.0.1** (nlfiedler/fastcdc-rs, MIT, publish 2026-04-26) — canonical pure-Rust FastCDC; implements both the 2016 and the improved 2020 (normalized chunking) variants, plus streaming. Exactly what the .nva append-only log needs for content-defined chunking. 1.4M downloads — modest but it's *the* reference implementation.
+- **blake3 1.8.6** — official crate, SIMD + rayon-based multithreaded hashing of large files; the natural chunk-ID/integrity hash for .nva (faster than SHA-256 by ~×5–10 on large inputs). License CC0/Apache — clean.
+- **memmap2 0.9.11** — the maintained successor of the abandoned `memmap` (RazrFalcon fork); the standard choice for mapping huge archives. Remember: on Windows, a mapped file section blocks truncation — compaction must unmap first (design note for .nva compactor).
 - **rayon 1.12.0** — data-parallel compression of independent chunks/blocks. Standard.
 
 ## 8. Platform / UX crates
@@ -168,7 +168,7 @@ Practical consequence: the **MVP can build with nothing but `rustup` + MSVC Buil
 
 ## 9. Dependency shortlists
 
-### MVP (pack/unpack zip & 7z, unpack rar, .narc v0, CLI)
+### MVP (pack/unpack zip & 7z, unpack rar, .nva v0, CLI)
 
 ```toml
 # formats
@@ -178,8 +178,8 @@ tar = "0.4"                  # tar/tgz support, nearly free
 unrar = { version = "0.5", optional = true }  # feature "rar", subprocess-isolated
 # codecs
 flate2 = "1"                 # deflate (miniz_oxide; try feature zlib-rs)
-zstd = { version = "0.13", features = ["zstdmt"] }  # .narc default codec (FFI)
-# .narc core
+zstd = { version = "0.13", features = ["zstdmt"] }  # .nva default codec (FFI)
+# .nva core
 fastcdc = "4"                # content-defined chunking
 blake3 = { version = "1", features = ["rayon"] }    # chunk ids / integrity
 memmap2 = "0.9"

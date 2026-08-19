@@ -2,7 +2,7 @@
 
 Companion to `08-gpu-compression.md` (which answered "can the GPU run a codec?" — answer: only
 zstd-1..3-class ratios). This report answers the *other* question: can GPU horsepower help the
-**analysis, dictionary, similarity, transform and verification** stages of Nova Arc?
+**analysis, dictionary, similarity, transform and verification** stages of Nova Prism?
 
 Every number below is tagged **[measured here]** (run on the owner's machine), **[measured
 elsewhere]** (published benchmark, link given), or **[claimed]** (vendor/author assertion,
@@ -48,7 +48,7 @@ Against that ceiling, here is what the CPU on this machine already does **[measu
 | MinHash, 4 super-features, full coverage | 0.22 GB/s | 0.97 GB/s | 6× under the bus |
 | MinHash, 16 hashes, full coverage | 0.07 GB/s | 0.25 GB/s | 24× under |
 | zstd-19 on 32 MiB blocks | 0.0030 GB/s | ~0.024 GB/s | 250× under |
-| narc max tier (LZMA2+PPMd tournament) | — | **0.005 GB/s** | 1200× under |
+| nova max tier (LZMA2+PPMd tournament) | — | **0.005 GB/s** | 1200× under |
 | zstd fastcover dictionary training (optimize) | 0.0006 GB/s | **0.0024 GB/s** | 2500× under |
 | *reference:* pure DRAM stream read, 8 threads | — | **39.8 GB/s** | the ceiling every row above shares |
 
@@ -56,7 +56,7 @@ Against that ceiling, here is what the CPU on this machine already does **[measu
 
 1. **These are idle-machine peaks.** Re-run with ~65 % background CPU load, the same binary reported
    blake3 8t **5.5 GB/s** (not 31.6), order-0 8t 2.6 GB/s and stream read 3.1 GB/s. During a real
-   narc job all 8 cores are compressing, so the throughput actually *spare* for an analysis stage is
+   nova job all 8 cores are compressing, so the throughput actually *spare* for an analysis stage is
    a fraction of the peak. The honest form of the rule below is therefore "below ~3 GB/s **of spare
    capacity**", and doc 08 already treats keeping the CPU free as a feature in itself. It does not
    reverse any verdict here (hashing 114 MiB costs 4 ms idle, ~22 ms saturated, still ≈ the 20 ms
@@ -80,15 +80,15 @@ implementation exists.
 
 | # | Candidate | GPU impl. exists? | Realistic speedup of the stage | Effect on ratio | Build it? |
 |---|---|---|---|---|---|
-| 1 | **BWT / suffix sorting** (libcubwt) | **yes**, Apache-2.0, active | **6.5× end-to-end measured in bsc — but at 318 MB blocks (§7.1); 6–11× per-block over libsais holds down to ~4 MB inputs** | **zero cost — byte-identical output** | **Only if a BWT codec enters the format, and only with the block ≤ narc's chunk cap.** The GPU part is the easy half. |
+| 1 | **BWT / suffix sorting** (libcubwt) | **yes**, Apache-2.0, active | **6.5× end-to-end measured in bsc — but at 318 MB blocks (§7.1); 6–11× per-block over libsais holds down to ~4 MB inputs** | **zero cost — byte-identical output** | **Only if a BWT codec enters the format, and only with the block ≤ nova's chunk cap.** The GPU part is the easy half. |
 | 2 | Similarity sketching (MinHash) before solid packing | no (200 lines of our own) | 10–20× of a 0.25 GB/s stage | indirect; MC measured +15–74 % even for 7z with a 64 MB+ dictionary | CPU version first (higher priority than this report first assumed); GPU almost certainly never needed |
-| 3 | Dictionary training (COVER/fastcover) | **no** — nothing in CUDA | unknown; CPU has 10× unexploited headroom | **negative in narc's geometry (measured)** | **No** |
+| 3 | Dictionary training (COVER/fastcover) | **no** — nothing in CUDA | unknown; CPU has 10× unexploited headroom | **negative in nova's geometry (measured)** | **No** |
 | 4 | Analysis: entropy / n-gram / compressibility for many chunks | trivial to write | ≤1× (bus-bound) | none | **No** |
 | 5 | Byte transforms (delta, transpose, BCn, float shuffle) | yes (Brotli-G/nvCOMP) | ≤1× (bus-bound) | small, same as CPU | Only as a free rider on GPU *codec* work |
 | 6 | Entropy coding (rANS/ANS) | dietgpu archived; MANS alive, ints only | 100×+ on-device, ~0 end-to-end | order-0 class ratio = worse than what we ship | **No** |
 | 7 | Verification / hashing many chunks | yes | **negative** | none | **No — confirmed with numbers** |
 
-**Bottom line:** for Nova Arc as designed today, there is **no GPU work worth building** in these
+**Bottom line:** for Nova Prism as designed today, there is **no GPU work worth building** in these
 seven areas. The one genuinely attractive item (GPU BWT) is gated behind a *CPU* decision — whether
 libbsc-class block sorting deserves a place in the format at all, **at a block size that keeps edits
 cheap and extraction bounded**. Make that call on CPU merits; the GPU is then a bonus on the
@@ -113,7 +113,7 @@ Three consequences that any GPU plan must respect:
 1. **Bus ≈ 6 GB/s each way**, not the ~25 GB/s that `08-gpu-compression.md` §2.3 assumed for a Gen5
    x8 link. That report's throughput estimates for GPU zstd/LZ4 offload should be re-read with this
    correction: on *this* machine the GPU decompression path is capped near NVMe speed, not above it.
-2. **~1.2 GiB of VRAM is gone before narc starts** (1254 MiB at the time of measurement, 1491 MiB on
+2. **~1.2 GiB of VRAM is gone before nova starts** (1254 MiB at the time of measurement, 1491 MiB on
    a later check — it drifts with what the desktop is doing). A 2 GiB budget is the right default;
    anything that needs 20.5×block (libcubwt) must size blocks accordingly: 8151 MiB / 20.5 ≈ 398 MiB
    absolute max, **≈336 MiB** with the desktop deducted. libcubwt's own benchmark methodology caps
@@ -133,7 +133,7 @@ Three consequences that any GPU plan must respect:
 
 ## 3. Candidate 1 — the analysis phase on the GPU
 
-**Idea:** narc's two-phase design classifies each unit (magic bytes → content class → trial
+**Idea:** nova's two-phase design classifies each unit (magic bytes → content class → trial
 compression). Could the GPU compute entropy, n-gram statistics or compressibility estimates for
 thousands of chunks at once?
 
@@ -148,7 +148,7 @@ thousands of chunks at once?
 | zstd-3 trial on all bytes | 0.22 GB/s | ~1.5 GB/s | 80 ms |
 | zstd-12 trial on all bytes | 0.035 GB/s | ~0.25 GB/s | 480 ms |
 
-narc's max tier spends **22 s** on that same 114 MiB. The entire analysis budget is therefore
+nova's max tier spends **22 s** on that same 114 MiB. The entire analysis budget is therefore
 0.02–2 % of the job. Uploading the data to compute it would cost 114 MiB / 6 GB/s ≈ **19 ms just in
 transfer**, i.e. more than the order-0 pass costs on the CPU, and the GPU would still have to be fed
 by the same disk read.
@@ -165,7 +165,7 @@ Two secondary findings worth keeping:
   *systematically underestimates* ratios; entropy is only a lower bound. A GPU makes a biased
   estimator biased faster.
 
-**Where the analysis idea *does* have value — on the CPU.** narc's max tier runs a 3-way tournament
+**Where the analysis idea *does* have value — on the CPU.** nova's max tier runs a 3-way tournament
 (LZMA2 + PPMd order 10 + PPMd order 16) on every unit at ~0.005 GB/s aggregate. Replacing the
 tournament with a *predictor* built from the cheap statistics above (order-0/order-1 entropy, match
 density from a zstd-1 probe, magic class) would cut max-tier time by **at most 3×** — that is the
@@ -179,12 +179,12 @@ unmeasured too. That is a pure-CPU project and it is worth more than anything in
 ## 4. Candidate 2 — dictionary training
 
 This is where the compute gap is genuinely huge — and where the ratio payoff turns out to be
-**negative for narc's actual geometry**. Both halves were measured here.
+**negative for nova's actual geometry**. Both halves were measured here.
 
 ### 4.1 What training costs on the CPU today **[measured here]**
 
 Corpus: the project's own source tree (`test/corpus`), files < 256 KiB, sorted by extension exactly
-as narc's solid packer sorts them. `ZDICT_optimizeTrainFromBuffer_fastCover(d=8, steps=4, f=20)`,
+as nova's solid packer sorts them. `ZDICT_optimizeTrainFromBuffer_fastCover(d=8, steps=4, f=20)`,
 110 KiB dictionary target, zstd 1.5.7:
 
 | Sample set | 1 thread | 8 threads | speedup | `k` pinned (no sweep), 1 thread |
@@ -213,9 +213,9 @@ two largest sample sets pinned-k-1-thread already *beats* the 8-thread sweep by 
 smallest it loses to it. Combining both is untested; 137 s → **~10 s** is the order of magnitude to
 expect, without a line of GPU code.
 
-### 4.2 What a dictionary is worth in narc's real compression unit **[measured here]**
+### 4.2 What a dictionary is worth in nova's real compression unit **[measured here]**
 
-The usual "-13 % with a trained dictionary" number is measured **per file**. narc does not compress
+The usual "-13 % with a trained dictionary" number is measured **per file**. nova does not compress
 per file — it concatenates small files into solid blocks. So the same 110 KiB dictionary was tested
 against blocks of 64 KiB … 32 MiB, zstd-19, with `windowLog` pinned per block size and
 `pledgedSrcSize` set, in three arms (control for zstd API artefacts):
@@ -232,7 +232,7 @@ Every row below was **re-run and reproduced byte-for-byte** in an independent ve
 
 Three conclusions, in order of importance:
 
-1. **A trained dictionary is worth ~0 at narc's block sizes.** Its content adds −1.1 % at 8 MiB and
+1. **A trained dictionary is worth ~0 at nova's block sizes.** Its content adds −1.1 % at 8 MiB and
    −0.44 % at 32 MiB: the block already contains the cross-file redundancy the dictionary was
    supposed to supply. Dictionaries substitute for large blocks; they do not add to them. Bigger
    blocks are worth far more: 64 KiB → 32 MiB blocks alone take 12.43 → 6.60 MiB (**−47 %**).
@@ -240,17 +240,17 @@ Three conclusions, in order of importance:
    at 8 MiB, +14.3 % at 32 MiB, with window and source size pinned identically in both arms. The
    `refPrefix` arm (same bytes, no dictionary entropy tables / repcodes) does not show it, so the
    cause is the dictionary's prescribed entropy state and the dictMatchState search path, not
-   parameter derivation. **Gotcha for the codebase**: if narc ever attaches a dictionary, verify
+   parameter derivation. **Gotcha for the codebase**: if nova ever attaches a dictionary, verify
    per unit that it helps, and never assume `loadDictionary` is free. (Also note the separate,
    well-known trap this control ruled out: `ZSTD_createCDict` derives cParams from the *dictionary*
    size, so a naive `EncoderDictionary::copy` at level 19 compresses a 32 MiB block with parameters
    sized for 110 KB.)
-3. A dictionary is only interesting in the regime narc uses for **cheap edits** — small units
+3. A dictionary is only interesting in the regime nova uses for **cheap edits** — small units
    (64 KiB–1 MiB), where it is worth −10 % / −3 %. That is a real design option ("small units +
    shared dictionary" instead of "big blocks"), but it is a *format* decision, not a GPU one — **and
    the same table refutes it as a ratio play**: 64 KiB units *with* the dictionary still produce
    11.16 MiB against 6.60 MiB for 32 MiB blocks *without* one, i.e. **+69 %**. The dictionary buys
-   back only a fifth of what small units give away. It would also introduce narc's first global
+   back only a fifth of what small units give away. It would also introduce nova's first global
    cross-unit dependency: a shared dictionary can only be frozen at archive creation (retraining
    rewrites every unit), so ratio would decay as the archive's later contents drift from the trained
    corpus — the opposite of the append-only edit story. Extraction memory is unaffected (110 KiB).
@@ -279,13 +279,13 @@ Three conclusions, in order of importance:
   help in the small-key regime that fastcover's d = 6..8 corresponds to — by about **2× on the
   counting phase, ~1.45× end to end**. That is not a disqualifier, it is simply far too small a prize
   to justify writing a CUDA fastcover from scratch when `nbThreads` and `k`-pinning are sitting there
-  unused (§4.1) and the ratio payoff at narc's block sizes is ~0 (§4.2).
+  unused (§4.1) and the ratio payoff at nova's block sizes is ~0 (§4.2).
 - The parameter sweep (the part that actually dominates `optimize*` runtime) is embarrassingly
   parallel across *independent training runs* — which is exactly what `nbThreads` already exploits
   on the CPU, for free.
 
-**Verdict: do not build. No implementation, no ratio payoff at narc's block sizes, and 10× of CPU
-headroom left unused. Revisit only if narc adopts a small-unit + shared-dictionary format.**
+**Verdict: do not build. No implementation, no ratio payoff at nova's block sizes, and 10× of CPU
+headroom left unused. Revisit only if nova adopts a small-unit + shared-dictionary format.**
 
 ---
 
@@ -321,24 +321,24 @@ whatsoever. Upload at 6 GB/s versus a CPU that manages 0.25 GB/s means a theoret
   argument stands on our own measurement, not on MC's parameter choice.
 - **Even full coverage with 4 super-features hits 0.97 GB/s on 8 threads**, which is NVMe read
   speed. The stage would be I/O-bound before it is CPU-bound.
-- **The ratio payoff is unproven for narc's data — but the paper does not say it is small.** MC
+- **The ratio payoff is unproven for nova's data — but the paper does not say it is small.** MC
   reports **+11 % to +105 %** overall **[measured elsewhere]**, and per compressor "23–105 % for gzip,
   18–84 % for bzip2, **15–74 % for 7z** and 11–47 % for rzip". Its footnote about window size ("if the
   chunks were 64 KB, gzip would not match the start of one chunk against the start of the next") is a
   caveat about chunks being *large* relative to the window, not a claim that large-window compressors
   stop benefiting: the paper's own best result is **7z-MAX with MC**, i.e. LZMA with a large
-  dictionary still gains from reordering, and it gains at better throughput than 7z-MAX alone. narc's
+  dictionary still gains from reordering, and it gains at better throughput than 7z-MAX alone. nova's
   32 MiB blocks / 64 MiB LZMA2 dictionary are the same regime as that 7z arm. **Correction to an
   earlier draft: this is the regime where MC's gains are smaller, not smallest-to-nil — 15–74 % is
   still the largest unclaimed ratio prize in this report.** MC's cost is memory: the paper cites
   6 GB of extra reorganization buffers vs gzip ("128 KB compression regions × 48 K regions filled
-  simultaneously") for the DDFS deployment — which is exactly the constraint narc's bounded-memory
-  invariant would have to answer, and the reason a narc version must reorder *within* a block budget.
-- **Editing conflicts with clustering.** narc's differentiator is that a changed file rewrites one
+  simultaneously") for the DDFS deployment — which is exactly the constraint nova's bounded-memory
+  invariant would have to answer, and the reason a nova version must reorder *within* a block budget.
+- **Editing conflicts with clustering.** nova's differentiator is that a changed file rewrites one
   block. Similarity-clustered blocks are chosen by *content*, so a small edit can move a file into a
   different cluster and invalidate more than one block. Any clustering scheme has to be stable under
   edits — a design problem the GPU does not help with.
-- GPU dedup tooling that does exist is built for a scale narc will never see:
+- GPU dedup tooling that does exist is built for a scale nova will never see:
   [SEDD](https://arxiv.org/abs/2501.01046) (KDD'26, DOI 10.1145/3770855.3818161 — venue confirmed)
   reports up to **158× vs the CPU-based SlimPajama tool and 7.8× vs NVIDIA NeMo Curator on 30 M
   documents with 4 GPUs** (375× on MinHash signature generation alone), and 1.2 T tokens in 3 h on
@@ -358,17 +358,17 @@ premature until archives reach tens of GB with the sketch on the critical path.*
 
 ## 6. Candidate 4 — GPU entropy coding (rANS/ANS)
 
-| Project | State (verified 2026-08) | License | Fits narc? |
+| Project | State (verified 2026-08) | License | Fits nova? |
 |---|---|---|---|
 | [dietgpu](https://github.com/facebookresearch/dietgpu) | **archived** (per doc 08, last push 2026-03) | MIT | reference only |
 | [MANS](https://github.com/hpdps-group/MANS) (SC'25) | **alive**, the only actively developed option | **BSD-3-Clause** (its `LICENSE` file; GitHub reports "NOASSERTION") | **no — multi-byte integer data only, explicitly not general byte streams** (its core is ADM, "maps 16/32-bit integers into a compact 8-bit domain"); its README claims **0.52× dietgpu's CUDA compression throughput, 0.47× decompression** **[claimed]** |
 | [hipANS](https://github.com/PAA-NCIC/hipANS) | dietgpu port to ROCm | MIT-derived | AMD-only relevance |
 | [Recoil](https://dl.acm.org/doi/10.1145/3605573.3605588) (ICPP'23) | paper | — | idea: rANS decodable from arbitrary positions |
-| nvCOMP ANS | proprietary bitstream | NVIDIA EULA | banned from `.narc` by existing policy |
+| nvCOMP ANS | proprietary bitstream | NVIDIA EULA | banned from `.nva` by existing policy |
 
-Three independent reasons this is dead for narc, any one sufficient:
+Three independent reasons this is dead for nova, any one sufficient:
 
-1. **Ratio class.** An ANS stage compresses to ~order-0 entropy. narc's max tier ships PPMd7 and
+1. **Ratio class.** An ANS stage compresses to ~order-0 entropy. nova's max tier ships PPMd7 and
    LZMA2. Using GPU ANS would mean *building our own codec* whose modelling stage is also on the
    GPU — the thing doc 08 established does not exist above zstd-1..3 quality.
 2. **Bus.** 400 GB/s of on-device ANS throughput against a 6 GB/s wire is 1.5 % utilisation; the
@@ -423,26 +423,26 @@ BWT / 7× for inverse.
    **1.17×**, because the block exceeded VRAM. "6.5×" is a property of a matched block/VRAM/GPU
    combination, not of `-G`. (encode.su refuses automated fetches; these quotes come from the
    indexed thread text, so treat them as second-hand until someone opens the page.)
-3. **A 318 MB BWT block is incompatible with narc as designed** — the BWT block *is* the compression
+3. **A 318 MB BWT block is incompatible with nova as designed** — the BWT block *is* the compression
    unit, so it is also the edit granularity (edit cost ∝ block) and the extraction working set
-   (libbsc's CPU decode is 16 MB + 5× block ⇒ 1.6 GB for a 318 MB block). Any BWT codec in `.narc`
+   (libbsc's CPU decode is 16 MB + 5× block ⇒ 1.6 GB for a 318 MB block). Any BWT codec in `.nva`
    must keep the block at the existing chunk cap (≤16 MiB), where 5× block = 80 MiB and bounded
    extraction still holds — and where the *ratio* case for BWT is unmeasured, because bsc's published
    ratios all come from huge blocks.
 
 **But the honest framing: this is a codec decision wearing a GPU costume.** GPU BWT is only useful
-if `.narc` gains a BWT-based codec. The relevant comparison is therefore *libbsc on the CPU vs
-narc's current max tier*, and that is a question for the codec research track (doc 01), not this
+if `.nva` gains a BWT-based codec. The relevant comparison is therefore *libbsc on the CPU vs
+nova's current max tier*, and that is a question for the codec research track (doc 01), not this
 one. Two facts that make it worth asking: bsc's CPU path did 10 GB in 159 s (~63 MB/s, **at 318 MB
-blocks and 8 threads** — not a like-for-like against narc's 16 MiB units) while narc's max tier does
+blocks and 8 threads** — not a like-for-like against nova's 16 MiB units) while nova's max tier does
 ~5 MB/s, and BWT+CM is historically competitive with PPMd on text. If libbsc earns a place on merit
-*at narc's block size*, `-G` is then a bonus on the transform stage for NVIDIA users, and the
+*at nova's block size*, `-G` is then a bonus on the transform stage for NVIDIA users, and the
 fallback is the same code path with `-G` off.
 
 Caveats to carry: libcubwt is CUDA C++ (needs the toolkit at build time, NVIDIA-only at runtime), and
 at 16 MiB per unit only 328 MiB of VRAM is needed — the constraint flips from memory to launch
 granularity. The good news for small units is that libcubwt's own table still shows 570–1300 MB/s at
-0.8–10 MB inputs against libsais' 43–98 MB/s, so the per-block advantage does not evaporate at narc's
+0.8–10 MB inputs against libsais' 43–98 MB/s, so the per-block advantage does not evaporate at nova's
 scale; the open question is per-launch overhead across thousands of units, which the repo's
 minimum-of-five-runs methodology hides. Batching many units per launch would be required.
 
@@ -505,7 +505,7 @@ WGSL-specific friction for byte-oriented compression work, worth knowing before 
   ([wgpu CHANGELOG](https://github.com/gfx-rs/wgpu/blob/trunk/CHANGELOG.md)).
 - The TDR watchdog (§2) applies to every backend, not just CUDA.
 
-If narc ever ships GPU code, the shape is fixed by the above: **a separately loaded optional module,
+If nova ever ships GPU code, the shape is fixed by the above: **a separately loaded optional module,
 probed at runtime, with a CPU implementation that is always present and always correct**, and no
 GPU-only bytes in the format. That is already the recorded GPU policy in `ROADMAP.md`; nothing in
 this report changes it.

@@ -1,13 +1,13 @@
 # Research 11 — Where 7-Zip Is Actually Weak (and where it is not)
 
 **Scope:** the 7z format and 7-Zip implementation as adversary; RAR5 and zpaqfranz on the same axes;
-what `.narc` must do to be *strictly* better.
+what `.nva` must do to be *strictly* better.
 **Date:** 2026-08-17.
 **Everything numeric in this report was measured on this machine unless labelled "claimed".**
 
 Test rig: Windows 11 IoT Enterprise LTSC 2024, 8 logical cores, 32 GiB RAM (≈13 GiB free),
 NVMe on `D:`. **7-Zip 26.02 (x64), 2026-06-25** (locally installed, `C:\Program Files\7-Zip`).
-`narc` = local release build, format v0.2, `--full` (no throttling), tier `max`.
+`nova` = local release build, format v0.2, `--full` (no throttling), tier `max`.
 Timings and peak working set captured by a PowerShell harness that polls
 `Process.PeakWorkingSet64` every 15 ms (`D:\tmp\7zw\mem.ps1`).
 
@@ -15,10 +15,10 @@ Timings and peak working set captured by a PowerShell harness that polls
 
 ## 0. Executive summary — the honest scoreboard
 
-| Axis | Is 7-Zip weak? | Inherent to the format? | Measured gap | narc action |
+| Axis | Is 7-Zip weak? | Inherent to the format? | Measured gap | nova action |
 |---|---|---|---|---|
-| 1. Solid-archive update cost | **Yes, per newly touched file** | Yes (folder = one coder stream) | 13.8–20.3 s + 1057 MiB RAM for a 29 KB edit vs narc 0.12 s | Keep; but fix `add <dir>` (§1.4) |
-| 2. No deduplication | Yes | **Yes** (substream map is sequential) | Cuts both ways: narc −3.5 % on far-apart dupes, **+30 % worse** on near dupes | Stop selling dedup as ratio |
+| 1. Solid-archive update cost | **Yes, per newly touched file** | Yes (folder = one coder stream) | 13.8–20.3 s + 1057 MiB RAM for a 29 KB edit vs nova 0.12 s | Keep; but fix `add <dir>` (§1.4) |
+| 2. No deduplication | Yes | **Yes** (substream map is sequential) | Cuts both ways: nova −3.5 % on far-apart dupes, **+30 % worse** on near dupes | Stop selling dedup as ratio |
 | 3. No trained dictionaries | **Yes** | Yes (LZMA2 props = 1 byte) | The whole 36.2 % small-files gap | **Biggest available lever** (§3) — but see §3.4 for its real cost |
 | 4. Extraction parallelism | **Yes** | No — implementation | 1.00× across solid blocks; 3.6× only inside one folder | Free win, already 2.5× |
 | 5. Extraction memory | **Yes** | Yes (LZ77 window must exist) | **1543.7 MiB to extract a 306 KiB archive** at `-md=1536m` | Keep O(chunk); advertise it |
@@ -39,28 +39,28 @@ Two findings you must internalise before writing any marketing copy:
   accumulate dead bytes; it pays CPU per touched file and ratio forever. Qualify the ROADMAP with
   **"first touch of each file"** — the premise is weakened, not wrong.
 * **Content-hash dedup is not a ratio story.** On three identical copies of a 126 MiB source
-  tree, `7z -mx9` produced **11.4 MiB** and narc produced **16.4 MiB** — 7-Zip won by 30 %,
+  tree, `7z -mx9` produced **11.4 MiB** and nova produced **16.4 MiB** — 7-Zip won by 30 %,
   because a 256 MiB LZMA window already covers the duplication. Dedup only wins when duplicates
   are farther apart than the dictionary, or when you cannot afford dictionary-sized RAM.
 
 ---
 
-## 0.1 CRITICAL — narc data-loss bug found while re-verifying this report
+## 0.1 CRITICAL — nova data-loss bug found while re-verifying this report
 
-Not a 7-Zip finding. Reproduced on this machine with the release build and `sil.narc`
+Not a 7-Zip finding. Reproduced on this machine with the release build and `sil.nva`
 (45 219 944 B, the *intact* Silesia archive from §12 — it differs from the deliberately corrupted
-`c-sil.narc` by exactly one byte, so it is not the damaged copy):
+`c-sil.nva` by exactly one byte, so it is not the damaged copy):
 
 ```
-$ narc list sil.narc          ->  "0 file(s)",  exit code 0, no error
-$ narc info sil.narc          ->  Files: 0  Chunks: 0  Live data: 0 B
-                                  Reclaimable: 43.1 MiB (run 'narc compact')
-$ cp sil.narc dl.narc && narc add dl.narc sil/xml
+$ nova list sil.nva          ->  "0 file(s)",  exit code 0, no error
+$ nova info sil.nva          ->  Files: 0  Chunks: 0  Live data: 0 B
+                                  Reclaimable: 43.1 MiB (run 'nova compact')
+$ cp sil.nva dl.nva && nova add dl.nva sil/xml
   exit code 0, no warning
   45 219 944 B  ->  498 724 B      # 44.7 MiB (98.9 %) destroyed
 ```
 
-**Mechanism.** `footer::VERSION` is now `(0, 3)`; `sil.narc` was written by the v0.2 build. The
+**Mechanism.** `footer::VERSION` is now `(0, 3)`; `sil.nva` was written by the v0.2 build. The
 version gate (`footer.rs:97`) only rejects archives *newer* than the build, so an older archive
 falls through to a manifest parse failure. `Archive::open` (`archive.rs:173`) then walks backwards
 through up to `MAX_FOOTER_CANDIDATES = 64` footer candidates; one of them verifies and yields an
@@ -82,7 +82,7 @@ back-pointer that must match); (3) never truncate on open — only on an explici
 `compact`; (4) an archive whose byte length greatly exceeds `live + reclaimable` derived from a
 scanned footer should be treated as unreadable, not as empty.
 
-This also generalises §6.2's milder observation ("`narc list` printed `0 file(s)` with no loud
+This also generalises §6.2's milder observation ("`nova list` printed `0 file(s)` with no loud
 error"): the same silent-empty path is not just bad UX, it is a data-destruction path.
 
 ---
@@ -134,10 +134,10 @@ So for the default `-mx9` (dict 256 MiB on 64-bit since 24.09) the **default sol
 | `16m` | 8 | 13 543 835 B (12.9 MiB) | +48.4 % | 17.89 s | 227 MiB | 2.89 s | 213 MiB |
 | `64m` | 3 | 10 241 470 B (9.8 MiB) | +12.2 % | 23.26 s | 722 MiB | 13.23 s | 724 MiB |
 | `on` (default) | 2 | **9 129 445 B (8.7 MiB)** | — | 24.19 s | 965 MiB | **20.25 s** | 1057 MiB |
-| **narc max** | — | 12 436 093 B (11.9 MiB) | +36.2 % | 49.43 s | 720 MiB | **0.12 s** | 8.5 MiB |
+| **nova max** | — | 12 436 093 B (11.9 MiB) | +36.2 % | 49.43 s | 720 MiB | **0.12 s** | 8.5 MiB |
 
 Read it as: **7-Zip's editability knob costs 2.60× ratio** (22.6 / 8.7 MiB) and buys 28× faster
-edits. narc currently sits at 7-Zip's `-ms≈24m` ratio with better-than-`-ms=off` edit cost, at
+edits. nova currently sits at 7-Zip's `-ms≈24m` ratio with better-than-`-ms=off` edit cost, at
 **1/125 of the edit RAM**. That is the correct positioning claim, and it is defensible.
 
 ### 1.4 The update model, precisely (this corrects the project's premise)
@@ -180,19 +180,19 @@ lives in a tiny folder, so further edits are ~0.6 s.
    true `-mx9` repack.
 
 **Revised verdict: 7-Zip trades CPU once per distinct file touched, plus a permanent ratio
-degradation, and silently drops to weaker settings unless you re-specify them; narc trades space
-until `compact`.** narc's edit cost does not depend on which file, or on how many were touched
+degradation, and silently drops to weaker settings unless you re-specify them; nova trades space
+until `compact`.** nova's edit cost does not depend on which file, or on how many were touched
 before.
 
-narc's own weak spot, measured on the same corpus:
+nova's own weak spot, measured on the same corpus:
 
-| operation | narc | 7-Zip `-ms=on` |
+| operation | nova | 7-Zip `-ms=on` |
 |---|---|---|
 | replace **one named file** | **0.12 s**, +84 KB appended | 0.59 s, +7.6 KB |
 | re-add the **whole directory** with 1 file changed | **45.01 s**, **+5.4 MiB** | **0.62 s**, +34 B |
 
-`narc add <archive> <dir>` re-reads and re-analyses all 5751 files and re-emits solid blocks;
-after 4 generations `narc info` reported `Reclaimable: 5.2 MiB` on a 12 MiB archive. This is the
+`nova add <archive> <dir>` re-reads and re-analyses all 5751 files and re-emits solid blocks;
+after 4 generations `nova info` reported `Reclaimable: 5.2 MiB` on a 12 MiB archive. This is the
 single most user-visible regression versus 7-Zip and it is an implementation gap, not a format
 one. Fix: mtime+size fast path against the manifest, and reuse existing block assignments for
 untouched members.
@@ -224,9 +224,9 @@ break.**
 | `7z -mx9 -mmt=2` | 24 842 978 B | (not timed) | — | `LZMA2:28` |
 | `7z -mx9 -mmt=1` | 24 842 831 B (23.7 MiB) | **458.3 s** | 2694 MiB | `LZMA2:28` |
 | `7z -mx9 -md=1536m` | 24 842 887 B | 320.8 s | 3959 MiB | `LZMA2:384m` (reduced) |
-| **narc max** | **23 966 015 B (22.9 MiB)** | **25.1 s** | **560 MiB** | — |
+| **nova max** | **23 966 015 B (22.9 MiB)** | **25.1 s** | **560 MiB** | — |
 
-narc beats 7-Zip's *best* result by 3.5 % while being **12.8× faster** and using **7× less RAM**;
+nova beats 7-Zip's *best* result by 3.5 % while being **12.8× faster** and using **7× less RAM**;
 it beats the *default* by 2.07× and 8.6×.
 
 ### 2.3 The reason 7-Zip's default doubled — its own multithreading
@@ -278,19 +278,19 @@ corollaries worth remembering:
 | | archive | time | peak RAM |
 |---|---|---|---|
 | `7z -mx9` | **11 965 720 B (11.4 MiB)** | 68.1 s | 2815 MiB |
-| narc max | 17 154 751 B (16.4 MiB) | 50.0 s | 2825 MiB |
+| nova max | 17 154 751 B (16.4 MiB) | 50.0 s | 2825 MiB |
 
 **7-Zip wins by 30 %.** The whole corpus fits inside two 256 MiB LZMA2 blocks, so LZ77 matching
-does the dedup *and* gets a better base ratio than narc's 32 MiB units.
+does the dedup *and* gets a better base ratio than nova's 32 MiB units.
 
 `dup8` = 8 identical copies (1004 MiB, 46 008 files):
 
 | | archive | time | peak RAM |
 |---|---|---|---|
 | `7z -mx9` | 26 201 966 B (25.0 MiB) | 114.1 s | **7392 MiB** |
-| narc max | **23 304 168 B (22.2 MiB)** | 135.6 s | 4832 MiB |
+| nova max | **23 304 168 B (22.2 MiB)** | 135.6 s | 4832 MiB |
 
-narc wins ratio by 11 % and loses time by 19 %; 7-Zip needed **7.2 GiB of RAM to compress 1 GiB**.
+nova wins ratio by 11 % and loses time by 19 %; 7-Zip needed **7.2 GiB of RAM to compress 1 GiB**.
 
 **Blunt conclusion:** dedup is an *edit-locality and RAM* feature, not a ratio feature. Its ratio
 payoff appears only past the dictionary distance. Anyone who benchmarks "3 copies of my repo"
@@ -309,9 +309,9 @@ preset dictionary; LZMA1's 5-byte props carry only `lc/lp/pb` + `dictSize`. Noth
 (`BCJ, BCJ2, ARM64, RISCV, PPC, IA64, ARM, ARMT, SPARC, Swap2, Swap4, Delta`) and `7zAES`
 (verified via `7z i`). **No zstd/brotli/lz4 encoder for the 7z container at all.**
 
-### 3.2 narc already ships the capability — verify before designing anything else
+### 3.2 nova already ships the capability — verify before designing anything else
 
-The LZMA authors describe narc's exact situation in
+The LZMA authors describe nova's exact situation in
 [`liblzma/api/lzma/lzma12.h`](https://raw.githubusercontent.com/tukaani-project/xz/master/src/liblzma/api/lzma/lzma12.h):
 
 > "It is possible to initialize the LZ77 history window using a preset dictionary. It is useful
@@ -320,7 +320,7 @@ The LZMA authors describe narc's exact situation in
 > The most probable strings should be near the end of the preset dictionary."
 
 liblzma only allows this on the **raw** encoder/decoder (not inside `.xz`/`.lzma`) — which is fine,
-because `.narc` is our own container. And crucially, **the crate narc already depends on supports
+because `.nva` is our own container. And crucially, **the crate nova already depends on supports
 it on both sides** (`lzma-rust2` 0.19.0, vendored at
 `~/.cargo/registry/src/index.crates.io-*/lzma-rust2-0.19.0/`):
 
@@ -344,7 +344,7 @@ So the trained-dictionary lever is cleanly available for **LZMA2 and zstd, not P
 ### 3.3 Why this is the right fix for the 36.2 % small-files gap
 
 The gap on the source tree is 11.9 → 8.7 MiB (`+36.2 %` in §1.3's table; closing it means removing
-26.6 % of narc's output). 7-Zip closes it with a 256 MiB window, paying
+26.6 % of nova's output). 7-Zip closes it with a 256 MiB window, paying
 965 MiB to compress, 264 MiB to extract, and 20 s per first edit. A per-extension trained
 dictionary of 16–64 MiB, stored once as an immutable archive object and passed to
 `set_preset_dict`, gives the *same* cross-file redundancy while:
@@ -367,7 +367,7 @@ Three costs, all checkable in `lzma-rust2` 0.19.0, that the bullet list above hi
 
 1. **Encode pays the dictionary on every unit.** `src/lz/lz_encoder.rs:267` ends `set_preset_dict`
    with `match_finder.skip(self, copy_size)` — the match finder is driven across the *entire*
-   preset dictionary before the unit's first byte is encoded. At narc's max tier that finder is
+   preset dictionary before the unit's first byte is encoded. At nova's max tier that finder is
    bt4, so this is dictionary-sized work per unit on top of the unit itself. This is the same
    objection §3.2 uses to reject PPMd priming. It applies to LZMA2 too — just one-sided, because
    decode only memcpys the preset into the window (`lz_decoder.rs:20-32`).
@@ -378,7 +378,7 @@ Three costs, all checkable in `lzma-rust2` 0.19.0, that the bullet list above hi
    preset_dict.len().min(dict_size)` on both sides (`lz_encoder.rs:263`, `lz_decoder.rs:26`). A
    64 MiB dictionary is only *used* if `dict_size >= 64 MiB`.
 
-Point 3 collides head-on with narc's own invariant. `narc-core/src/codec.rs:95` derives the window
+Point 3 collides head-on with nova's own invariant. `nova-core/src/codec.rs:95` derives the window
 purely from the payload:
 
 ```rust
@@ -394,7 +394,7 @@ caller-supplied length instead of a flat 4 MiB per worker". A preset dictionary 
 exists to avoid, and 4–16× larger than the 4 MiB it already rejected. **§5 calls the chunk-bounded
 extraction invariant "sacred"; §3.3 spends it.** Both cannot stand as written.
 
-So the honest framing: preset dictionaries trade narc's most *verifiable* differentiator — a
+So the honest framing: preset dictionaries trade nova's most *verifiable* differentiator — a
 306 KiB archive opens in ~10 MiB where 7-Zip needs 1.5 GiB — for ratio. That may still be the right
 trade, but it is a trade, and the dictionary should be sized as the smallest that closes most of
 the gap, not 16–64 MiB by assertion.
@@ -457,8 +457,8 @@ Three hard conclusions:
    switch with a decoding side-effect that only materialises when compression already sacrificed
    the window.
 
-narc for contrast (Silesia, tier max): extract `-j1` **16.89 s**, `-j8` **6.67 s** (2.53×).
-So narc's parallelism advantage is real *but currently spent covering a much slower codec* — see §12.
+nova for contrast (Silesia, tier max): extract `-j1` **16.89 s**, `-j8` **6.67 s** (2.53×).
+So nova's parallelism advantage is real *but currently spent covering a much slower codec* — see §12.
 
 ---
 
@@ -491,8 +491,8 @@ Two aggravating facts:
   compression, if RAM size is not enough") — i.e. low RAM silently costs you threads *and*,
   per §2.3, changes the ratio.
 
-**narc's counter-claim, measured:** Silesia extraction peaked at 74 MiB for a single 9.7 MiB file
-and 123 MiB for the full 203 MiB archive at `-j1`. `narc info`/`list` on a 17 253-file archive
+**nova's counter-claim, measured:** Silesia extraction peaked at 74 MiB for a single 9.7 MiB file
+and 123 MiB for the full 203 MiB archive at `-j1`. `nova info`/`list` on a 17 253-file archive
 peaked under 10 MiB. Bounded-by-chunk extraction is a genuine, checkable differentiator; keep the
 `MAX_CHUNK`-bounded invariant sacred.
 
@@ -520,15 +520,15 @@ end of archive" rather than failing).
 |---|---|---|---|
 | `sil-solid.7z` | 1 folder, 203 MiB | 115 513 230 B = **54.5 %** | reymont, samba, sao, webster, x-ray, xml; osdb truncated |
 | `sil-16m.7z` | 10 folders | 206 350 221 B = **97.4 %** | osdb truncated only |
-| `sil.narc` | ~16 MiB chunks | 139 322 729 B = **65.7 %** | **and narc aborted (exit 1)** |
+| `sil.nva` | ~16 MiB chunks | 139 322 729 B = **65.7 %** | **and nova aborted (exit 1)** |
 
 Header damage: 10 bytes clobbered near EOF → `7z l` reports `Headers Error`, archive unopenable
-(no redundancy for the header at all). narc's footer damaged the same way → `narc list` printed
+(no redundancy for the header at all). nova's footer damaged the same way → `nova list` printed
 `0 file(s)` **with no loud error**, which is worse UX than an explicit failure.
 
-**narc's own gap here is embarrassing and cheap to fix:** narc stops at the first bad chunk instead
+**nova's own gap here is embarrassing and cheap to fix:** nova stops at the first bad chunk instead
 of skipping it, so four files whose chunks were intact were never written. Skip-and-continue plus a
-per-file damage report would already put narc ahead of solid 7z, before any parity data exists.
+per-file damage report would already put nova ahead of solid 7z, before any parity data exists.
 
 ### 6.3 What a modern format should do
 
@@ -540,14 +540,14 @@ for continuous damage but "significantly more efficient in the case of multiple 
 [win-rar.com explainer](https://www.win-rar.com/recovery-record.html?L=0)). Note the limit:
 "the Repair command does not fix broken blocks in the recovery record itself".
 
-Recommended design for `.narc`:
+Recommended design for `.nva`:
 
 * **Two tiers.** Always protect the footer + manifest (kilobytes; makes the difference between
   "unopenable" and "fully listable"). Optionally protect the chunk log at a user-chosen percent.
 * **Detection separate from correction.** Per-shard CRC32c; RS reconstructs only shards you know
   are bad. This is what PAR2/PAR3 do at format level, and what the Rust crates explicitly require.
 * **Codec:** [`reed-solomon-simd`](https://docs.rs/reed-solomon-simd/) **3.1.0** (2025-10-14),
-  licence **MIT AND BSD-3-Clause** (both apply — compatible with an open-source narc, but the
+  licence **MIT AND BSD-3-Clause** (both apply — compatible with an open-source nova, but the
   BSD-3 attribution clause must be carried). Fork of Markus Laire's `reed-solomon-16`, itself based
   on Leopard-RS by Christopher A. Taylor; GF(2^16), O(n log n), runtime SSSE3/AVX2/Neon selection
   with a plain-Rust fallback, 1–32768 original × 1–32768 recovery shards, and since 3.0.0 shard
@@ -556,7 +556,7 @@ Recommended design for `.narc`:
 * **Append-only.** Parity as a separate trailing section referenced by the footer keeps the
   append-only commit protocol intact and lets `compact` regenerate it. **Unresolved tension:** every
   append invalidates the parity that covered the previous chunk log, so parity is either recomputed
-  on each commit (which reintroduces exactly the whole-archive rewrite cost narc exists to avoid) or
+  on each commit (which reintroduces exactly the whole-archive rewrite cost nova exists to avoid) or
   left stale until `compact`. Stale parity must be *recorded as stale* in the footer, or the format
   promises protection it does not have. The tiering above makes this tractable — footer+manifest
   parity is kilobytes and can be rewritten every commit; bulk chunk parity is the part that must be
@@ -589,15 +589,15 @@ itself a compressed stream. Measured on a 17 253-file archive:
 | `Headers Size`, `-mhc=off` | 2 864 598 B ≈ 166 B/file |
 | header compression factor | **27.5×** |
 | `7z l` wall time (17 253 files) | **0.063–0.064 s** |
-| `narc list` wall time, same file count | 0.096–0.102 s |
-| `narc info` | 0.037 s |
+| `nova list` wall time, same file count | 0.096–0.102 s |
+| `nova info` | 0.037 s |
 
-*(An earlier measurement through the PowerShell harness showed `narc list` at ~1.8 s. That was a
+*(An earlier measurement through the PowerShell harness showed `nova list` at ~1.8 s. That was a
 harness artefact — the shell-`time` numbers above are the correct ones. Recording it so nobody
 re-derives the wrong conclusion.)*
 
 7-Zip additionally writes `kDummy (0x19)` padding blocks since 9.26 "for faster archive opening".
-**There is no listing-cost weakness to exploit.** narc is at parity and should stay there; the only
+**There is no listing-cost weakness to exploit.** nova is at parity and should stay there; the only
 metadata weakness is the encryption leak in §8.
 
 ---
@@ -660,7 +660,7 @@ checksums instead of CRC32, and — the detail 7-Zip missed — *"if archive hea
 encrypted, file checksums for encrypted RAR 5.0 files are modified using a password-dependent
 algorithm so that file contents cannot be guessed from checksums."* Still no AEAD.
 
-### 8.4 narc's requirements (and a trap specific to dedup)
+### 8.4 nova's requirements (and a trap specific to dedup)
 
 * Argon2id (or scrypt) with a **16-byte random salt** stored in the header; tunable, recorded.
 * **AEAD per chunk** — XChaCha20-Poly1305 or AES-256-GCM-SIV — with the chunk index and archive id
@@ -698,7 +698,7 @@ full folder decode. The earlier 0.43 s figure was 8 threads decoding *everything
 a seek. **Random-access granularity in 7z is the folder, period**, because intra-folder chunk
 offsets are not indexed in the header.
 
-narc for contrast: `dickens` 2.07 s / 74 MiB, `xml` 0.33 s / 37.7 MiB — cost tracks the file's own
+nova for contrast: `dickens` 2.07 s / 74 MiB, `xml` 0.33 s / 37.7 MiB — cost tracks the file's own
 size, not its position. That is the right property; the per-byte constant is the problem (§12).
 
 ---
@@ -726,7 +726,7 @@ symlink, `0x0003` Windows junction, `0x0004` Hard link, `0x0005` File copy.
 `0x0005 File copy` deserves a note: **RAR5 has file-level dedup** that 7z lacks — an identical
 file can be stored as a redirection instead of data.
 
-This is the cheapest differentiator on the list. narc's ROADMAP already lists empty dirs, symlinks,
+This is the cheapest differentiator on the list. nova's ROADMAP already lists empty dirs, symlinks,
 NTFS attrs/ADS and ACLs as "not preserved yet"; shipping them makes a factual claim no `.7z` can
 match, and matters for real backup use.
 
@@ -749,13 +749,13 @@ From the locally installed `History.txt` and [7-zip.org/history.txt](https://www
 encryption, or the memory model.** The trajectory is maintenance, format-handler breadth, and CVE
 response. Two things to respect rather than dismiss: the CVE cadence is real work (five CVEs in
 14 months, mostly in foreign-format parsers — an argument for `#![forbid(unsafe_code)]` in
-narc-core), and the huge-pages work shows Pavlov still optimises the hot path.
+nova-core), and the huge-pages work shows Pavlov still optimises the hot path.
 
 ---
 
 ## 12. Cross-check: RAR5 and zpaqfranz on the same axes
 
-| axis | 7z (26.02) | RAR5 (WinRAR 7.x) | zpaqfranz (v64.x, MIT) | narc today |
+| axis | 7z (26.02) | RAR5 (WinRAR 7.x) | zpaqfranz (v64.x, MIT) | nova today |
 |---|---|---|---|---|
 | dedup | **none** (format-inherent) | file-level via `0x0005 File copy`; hard links | **fragment-level CDC dedup** — closest prior art | chunk-level CDC |
 | journaling / versions | none | none | **yes**, append-only, rollback | append-only, single version |
@@ -777,14 +777,14 @@ to restart the archive every 1000–2000 versions on HDD; no recovery record; ex
 file from a stored disk image requires a temp extract. The ZPAQL bytecode VM bought forward
 compatibility at enormous complexity cost and **nobody copied it** — version the format instead.
 
-### The narc weakness this comparison exposes
+### The nova weakness this comparison exposes
 
 | Silesia, 203 MiB | archive | compress | **extract to disk, 1 thr** | **extract to disk, 8 thr** |
 |---|---|---|---|---|
 | `7z -mx9 -ms=on` | 48 688 197 B (46.4 MiB) | 66.1 s / 2089 MiB | **1.88 s** / 209 MiB | 1.89 s / 256 MiB |
-| `narc max` | **45 219 944 B (43.1 MiB)** | **36.5 s** / 701 MiB | **16.89 s** / 123 MiB | 6.67 s / 427 MiB |
+| `nova max` | **45 219 944 B (43.1 MiB)** | **36.5 s** / 701 MiB | **16.89 s** / 123 MiB | 6.67 s / 427 MiB |
 
-narc wins ratio by 7.1 % and compression speed by 1.8×, and **loses decompression by 9.0× single
+nova wins ratio by 7.1 % and compression speed by 1.8×, and **loses decompression by 9.0× single
 -threaded and 3.5× at 8 threads.** Root cause: PPMd7 is roughly symmetric, while LZMA2 decodes
 ~10× faster than it encodes. Archives are written once and read many times; a max tier that is
 9× slower to read is a real product problem, and on a weak single-core PC (an explicit project
@@ -853,11 +853,11 @@ Re-measured independently against the same 7-Zip 26.02 install and surviving art
 * The small-files gap is **36.2 %** (§1.3's own table), not 31 %.
 * §1.4's update model: the repack recurs **per newly touched file** (13.8/14.0/13.8 s for three
   further files, blocks 4→5→6→7), and `7z u` silently drops `LZMA2:28`→`LZMA2:25`.
-* §12's narc dictionary row (was "chunk-bounded (16 MiB)").
+* §12's nova dictionary row (was "chunk-bounded (16 MiB)").
 * §3 gained §3.4/§3.5: the preset-dictionary cost model and the zstd-vs-LZMA2 conflation.
 
-**Could not re-verify:** narc's own extraction timings (§9, §12) — `sil.narc` is unreadable by the
+**Could not re-verify:** nova's own extraction timings (§9, §12) — `sil.nva` is unreadable by the
 current build, which is what exposed §0.1. Note that `mem.ps1` (PowerShell `Start-Process`) inflates
 short runs by ~0.3 s versus direct exec: 7z full Silesia extract is **1.548 s** direct vs 1.88 s
-harnessed. Applying that correction makes narc's single-threaded decode deficit ≈**10.7×**, i.e.
+harnessed. Applying that correction makes nova's single-threaded decode deficit ≈**10.7×**, i.e.
 §12 *understates* the problem. Never compare a harnessed number against a shell-timed one.
