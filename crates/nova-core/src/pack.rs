@@ -24,7 +24,7 @@ use std::fs::File;
 use std::io::{BufReader, Read, Write};
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::{ensure, Context, Result};
 use fastcdc::v2020::StreamCDC;
 
 use crate::analyze::{self, Kind, Tier};
@@ -216,16 +216,24 @@ impl Packer {
         let mut peek = [0u8; 12];
         // Same for a JPEG: lepton reads one whole file, not a fragment of one.
         // And for a .wav, whose RIFF chunk list has to arrive intact.
-        let recompressible = meta.len() >= MIN_CONTAINER
-            && meta.len() <= self.geom.unit * 2
-            && File::open(disk)
-                .and_then(|mut f| f.read(&mut peek))
-                .map(|n| {
-                    analyze::is_deflate_container(&peek[..n])
-                        || analyze::is_jpeg(&peek[..n])
-                        || crate::wav::is_wav(&peek[..n])
-                })
-                .unwrap_or(false);
+        let magic = File::open(disk)
+            .and_then(|mut f| f.read(&mut peek))
+            .map(|n| &peek[..n])
+            .unwrap_or(&[]);
+        let (is_wav, is_container) = (
+            crate::wav::is_wav(magic),
+            analyze::is_deflate_container(magic) || analyze::is_jpeg(magic),
+        );
+        // THE CAP IS THE READER'S, not a heuristic about memory. A solo unit is
+        // one whole file, and `read_packed` REFUSES a chunk above
+        // `MAX_STORED_CHUNK` — so raising this alone writes archives nova
+        // cannot extract. Measured the hard way: at `unit * 4` a real .wav
+        // corpus packed happily, listed happily, and failed on extract with
+        // "corrupt manifest: implausible chunk size". The `min` states the
+        // dependency instead of leaving `unit * 2` to coincide with it.
+        let cap = (self.geom.unit * 2).min(crate::archive::MAX_STORED_CHUNK);
+        let recompressible =
+            meta.len() >= MIN_CONTAINER && meta.len() <= cap && (is_wav || is_container);
         let deflate_container = recompressible;
 
         let mut whole: Option<Vec<u8>> = None;
@@ -396,6 +404,18 @@ impl Packer {
             return Ok(());
         }
         let buf = std::mem::take(&mut self.buf);
+        // The backstop for the bound the solo cap is derived from. Every other
+        // path is bounded by the geometry, so reaching this is a bug — and the
+        // right answer to that bug is to refuse, loudly, before anything is
+        // written. An archive that packs and lists and cannot extract is the
+        // worst outcome an archiver has, because the source may be gone by the
+        // time anyone finds out.
+        ensure!(
+            buf.len() as u64 <= crate::archive::MAX_STORED_CHUNK,
+            "internal error: a {}-byte unit exceeds the {}-byte chunk a reader accepts",
+            buf.len(),
+            crate::archive::MAX_STORED_CHUNK
+        );
         let kind = self.kind.take();
         let traced = self
             .trace

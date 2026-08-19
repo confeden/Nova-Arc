@@ -45,8 +45,13 @@ pub(crate) const HEAD_SAMPLE: usize = 1024 * 1024;
 
 /// Upper bound on a stored chunk. A max-tier unit is capped at twice
 /// `MAX_CHUNK`, and the check below is a strict `>`, so units of exactly 64 MiB
-/// are admitted. This may be raised, never lowered.
-const MAX_STORED_CHUNK: u64 = MAX_CHUNK as u64 * 2;
+/// are admitted. This may be raised, never lowered — and raising it is a FORMAT
+/// change, because an older reader refuses what a newer writer would emit.
+///
+/// `Packer` derives its solo-unit cap from this, and `Packer::flush` asserts
+/// against it: a unit above this bound is an archive nova writes, lists, and
+/// then cannot extract.
+pub(crate) const MAX_STORED_CHUNK: u64 = MAX_CHUNK as u64 * 2;
 
 /// Upper bound on the buffer a codec is asked to produce. A length-changing
 /// filter makes this bigger than the unit — undoing deflate turns a zip into

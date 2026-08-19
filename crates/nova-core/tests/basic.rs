@@ -1169,6 +1169,76 @@ fn wav_audio_is_recompressed_and_still_extracts() {
     assert_same_tree(&src, &out.join("audio"));
 }
 
+/// A .wav too large for a unit of its own must still come back byte for byte.
+///
+/// The solo cap is the READER'S bound, not a heuristic: `read_packed` refuses a
+/// chunk above `MAX_STORED_CHUNK`, so a packer that hands a bigger file its own
+/// unit produces an archive that packs, lists, and then fails to extract with
+/// "corrupt manifest: implausible chunk size". Measured by doing it. This holds
+/// the fallback: past the cap the file takes the ordinary binary path, keeps
+/// the record-width filter, and round-trips.
+#[test]
+fn a_wav_past_the_solo_cap_falls_back_and_round_trips() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("audio");
+    fs::create_dir_all(&src).unwrap();
+
+    // The fast tier's unit is 4 MiB, so its solo cap is 8 MiB. Comfortably past.
+    let frames = 3_000_000usize;
+    let mut pcm = Vec::with_capacity(frames * 4);
+    let mut seed = 0x51ED_2701_A3B4_C5D6u64;
+    for i in 0..frames {
+        let t = i as f64;
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        let d = (seed >> 48) as i16 % 28;
+        pcm.extend_from_slice(&(((t * 0.0107).sin() * 10500.0) as i16).wrapping_add(d).to_le_bytes());
+        pcm.extend_from_slice(&(((t * 0.0089).cos() * 9800.0) as i16).wrapping_sub(d).to_le_bytes());
+    }
+    let mut wav = Vec::with_capacity(pcm.len() + 44);
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&((36 + pcm.len()) as u32).to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&2u16.to_le_bytes());
+    wav.extend_from_slice(&44100u32.to_le_bytes());
+    wav.extend_from_slice(&(44100u32 * 4).to_le_bytes());
+    wav.extend_from_slice(&4u16.to_le_bytes());
+    wav.extend_from_slice(&16u16.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&(pcm.len() as u32).to_le_bytes());
+    wav.extend_from_slice(&pcm);
+    assert!(wav.len() > 8 * 1024 * 1024, "must exceed the fast tier's cap");
+    fs::write(src.join("long.wav"), &wav).unwrap();
+
+    let arc = tmp.path().join("w.nva");
+    let mut a = Archive::create(&arc).unwrap();
+    a.add_paths(std::slice::from_ref(&src), &PackOptions::new(Tier::Fast))
+        .unwrap();
+    assert!(
+        a.manifest.chunks.iter().all(|c| c.filter != 38),
+        "past the cap the flac transform must not be reached"
+    );
+    // No unit may exceed what a reader accepts, whatever path produced it.
+    assert!(
+        a.manifest.chunks.iter().all(|c| c.unpacked <= 64 * 1024 * 1024),
+        "a unit above MAX_STORED_CHUNK cannot be extracted"
+    );
+    // The record-width filter is the fallback, and it must still be there.
+    assert!(
+        a.manifest.chunks.iter().any(|c| (2..=33).contains(&c.filter)),
+        "the fallback path must keep the record-width filter"
+    );
+    drop(a);
+
+    let a = Archive::open_ro(&arc).unwrap();
+    let out = tmp.path().join("out");
+    a.extract(&out, None, Overwrite::Fail).unwrap();
+    assert_same_tree(&src, &out.join("audio"));
+}
+
 /// One big file, extracted with the intra-file decode lanes.
 ///
 /// Extraction parallelises across FILES, so an archive holding a single large

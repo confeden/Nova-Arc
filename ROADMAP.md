@@ -23,20 +23,20 @@
   virtualized list with glyphs + unit badges, sortable columns, multi-select,
   context menu, double-click opens from a temp dir, Explorer drag&drop both ways,
   throttled progress, level/memory in toolbar (DEFAULT max), argv[1] opens.
-- 95 tests green, clippy clean: roundtrip, append without rewrite, dedup,
+- 96 tests green, clippy clean: roundtrip, append without rewrite, dedup,
   replace, remove+compact, rename, selective extract, crash recovery, torn
   manifest, embedded/forged footer, writer lock, selectors, pre-1970 mtime,
   overwrite policy, compact-detects-corruption, the progress contract,
   deflate/JPEG/PDF/WAV round-trips, the PDF traps, the record-width filter on
-  interleaved PCM, one large file through the decode lanes, and the
-  `legacy-*.nva` fixtures.
+  PCM, a .wav past the solo cap, one large file through the decode lanes, and
+  the `legacy-*.nva` fixtures.
 - Compression v2 DONE: codec+filter per content class, solid blocks by extension,
   LZMA2 + PPMd7 + bsc, BCJ x86 + delta (BCJ verified against liblzma).
 - Measured residue: BCJ on real .exe +4.4-5.7% vs unfiltered. PPMd7 vs zstd-19
   on 4 MiB prose -24%; LZMA2 vs zstd-19 on prose ±2%. Peak RAM tracks `--memory`
   on EXTRACT too (256M→153 MiB, default→1.0 GiB) — bounded, but "~10 MiB peak"
   is long gone, units are the cost.
-- `test/` = local playground (gitignored). zip/7z/rar and GPU: not started.
+- `test/` = playground (gitignored). zip/7z/rar and GPU: not started.
 
 ## Architecture & invariants
 
@@ -45,11 +45,11 @@
   rewritten except by `compact`.
 - Benches: test/{bench-std,scaling,bwt-sweep,compare-7z,edit-cost,audio-bench,
   delta-gate-check}.sh.
-- Commit = manifest → fsync → footer → fsync; without the barrier a valid footer
-  can point at a torn manifest.
-- Footer self-hash covers its own absolute offset, so a `.nva` stored inside
-  another archive cannot be mistaken for a commit. Readers verify each footer
-  candidate's manifest and resume the backward scan on failure (≤64).
+- Commit = manifest → fsync → footer → fsync; without the barrier a valid
+  footer can point at a torn manifest.
+- Footer self-hash covers its own absolute offset, so a `.nva` inside another
+  archive cannot be mistaken for a commit. Readers verify each candidate's
+  manifest and resume the backward scan on failure (≤64).
 - Packing invariant: the writer appends chunks in submission order, so the reader
   predicts each index as `base + submission index` and builds entries early.
 - PROGRESS CONTRACT (`Progress`, `Phase`, `archive::Reporter`). `bytes_done` =
@@ -61,10 +61,10 @@
   in `Budget::acquire` holding it and stalls the writer. Throttling lives in
   core, clocks in the GUI — do NOT add a timer thread to core.
 - Memory model: `budget ≈ 32 MiB base + workers × (tables + 8 MiB) + queued`;
-  workers capped by the budget, then in-flight bytes capped by the workers.
-  Table cost per tier in `Tier::worker_memory()` (fast 4, normal 40, max 56).
-- Chunk hash = blake3(uncompressed)[..16]; serves dedup AND extract integrity.
-  Dead chunk records stay as dedup sources until compact.
+  workers capped by the budget, then in-flight bytes by the workers. Table cost
+  per tier in `Tier::worker_memory()` (fast 4, normal 40, max 56).
+- Chunk hash = blake3(uncompressed)[..16]: dedup AND integrity. Dead records
+  stay as dedup sources until compact.
 - INTRA-FILE DECODE LANES. Threads the file count cannot use become lanes
   INSIDE each file (`lanes_per_worker = budget / workers`), so a one-file
   archive stops using one thread while total concurrency, memory, ordering,
@@ -73,9 +73,9 @@
     unit and the sequential path got that free from `UnitCache`. Per extent it
     decoded the same unit once per lane — enwik8 4.8 → 8.2 s. Running out of
     handles means fewer lanes, not an error.
-- PPMd7 order (10) and pool formula (32x chunk, cap 64 MiB) are FORMAT
-  CONSTANTS — not stored per chunk, so changing them breaks old archives. Order
-  10 beat 12/16: a pool-exhaustion restart costs more than depth gains.
+- PPMd7 order (10) and pool formula (32x chunk, cap 64 MiB) are FORMAT CONSTANTS
+  — not stored per chunk, so changing them breaks old archives. Order 10 beat
+  12/16: a pool-exhaustion restart costs more than depth gains.
 - LZMA2 presets 6..9 differ only in dictionary size, which the chunk cap
   overrides, so max raises nice_len instead (xz -e style).
 - Codec and filter ids are tabulated in `docs/format.md`; keep it in step. A
@@ -96,18 +96,16 @@
 - A content-defined cut may only fire at or above HALF the target: the low tail
   is pure loss, and it made boundaries LESS stable. MEASURED both ways.
 - A unit's codec+filter come from a BYTE-MAJORITY VOTE of the per-file verdicts,
-  never from the unit's head sample (`Packer::unit_plan`). One sub-4 KiB `.flac`
-  ahead of `.go` made the head say "already compressed" and 8.36 MB of source
-  was stored raw. Only a unit with NO voters reads the head.
-- REALIZED unit geometry (test/corpus at max): 6 units, size-weighted mean
-  41.42 MiB, 79% of bytes in units >= 16 MiB.
-- Two-phase pipeline: `analyze::plan()` (magic → class → trial) gives
-  codec+filter, then per-chunk compression. fast=zstd3, normal=zstd12+bsc,
-  max=LZMA2/PPMd7/bsc.
+  never the head sample (`Packer::unit_plan`). One sub-4 KiB `.flac` ahead of
+  `.go` made the head say "already compressed" and 8.36 MB was stored raw. Only
+  a unit with NO voters reads the head.
+- Realized unit geometry (test/corpus at max): 6 units, mean 41.42 MiB.
+- Two-phase pipeline: `analyze::plan()` (magic → class → trial) gives codec and
+  filter, then per-chunk compression. fast=zstd3, normal=zstd12+bsc, max=all.
 - `HEAD_SAMPLE` = 1 MiB, load-bearing: deflate leaves matches megabytes apart,
-  so a level-1 zip reads as +0.02% on a 64 KiB sample and −25.6% on a 1 MiB one.
-  Free — `add_file` chains the head in front of the file. Sub-tests keep their
-  caps (`TRIAL_SAMPLE` 64 KiB; the delta detector MUST stay capped).
+  so a level-1 zip reads as +0.02% on 64 KiB and −25.6% on 1 MiB. Free —
+  `add_file` chains the head in front of the file. Sub-tests keep their caps
+  (`TRIAL_SAMPLE` 64 KiB; the delta detector MUST stay capped).
 - Precompressed magic does NOT mean store — it is a claim about the FORMAT, not
   the bytes; storing on it alone cost 1.12 MB on a 4.93 MiB corpus. A 1 MiB
   zstd-1 trial must save >= 1%: compressible deflate lands at −3.9..−25.6%,
@@ -206,9 +204,8 @@
 - nova max is NOT faster than 7-Zip: Silesia 52.7 s vs 44.4 s, enwik8 77.7 s vs
   43.3 s. The old "6.8 s vs 49 s" predates the tournament; never requote it.
 - DECODE is DATA-DEPENDENT: Silesia nova 1.8 s vs kanzi -l9 50.5 s; enwik8 4.6 s.
-- kanzi -l7: Silesia 47,308,780 B in 6.15 s, the fast tier's bar. CAVEAT: kanzi's
-  default `-j` is HALF the cores, so bench-std gave it 4 threads against nova's
-  8; bwt-sweep and scaling pass `-j`.
+- kanzi -l7: Silesia 47,308,780 B in 6.15 s, the fast tier's bar. CAVEAT: its
+  default `-j` is HALF the cores, so bench-std gave it 4 threads against our 8.
 - BWT wins on SOME units and loses on others (`test/bwt-sweep.sh`), which is
   what a per-unit tournament settles.
   · enwik8 block sweep: 8 MiB 23,593,148 · 32 21,983,674 · 128 20,803,016 —
@@ -242,16 +239,13 @@
   (the floor ALONE made fast 5.1 MB worse); max is the floor.
 - Edit cost at max is ~4.7 MiB and ~40 s — the edited file lives in a 30-60 MB
   unit. Cheap edits are a fast/normal property (0.73 / 3.30 MiB).
-- The manifest is 91-92 KB of the source tree's gap to 7-Zip — real cost, and
-  the reason the manifest gets its own codec.
+- The manifest is 91-92 KB of the source tree's gap to 7-Zip — real cost.
 - MANIFEST CODEC: a manifest >= 128 KiB is offered to LZMA2 and the smaller
   result wins (682,799 B raw: zstd 19 84,565 vs LZMA2 74,690, −18.9%). The codec
   is read off the BYTES — a zstd frame starts 28 B5 2F FD and a raw LZMA2 stream
   never can — so there is no format field and every manifest ever written still
   decodes. Front-coding paths: another 7,663 B, not done, a format change.
 - nova's encoder is 0.24% BETTER than liblzma -9e on identical boundaries.
-- Tournament on a source tree: LZMA2 wins 5 of 6 units = 99.94% of stored bytes;
-  PPMd7 order 10 won one 35 KB unit, order 16 never won.
 - Diagnostics: `NOVA_UNIT_TRACE=<file>` logs one line per unit as it is built
   (idx, size, items, WHY it was cut, kind, ext histogram) — the cut reason exists
   only at pack time. `nova info --units` dumps them with the winning codec.
@@ -404,6 +398,12 @@
   6,952,563 through filter 38 — **−4.9% in 11m47s for 14 MB**, ~700x slower than
   the speed budget allows. Re-coding FLAC's Rice residuals could capture only
   part of that 5%, not the 16-22% deflate and JPEG gave. Audio is SOLVED.
+- Raising the packer's solo-unit cap on its own — it is the READER's bound in
+  disguise. `read_packed` refuses a chunk above `MAX_STORED_CHUNK` (2x
+  MAX_CHUNK = 64 MiB) and `unit * 2` merely equalled it. At `unit * 4` a real
+  WAV corpus packed, LISTED, and failed on extract with "corrupt manifest:
+  implausible chunk size". The cap now reads `min(unit * 2, MAX_STORED_CHUNK)`
+  and `Packer::flush` asserts the bound before anything is written.
 - Byte-plane split for 16-bit data — research 14 §7.2's top "ship-now"
   (-10..-11% on x-ray and mr vs LZMA2). DEAD, killed twice: bsc ALONE beats the
   proposed filter (x-ray 3,757,028 vs 3,999,186; mr 2,206,462 vs 2,473,757), and
@@ -507,11 +507,10 @@
 ## Open issues
 
 - Not preserved: empty dirs, symlinks, NTFS attrs/ADS, ACLs. Manifest in RAM.
-  Long Windows paths (>260) untested.
+  Long Windows paths untested.
 - Solid-block members are read whole into RAM at pack time (up to 8 MiB outside
   the pipeline budget). No trained dictionaries; no MP3 recompression.
-- A container larger than 2x the unit (64 MiB at max) is never recompressed — it
-  cannot get a unit of its own, so a big PDF or zip silently loses the feature.
+- A container past the solo cap is never recompressed — see Plans 1.
 - The outer extraction loop is still per FILE; lanes engage only below workers.
 - `--eco`/`--full`/EcoQoS built but not measured under load.
 - Progress granularity at max is bounded by the UNIT COUNT, not fixable in the
@@ -530,12 +529,13 @@ v0.7 recompression — deflate id 34, JPEG id 35, x86 split id 36, PDF images id
 The standing direction is the owner's: beat 7-Zip where it has NOTHING, rather
 than out-tune LZMA. Remaining, in measured order of value:
 
-1. A container larger than 2x the unit silently loses recompression, and .wav
-   made it the top item: at NORMAL that cap is 32 MiB, so 5 of 16 real tracks
-   (55% of the bytes) missed the filter and normal landed at 305,746,008 against
-   max's 276,221,291. FLAC frames are independent, so audio CAN be cut — but a
-   bare PCM slice carries no `fmt `, and `Filter` is one byte with nowhere to
-   put one, so this needs a per-unit filter parameter.
+1. A container past the solo cap silently loses recompression, and .wav made it
+   the top item. PRICED by breaking it: at `unit * 4` the WAV corpus went
+   276,221,291 → **265,279,950** at max (−4.0%) and 305,746,008 → **276,379,242**
+   at normal (−9.6%). But that cap IS `MAX_STORED_CHUNK`, so the only way to
+   collect it is to SPLIT, not to raise. FLAC frames are independent so audio
+   can be cut — a bare PCM slice carries no `fmt ` and `Filter` is one byte, so
+   it needs a per-unit filter parameter threaded through `Job`.
 2. AUDIO IS OTHERWISE DONE — see Negative knowledge for why FLAC residuals are
    not worth it. MP3 (packMP3, ~16%, LGPL-3.0, dormant) is the only piece left,
    and it is a licensing question before it is a code one.
