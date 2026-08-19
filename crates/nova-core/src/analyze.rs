@@ -308,28 +308,31 @@ pub fn plan(head: &[u8], tier: Tier) -> Plan {
             // nothing repeats byte for byte, yet each column changes slowly.
             // Differencing at the record width exposes that, and it is the
             // one case where data everyone calls incompressible is not.
-            // Data that already compresses is left alone: differencing it is
-            // a gamble that measured *worse* on source trees, and the codec
-            // is already finding those matches. The filter exists to rescue
-            // the other case — data that looks like noise to a match finder
-            // because it is a table of fixed-width records.
-            if compresses(head) {
-                return Plan {
-                    codec: general_codec(tier),
-                    filter: Filter::None,
-                    kind: Class::Generic,
-                };
-            }
+            //
+            // "Already compresses" is NOT a reason to skip the detector, and
+            // an early return on it cost 27% on 16-bit stereo PCM: a .wav
+            // compresses to 82% unfiltered, cleared the gate, and never met
+            // the filter that takes it to 60%. `pays_off` is the guard — it
+            // trials the transform and keeps it only on a clear win, which is
+            // exactly what the source trees the gate was written for need.
+            //
             // Capped deliberately: the detector runs one entropy pass per
             // candidate distance, so it is the one test whose cost scales with
             // the sample. 64 KiB is plenty to see a record structure.
-            match crate::filters::detect_delta_stride(&head[..head.len().min(TRIAL_SAMPLE)])
+            let filter = crate::filters::detect_delta_stride(&head[..head.len().min(TRIAL_SAMPLE)])
                 .and_then(|d| Filter::delta(d).ok())
-                .filter(|f| pays_off(head, *f))
-            {
+                .filter(|f| pays_off(head, *f, tier));
+            match filter {
                 Some(filter) => Plan {
                     codec: general_codec(tier),
                     filter,
+                    kind: Class::Generic,
+                },
+                // No stride helps. Compressible data still goes to the codec;
+                // only data that is noise to both is stored.
+                None if compresses(head) => Plan {
+                    codec: general_codec(tier),
+                    filter: Filter::None,
                     kind: Class::Generic,
                 },
                 None => Plan::STORE,
@@ -358,22 +361,46 @@ fn general_codec(tier: Tier) -> Codec {
 /// is a proxy and sometimes wrong: on Silesia's `sao` star catalogue every
 /// differencing width *hurts* (LZMA2 grows 8-60%), because the fields it
 /// separates were already being matched. So the proposal is tried on the
-/// sample with a fast codec and kept only if it wins. Cost is two compressions
-/// of 64 KiB, which is nothing next to compressing the file.
-fn pays_off(head: &[u8], filter: Filter) -> bool {
-    let sample = &head[..head.len().min(TRIAL_SAMPLE)];
-    let Ok(plain) = zstd::bulk::compress(sample, 1) else {
+/// sample and kept only if it wins.
+///
+/// TWO THINGS THIS STEP HAS TO GET RIGHT, both learned by regression.
+///
+/// It runs on the WHOLE head, not the detector's 64 KiB: a Firefox XML unit
+/// read as a 4-byte record structure in its first 64 KiB and cost 176 KB once
+/// the filter met the other 1.4 MB.
+///
+/// And it trials with the codec that will actually run, which from the normal
+/// tier up means bsc. BWT sorts by following context, so it already models
+/// interleaved fixed-width records, and differencing them severs the sample's
+/// high byte from its low — the same reason the byte-plane split died. A zstd
+/// verdict cannot see this and no threshold separates the cases: on the 1 MiB
+/// head Silesia's `x-ray` shows **-25.7% under zstd and +0.9% under bsc**,
+/// while a 16-bit stereo `.wav` shows -20.5% and **-28.7%**. Judged by zstd
+/// the filter is approved for both and costs 0.77% on Silesia; judged by bsc
+/// `mr` (+1.6%), `x-ray` and `sao` (+5.6%) are all refused and PCM still wins
+/// by a mile.
+fn pays_off(head: &[u8], filter: Filter, tier: Tier) -> bool {
+    let Some(plain) = trial(tier, head) else {
         return false;
     };
-    let mut filtered = sample.to_vec();
+    let mut filtered = head.to_vec();
     if filter.apply(&mut filtered).is_err() {
         return false;
     }
-    match zstd::bulk::compress(&filtered, 1) {
+    match trial(tier, &filtered) {
         // Require a clear win: a filter byte and a decode-side pass are not
         // worth a fraction of a percent.
-        Ok(c) => c.len() * 100 < plain.len() * 98,
-        Err(_) => false,
+        Some(c) => c * 100 < plain * 98,
+        None => false,
+    }
+}
+
+/// The stand-in for the codec this tier will reach for. Fast has no bsc
+/// (measured twice and refused), so zstd speaks for it.
+fn trial(tier: Tier, data: &[u8]) -> Option<usize> {
+    match tier {
+        Tier::Fast => zstd::bulk::compress(data, 1).ok().map(|v| v.len()),
+        _ => nova_bsc::compress(data).ok().map(|v| v.len()),
     }
 }
 
@@ -505,6 +532,47 @@ mod tests {
                 (seed >> 24) as u8
             })
             .collect()
+    }
+
+    /// 16-bit stereo PCM: two slowly-moving channels plus dither, interleaved.
+    /// Compresses without help, which is exactly why it used to be skipped.
+    fn pcm_stereo_16(frames: usize) -> Vec<u8> {
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut out = Vec::with_capacity(frames * 4);
+        for i in 0..frames {
+            let t = i as f64;
+            let l = (t * 0.013).sin() * 9000.0 + (t * 0.0009).sin() * 4000.0;
+            let r = (t * 0.011).sin() * 8500.0 + (t * 0.0007).cos() * 4200.0;
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let dither = ((seed >> 40) as i16) % 24;
+            out.extend_from_slice(&(l as i16).wrapping_add(dither).to_le_bytes());
+            out.extend_from_slice(&(r as i16).wrapping_sub(dither).to_le_bytes());
+        }
+        out
+    }
+
+    /// THE GATE THAT COST 27%. The record-width detector used to be skipped
+    /// whenever the data compressed at all, so 16-bit stereo PCM — which lands
+    /// at 82% unfiltered — never met the filter that takes it to 60%. On a real
+    /// 518 MB corpus of decoded music that gate was worth 22.3%.
+    #[test]
+    fn interleaved_pcm_gets_the_record_width_filter() {
+        let pcm = pcm_stereo_16(400_000);
+        assert!(
+            compresses(&pcm),
+            "the point of this test is data that clears the old gate"
+        );
+        for tier in [Tier::Normal, Tier::Max] {
+            let p = plan(&pcm, tier);
+            assert_eq!(
+                p.filter,
+                Filter::Delta(4),
+                "{tier:?} should difference at the 4-byte frame"
+            );
+            assert_ne!(p.codec, Codec::Store);
+        }
     }
 
     /// A JPEG is proposed for recompression, not stored on sight. Whether the
