@@ -235,7 +235,7 @@ pub fn plan(head: &[u8], tier: Tier) -> Plan {
     if is_deflate_container(head) {
         return Plan {
             codec: general_codec(tier),
-            filter: Filter::Deflate,
+            filter: Filter::Container,
             kind: Class::Deflate,
         };
     }
@@ -266,7 +266,7 @@ pub fn plan(head: &[u8], tier: Tier) -> Plan {
         // unreachable!(), so a future classifier change cannot panic here.
         Class::Deflate => Plan {
             codec: general_codec(tier),
-            filter: Filter::Deflate,
+            filter: Filter::Container,
             kind: Class::Deflate,
         },
         // Same story as Class::Deflate: matched by magic before the classifier.

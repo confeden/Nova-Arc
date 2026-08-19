@@ -17,10 +17,22 @@
 
 use anyhow::{bail, Result};
 
-/// One embedded deflate stream: where its bytes live, in order.
+/// What a container's embedded stream is, and therefore which transform can
+/// undo it. A PDF holds both kinds: page content and object streams are
+/// deflate, embedded photographs are whole JPEGs under `/DCTDecode`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    /// Raw deflate, undone by preflate.
+    Deflate,
+    /// A whole JPEG file, re-coded by lepton.
+    Jpeg,
+}
+
+/// One embedded stream: where its bytes live, in order, and what they are.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Stream {
     pub pieces: Vec<(usize, usize)>,
+    pub kind: Kind,
 }
 
 impl Stream {
@@ -78,6 +90,7 @@ pub fn find_streams(buf: &[u8]) -> Vec<Stream> {
         }
         out.extend(streams.into_iter().map(|s| Stream {
             pieces: s.pieces.iter().map(|&(o, l)| (o + at, l)).collect(),
+            kind: s.kind,
         }));
         at += consumed;
     }
@@ -130,6 +143,7 @@ fn gzip(f: &[u8]) -> (Vec<Stream>, usize) {
     (
         vec![Stream {
             pieces: vec![(p, end - p)],
+            kind: Kind::Deflate,
         }],
         f.len(),
     )
@@ -164,7 +178,13 @@ fn png(f: &[u8]) -> (Vec<Stream>, usize) {
         return (Vec::new(), end);
     }
     trim(&mut pieces, 2, 4);
-    (vec![Stream { pieces }], end)
+    (
+        vec![Stream {
+            pieces,
+            kind: Kind::Deflate,
+        }],
+        end,
+    )
 }
 
 /// Drop `front` bytes from the start of a piece list and `back` from its end.
@@ -234,6 +254,7 @@ fn zip(f: &[u8]) -> (Vec<Stream>, usize) {
         if start.checked_add(csize).is_some_and(|e| e <= f.len()) {
             out.push(Stream {
                 pieces: vec![(start, csize)],
+                kind: Kind::Deflate,
             });
         }
     }
@@ -316,9 +337,9 @@ fn pdf(f: &[u8]) -> (Vec<Stream>, usize) {
         if let Some(p) = rfind(dict, b"obj") {
             dict = &dict[p + 3..];
         }
-        if !flate_first(dict) {
+        let Some(kind) = stream_kind(dict) else {
             continue;
-        }
+        };
         // §7.3.8.1: the keyword is followed by CRLF or a single LF, never by a
         // lone CR. Tolerating one would shift every offset by a byte.
         let mut s = i + 6;
@@ -347,10 +368,16 @@ fn pdf(f: &[u8]) -> (Vec<Stream>, usize) {
                 None => break,
             },
         };
-        let (body, body_end) = zlib_body(f, s, end);
-        if body_end > body {
+        // Only deflate carries the zlib wrapper. A `/DCTDecode` stream is the
+        // JPEG file itself and lepton needs it whole, starting at its SOI.
+        let (body, body_end) = match kind {
+            Kind::Deflate => zlib_body(f, s, end),
+            Kind::Jpeg => (s, end),
+        };
+        if body_end > body && (kind == Kind::Deflate || f[body..].starts_with(&[0xFF, 0xD8])) {
             out.push(Stream {
                 pieces: vec![(body, body_end - body)],
+                kind,
             });
         }
         at = at.max(end);
@@ -381,19 +408,25 @@ fn zlib_body(f: &[u8], s: usize, end: usize) -> (usize, usize) {
     }
 }
 
-/// True when the stream's OUTERMOST filter is FlateDecode — the only case
-/// where the bytes on disk are a deflate stream. `/Filter [/ASCII85Decode
-/// /FlateDecode]` applies ASCII85 last, so its raw bytes are text.
-fn flate_first(dict: &[u8]) -> bool {
-    let Some(p) = find_at(dict, 0, b"/Filter") else {
-        return false;
-    };
+/// What transform, if any, can undo this stream — decided by the OUTERMOST
+/// filter, the only one that describes the bytes actually on disk.
+/// `/Filter [/ASCII85Decode /FlateDecode]` applies ASCII85 last, so its raw
+/// bytes are text and neither transform applies.
+fn stream_kind(dict: &[u8]) -> Option<Kind> {
+    let p = find_at(dict, 0, b"/Filter")?;
     let mut q = p + 7;
     // `/Filter/FlateDecode`, `/Filter [ /FlateDecode ]`, `/Filter[/FlateDecode]`
     while q < dict.len() && (is_ws(dict[q]) || dict[q] == b'[') {
         q += 1;
     }
-    dict[q..].starts_with(b"/FlateDecode")
+    let rest = &dict[q..];
+    if rest.starts_with(b"/FlateDecode") {
+        Some(Kind::Deflate)
+    } else if rest.starts_with(b"/DCTDecode") {
+        Some(Kind::Jpeg)
+    } else {
+        None
+    }
 }
 
 /// `/Length N` when it is a direct integer.
@@ -465,7 +498,14 @@ fn trim_eol(f: &[u8], start: usize, mut end: usize) -> usize {
 
 /// Magic for the transformed form. Present so a corrupt or truncated payload is
 /// rejected before it can drive an allocation.
+///
+/// v1 is deflate-only and is what filter id 34 writes. v2 adds a kind byte per
+/// stream so one container can mix deflate and JPEG — a PDF does, and 18.5% of
+/// a real documentation corpus turned out to be `/DCTDecode` photographs. The
+/// decoder reads both, so every archive ever written still opens; only the
+/// encoder moved on, and it moved on under a NEW filter id.
 const MAGIC: &[u8; 4] = b"NDf1";
+const MAGIC_V2: &[u8; 4] = b"NDf2";
 
 fn put(out: &mut Vec<u8>, mut v: u64) {
     loop {
@@ -494,9 +534,12 @@ fn get(inp: &mut &[u8]) -> Result<u64> {
     bail!("malformed varint in recompression header")
 }
 
-/// What one transformed stream needs in order to be rebuilt.
+/// What one transformed stream needs in order to be rebuilt. For deflate that
+/// is preflate's plaintext and correction record; for JPEG it is the lepton
+/// blob in `plain`, with `corrections` empty.
 pub struct Piece {
     pub pieces: Vec<(usize, usize)>,
+    pub kind: Kind,
     pub plain: Vec<u8>,
     pub corrections: Vec<u8>,
 }
@@ -507,7 +550,7 @@ pub struct Piece {
 /// The grouping is deliberate. Plaintexts are the same kind of data as each
 /// other and compress together; correction records are near-random and would
 /// otherwise sit between them, cutting every match.
-pub fn encode(original: &[u8], parts: &[Piece]) -> Result<Vec<u8>> {
+pub fn encode(original: &[u8], parts: &[Piece], v2: bool) -> Result<Vec<u8>> {
     // Validated rather than assumed. The pieces come from this module's own
     // scanner, but a scanner bug must surface as a refusal and a fallback to
     // storing the data, never as an out-of-range slice inside a library that
@@ -521,11 +564,20 @@ pub fn encode(original: &[u8], parts: &[Piece]) -> Result<Vec<u8>> {
             seen = off + len;
         }
     }
+    if !v2 && parts.iter().any(|p| p.kind != Kind::Deflate) {
+        bail!("the v1 framing cannot carry a non-deflate stream");
+    }
     let mut header = Vec::new();
-    header.extend_from_slice(MAGIC);
+    header.extend_from_slice(if v2 { MAGIC_V2 } else { MAGIC });
     put(&mut header, original.len() as u64);
     put(&mut header, parts.len() as u64);
     for p in parts {
+        if v2 {
+            header.push(match p.kind {
+                Kind::Deflate => 0,
+                Kind::Jpeg => 1,
+            });
+        }
         put(&mut header, p.pieces.len() as u64);
         for &(off, len) in &p.pieces {
             put(&mut header, off as u64);
@@ -570,6 +622,7 @@ pub struct Decoded<'a> {
 /// belong, and the two blobs a deflate encoder needs to reproduce them.
 pub struct Parsed<'a> {
     pub pieces: Vec<(usize, usize)>,
+    pub kind: Kind,
     pub plain: &'a [u8],
     pub corrections: &'a [u8],
 }
@@ -579,9 +632,11 @@ pub fn decode(buf: &[u8]) -> Result<Decoded<'_>> {
     let Some((magic, rest)) = inp.split_at_checked(4) else {
         bail!("truncated recompression payload");
     };
-    if magic != MAGIC {
-        bail!("not a recompression payload");
-    }
+    let v2 = match magic {
+        m if m == MAGIC => false,
+        m if m == MAGIC_V2 => true,
+        _ => bail!("not a recompression payload"),
+    };
     inp = rest;
     let original_len = get(&mut inp)? as usize;
     // Every count and length here is attacker-controlled, so nothing may size
@@ -609,6 +664,21 @@ pub fn decode(buf: &[u8]) -> Result<Decoded<'_>> {
     let mut meta = Vec::new();
     let mut covered = 0usize;
     for _ in 0..count {
+        // The kind byte comes first in v2 so the rest of the record parses the
+        // same either way.
+        let kind = if v2 {
+            let Some((&b, rest)) = inp.split_first() else {
+                bail!("truncated recompression header");
+            };
+            inp = rest;
+            match b {
+                0 => Kind::Deflate,
+                1 => Kind::Jpeg,
+                other => bail!("unknown recompression stream kind {other}"),
+            }
+        } else {
+            Kind::Deflate
+        };
         let n = get(&mut inp)? as usize;
         if n > inp.len() / 2 {
             bail!("implausible piece count");
@@ -631,7 +701,7 @@ pub fn decode(buf: &[u8]) -> Result<Decoded<'_>> {
         }
         let plain = get(&mut inp)? as usize;
         let corr = get(&mut inp)? as usize;
-        meta.push((pieces, plain, corr));
+        meta.push((pieces, kind, plain, corr));
     }
     if covered > original_len {
         bail!("recompression pieces overlap");
@@ -640,7 +710,7 @@ pub fn decode(buf: &[u8]) -> Result<Decoded<'_>> {
     let body = inp;
     let verbatim_len = original_len - covered;
     let mut need = verbatim_len;
-    for (_, plain, corr) in &meta {
+    for (_, _, plain, corr) in &meta {
         need = need
             .checked_add(*plain)
             .and_then(|n| n.checked_add(*corr))
@@ -657,17 +727,18 @@ pub fn decode(buf: &[u8]) -> Result<Decoded<'_>> {
     // every record has been read and its lengths reconciled against the payload
     // size, so `meta.len()` is a fact rather than an assertion.
     let mut plains = Vec::with_capacity(meta.len());
-    for (_, plain, _) in &meta {
+    for (_, _, plain, _) in &meta {
         let (a, b) = at.split_at(*plain);
         plains.push(a);
         at = b;
     }
     let mut streams = Vec::with_capacity(plains.len());
-    for ((pieces, _, corr), plain) in meta.into_iter().zip(plains) {
+    for ((pieces, kind, _, corr), plain) in meta.into_iter().zip(plains) {
         let (a, b) = at.split_at(corr);
         at = b;
         streams.push(Parsed {
             pieces,
+            kind,
             plain,
             corrections: a,
         });
@@ -735,7 +806,16 @@ mod tests {
     use super::*;
 
     fn framed(original: &[u8], parts: Vec<Piece>) -> Vec<u8> {
-        encode(original, &parts).expect("valid pieces")
+        encode(original, &parts, false).expect("valid pieces")
+    }
+
+    fn piece(pieces: Vec<(usize, usize)>, plain: &[u8], corrections: &[u8]) -> Piece {
+        Piece {
+            pieces,
+            kind: Kind::Deflate,
+            plain: plain.to_vec(),
+            corrections: corrections.to_vec(),
+        }
     }
 
     #[test]
@@ -744,16 +824,8 @@ mod tests {
         // deflate data; the framing must put every byte back where it was.
         let original: Vec<u8> = (0..1000u32).map(|i| (i % 251) as u8).collect();
         let parts = vec![
-            Piece {
-                pieces: vec![(10, 100)],
-                plain: b"plain-one".to_vec(),
-                corrections: b"corr1".to_vec(),
-            },
-            Piece {
-                pieces: vec![(300, 50), (400, 50)],
-                plain: b"plain-two".to_vec(),
-                corrections: b"c2".to_vec(),
-            },
+            piece(vec![(10, 100)], b"plain-one", b"corr1"),
+            piece(vec![(300, 50), (400, 50)], b"plain-two", b"c2"),
         ];
         let enc = framed(&original, parts);
         let dec = decode(&enc).unwrap();
@@ -773,14 +845,7 @@ mod tests {
     #[test]
     fn rejects_a_truncated_or_forged_payload() {
         let original = vec![7u8; 500];
-        let enc = framed(
-            &original,
-            vec![Piece {
-                pieces: vec![(0, 100)],
-                plain: vec![1, 2, 3],
-                corrections: vec![4],
-            }],
-        );
+        let enc = framed(&original, vec![piece(vec![(0, 100)], &[1, 2, 3], &[4])]);
         assert!(decode(&enc[..enc.len() - 1]).is_err(), "short payload");
         assert!(decode(&enc[..3]).is_err(), "no magic");
         let mut bad = enc.clone();
@@ -790,28 +855,12 @@ mod tests {
         // slicing out of range; it used to abort the process trying to
         // allocate 64 GiB.
         assert!(
-            encode(
-                &original,
-                &[Piece {
-                    pieces: vec![(400, 200)],
-                    plain: vec![],
-                    corrections: vec![],
-                }]
-            )
-            .is_err(),
+            encode(&original, &[piece(vec![(400, 200)], &[], &[])], false).is_err(),
             "piece outside the original"
         );
         // And out-of-order pieces, which `rebuild` could not splice back.
         assert!(
-            encode(
-                &original,
-                &[Piece {
-                    pieces: vec![(200, 50), (100, 50)],
-                    plain: vec![],
-                    corrections: vec![],
-                }]
-            )
-            .is_err(),
+            encode(&original, &[piece(vec![(200, 50), (100, 50)], &[], &[])], false).is_err(),
             "pieces out of order"
         );
     }
