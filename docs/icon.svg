@@ -1,0 +1,28 @@
+<svg width="512" height="512" viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg" role="img">
+<title>Nova Prism</title>
+<desc>App icon: a glowing triangle on a dark background with a small spectrum of color chips beneath it.</desc>
+<defs>
+  <radialGradient id="npIconBg" cx="60%" cy="32%" r="72%">
+    <stop offset="0%" stop-color="#131f39"/>
+    <stop offset="100%" stop-color="#07090f"/>
+  </radialGradient>
+  <filter id="npIconGlow" x="-60%" y="-60%" width="220%" height="220%">
+    <feGaussianBlur stdDeviation="10" result="b"/>
+    <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+  </filter>
+</defs>
+
+<rect x="0" y="0" width="512" height="512" rx="96" fill="url(#npIconBg)"/>
+
+<polygon points="256,96 132,392 380,392" fill="#eafcff" fill-opacity="0.06" stroke="#eafcff"
+  stroke-width="15" stroke-linejoin="round" filter="url(#npIconGlow)"/>
+
+<g>
+  <circle cx="150" cy="440" r="12" fill="#ff3b3b"/>
+  <circle cx="192" cy="440" r="12" fill="#ff9138"/>
+  <circle cx="234" cy="440" r="12" fill="#ffd23b"/>
+  <circle cx="276" cy="440" r="12" fill="#4ce26a"/>
+  <circle cx="318" cy="440" r="12" fill="#34d3c4"/>
+  <circle cx="360" cy="440" r="12" fill="#3b82f6"/>
+</g>
+</svg>

@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/nova-core", "crates/nova-cli", "crates/nova-platform", "crates/nova-gui", "crates/nova-bsc"]
 
 [workspace.package]
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 repository = "https://github.com/confeden/Nova-Prism"
 
