@@ -437,31 +437,28 @@
   trigger a class split.
 - Letting a class change slide until the unit is half the target — TRIED AND
   REVERTED: a 171 KB win in a fixed-codec counterfactual cost +1,002,157 B at
-  max and +598,383 B on Silesia in the real packer. THE LESSON invalidates every
-  fixed-codec counterfactual: one LZMA2 chain cannot see what a mixed unit gives
-  up, because a unit has ONE codec and ONE filter, and one winner cannot filter
-  two classes.
+  max, +598,383 B on Silesia in the real packer. THE LESSON: one LZMA2 chain
+  cannot see what a mixed unit gives up — a unit has ONE codec and ONE filter,
+  and one winner cannot filter two classes.
 - Creating RAR archives is legally impossible (RARLAB license); unrar may only
   extract. Plan: pack zip/7z/nova, unpack adds rar.
-- `PROCESS_MODE_BACKGROUND_BEGIN` — Very Low I/O and memory priority (~250x
-  slowdowns); compose the three APIs instead. IDLE/EcoQoS as DEFAULT — starved
-  by daemons. IoPriorityHintVeryLow as default — 1-3% of disk. Job-object
-  working-set caps and CPU-rate control — paging churn. WinRAR sleep injection —
-  wastes cores. rayon/par_bridge as the pipeline — no backpressure or ordering.
+- `PROCESS_MODE_BACKGROUND_BEGIN` — Very Low I/O/memory priority (~250x
+  slowdowns). IDLE/EcoQoS default — starved by daemons. IoPriorityHintVeryLow
+  default — 1-3% of disk. Job-object working-set caps/CPU-rate control —
+  paging churn. WinRAR sleep injection, rayon/par_bridge — cores wasted, no backpressure.
 - libzstd internal MT (`ZSTD_c_nbWorkers`) — breaks memory estimation and
-  duplicates our chunk parallelism. zstd `--long` — pointless under CDC chunks.
-- LZMA2 as the universal max-tier codec — on 4 MiB chunks it is only ±2% vs
-  zstd-19 on text, its edge coming from >4 MiB dictionaries that chunking
-  removes. It stays for binary/generic data; text goes to PPMd7 (−24%).
+  duplicates chunk parallelism; zstd `--long` — pointless under CDC chunks.
+- LZMA2 as the universal max-tier codec — on 4 MiB chunks only ±2% vs zstd-19
+  on text, its edge coming from >4 MiB dictionaries chunking removes. Stays
+  for binary/generic data; text goes to PPMd7 (−24%).
 - Capping zstd WindowLog for 4 MiB chunks — no effect, already shrinks to
   the source size. Parallel EXTRACTION with zstd is SLOWER too (NTFS
   metadata contention): 5751 files, 1.0 s on 1 thread vs 2.5 s on 8; default
   extract workers = 1 for zstd/store, `-j` still honoured.
-- GPU for blake3/dedup — slower than CPU SIMD, PCIe erases gains. GPU high-ratio
-  compression (LZMA-class) does not exist in 2026; GPU codecs land near zstd-1..3
-  and Blackwell's HW decompressor is datacenter-only (a 5060 Ti has none).
-- Dead/unusable GPU projects: dietgpu, Brotli-G, multians, CULZSS, GST, Gstd.
-  nvCOMP's proprietary codecs would make a .nva unreadable without an NVIDIA GPU.
+- GPU for blake3/dedup — slower than CPU SIMD, PCIe erases gains. GPU
+  high-ratio compression (LZMA-class) does not exist in 2026 — codecs land
+  near zstd-1..3 and every candidate (dietgpu, Brotli-G, CULZSS) is dead.
+  nvCOMP's proprietary codecs would make a .nva unreadable without NVIDIA.
 
 ## Owner decisions
 
@@ -539,8 +536,11 @@ than out-tune LZMA. Remaining, in measured order of value:
 2. AUDIO IS OTHERWISE DONE — see Negative knowledge for why FLAC residuals are
    not worth it. MP3 (packMP3, ~16%, LGPL-3.0, dormant) is the only piece left,
    and it is a licensing question before it is a code one.
-3. Executable modelling (BCJ2-class, section splitting) — 51% of the remaining
-   headroom to paq8px on Silesia, five times images and tables combined.
+3. CORRECTED (research 14): the 51%-of-paq8px executable headroom is
+   ALREADY SHIPPED at the filter level — BCJ2 (id 36) is research 04 §5's
+   full recommendation, dispack explicitly rejected there. What remains
+   needs a CM codec: research 14 §10's lpaq/TPAQ tier, 41.5-43 MiB on
+   Silesia (today ~49.3), 2x slower, 1-3 GiB/worker. Owner call first.
 4. zip/7z unpack + zip pack (sevenz-rust2), rar unpack (unrar). GUI: shell
    icons/thumbnails (research 06/07), .nva association + installer, folder tree,
    RU localization. Later: GPU (research 08), encryption (XChaCha20-Poly1305),
