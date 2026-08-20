@@ -89,6 +89,7 @@ const el = {
   memory: $<HTMLSelectElement>("memory"),
   checkAll: $<HTMLInputElement>("check-all"),
   menu: $<HTMLDivElement>("menu"),
+  tree: $<HTMLElement>("tree"),
 };
 
 const state = {
@@ -100,6 +101,12 @@ const state = {
   sortAsc: true,
   busy: false,
   menuTarget: "" as string,
+  /** Selected folder, "" for the whole archive. Narrows the table the same way
+   *  the filter does, and the two compose. */
+  folder: "",
+  /** Folders drawn open. A 5751-file tree fully expanded is not navigation, so
+   *  only the path down to the selection starts open. */
+  expanded: new Set<string>(),
   /** Last reading, and when it arrived. The clock lives here, not in the core:
    *  nova-core reports on data movement, and speed/ETA/"nothing for a while"
    *  all need arrival times, which the webview knows for free. */
@@ -300,9 +307,81 @@ function renderSummary(info: ArchiveInfo) {
   ].join("");
 }
 
+/** A folder in the archive. Archive paths are always '/'-separated, so the
+ *  tree is derived from the entry list rather than stored: the format has no
+ *  directory entries at all. */
+type Folder = {
+  name: string;
+  path: string;
+  kids: Map<string, Folder>;
+  /** Files anywhere below, not just directly inside — the number that tells
+   *  you whether a branch is worth opening. */
+  files: number;
+};
+
+function buildTree(entries: Entry[]): Folder {
+  const root: Folder = { name: "", path: "", kids: new Map(), files: entries.length };
+  for (const e of entries) {
+    const parts = e.path.split("/");
+    let at = root;
+    // The last part is the file itself and never becomes a folder.
+    for (let i = 0; i < parts.length - 1; i++) {
+      const name = parts[i];
+      let kid = at.kids.get(name);
+      if (!kid) {
+        kid = { name, path: at.path ? `${at.path}/${name}` : name, kids: new Map(), files: 0 };
+        at.kids.set(name, kid);
+      }
+      kid.files++;
+      at = kid;
+    }
+  }
+  return root;
+}
+
+function inFolder(path: string, folder: string): boolean {
+  return folder === "" || path.startsWith(`${folder}/`);
+}
+
+function renderTree() {
+  const root = buildTree(state.entries);
+  // A flat archive has nothing to navigate; the panel would only take width.
+  if (root.kids.size === 0) {
+    el.tree.classList.add("hidden");
+    el.tree.innerHTML = "";
+    return;
+  }
+  el.tree.classList.remove("hidden");
+
+  const draw = (f: Folder, depth: number): string => {
+    const kids = [...f.kids.values()].sort((a, b) => a.name.localeCompare(b.name));
+    const open = f.path === "" || state.expanded.has(f.path);
+    const twist = kids.length ? (open ? "▾" : "▸") : "";
+    const label = f.path === "" ? "Весь архив" : f.name;
+    const row = `<div class="node${state.folder === f.path ? " on" : ""}"
+        data-folder="${escapeHtml(f.path)}" style="padding-left:${6 + depth * 14}px"
+        title="${escapeHtml(f.path || "Весь архив")}">
+        <span class="twist${kids.length ? " has" : ""}">${twist}</span>
+        <span class="label">${escapeHtml(label)}</span>
+        <span class="count">${f.files}</span>
+      </div>`;
+    return row + (open ? kids.map((k) => draw(k, depth + 1)).join("") : "");
+  };
+  el.tree.innerHTML = draw(root, 0);
+}
+
 function visibleEntries(): Entry[] {
   const q = state.filter.trim().toLowerCase();
-  return q ? state.entries.filter((e) => e.path.toLowerCase().includes(q)) : state.entries;
+  return state.entries.filter(
+    (e) => inFolder(e.path, state.folder) && (!q || e.path.toLowerCase().includes(q)),
+  );
+}
+
+/** How an entry is named in the table: relative to the folder being viewed,
+ *  because repeating the selected prefix on every row is noise. Selection and
+ *  every command still use the full path. */
+function displayPath(path: string): string {
+  return state.folder ? path.slice(state.folder.length + 1) : path;
 }
 
 function renderRows() {
@@ -320,7 +399,7 @@ function renderRows() {
       return `<tr${sel} data-path="${escapeHtml(e.path)}">
         <td><input type="checkbox"${checked} /></td>
         <td title="${escapeHtml(e.path)}"><span class="name">${icon(e.path)}<span class="text">${escapeHtml(
-          e.path,
+          displayPath(e.path),
         )}</span>${e.solid ? '<span class="solid">в блоке</span>' : ""}</span></td>
         <td class="num">${human(e.size)}</td>
         <td class="num">${human(e.stored)}</td>
@@ -363,9 +442,13 @@ async function loadArchive(path: string) {
     state.archive = info.path;
     state.entries = info.entries;
     state.selected.clear();
+    // A different archive's folder is meaningless here, and after add/remove
+    // the old one may not exist any more.
+    if (!state.entries.some((e) => inFolder(e.path, state.folder))) state.folder = "";
     el.checkAll.checked = false;
     el.filter.disabled = false;
     renderSummary(info);
+    renderTree();
     renderRows();
     refreshButtons();
     setStatus(`Открыт архив: ${info.files} файл(ов)`);
@@ -475,6 +558,27 @@ el.checkAll.addEventListener("change", () => {
   refreshButtons();
 });
 
+el.tree.addEventListener("click", (ev) => {
+  const node = (ev.target as HTMLElement).closest<HTMLElement>(".node");
+  if (!node) return;
+  const folder = node.dataset.folder!;
+  // The chevron only opens and closes; anywhere else picks the folder. Mixing
+  // the two into one click makes it impossible to peek without navigating.
+  if ((ev.target as HTMLElement).classList.contains("twist")) {
+    if (state.expanded.has(folder)) state.expanded.delete(folder);
+    else state.expanded.add(folder);
+  } else {
+    state.folder = folder;
+    if (folder) state.expanded.add(folder);
+    // Selection is by full path and survives, but "select all" now means a
+    // different set, so the header box must not claim otherwise.
+    el.checkAll.checked = false;
+    renderRows();
+    refreshButtons();
+  }
+  renderTree();
+});
+
 el.rows.addEventListener("click", (ev) => {
   const tr = (ev.target as HTMLElement).closest("tr");
   if (!tr) return;
@@ -534,56 +638,61 @@ el.menu.addEventListener("click", async (ev) => {
   }
 });
 
-// Drag & drop from Explorer: an archive opens, anything else is packed.
-void getCurrentWebview().onDragDropEvent(async (event) => {
-  if (event.payload.type !== "drop" || state.busy) return;
-  const paths = event.payload.paths;
-  if (paths.length === 1 && paths[0].toLowerCase().endsWith(".nva")) {
-    await loadArchive(paths[0]);
-  } else if (state.archive) {
-    await addToArchive(paths);
-  } else {
-    await createArchive(paths);
-  }
-});
-
-void listen<OpProgress>("nova://progress", (ev) => {
-  const p = ev.payload;
-  const now = performance.now();
-  // Events arrive up to ~20 times a second and must not each drag three DOM
-  // writes with them; they only update the model. renderProgress paints.
-  const prev = state.prog;
-  if (prev && now > state.progAt) {
-    const dt = (now - state.progAt) / 1000;
-    const db = p.bytes_done - prev.bytes_done;
-    if (db >= 0 && dt > 0) {
-      const inst = db / dt;
-      state.rate = state.rate > 0 ? state.rate * 0.7 + inst * 0.3 : inst;
+// Everything below reaches into Tauri internals and THROWS outside the app,
+// which took the rest of this module with it — including the startup load, so
+// the browser demo mode this file opens by promising rendered a blank window.
+if (IN_APP) {
+  // Drag & drop from Explorer: an archive opens, anything else is packed.
+  void getCurrentWebview().onDragDropEvent(async (event) => {
+    if (event.payload.type !== "drop" || state.busy) return;
+    const paths = event.payload.paths;
+    if (paths.length === 1 && paths[0].toLowerCase().endsWith(".nva")) {
+      await loadArchive(paths[0]);
+    } else if (state.archive) {
+      await addToArchive(paths);
+    } else {
+      await createArchive(paths);
     }
-  }
-  state.prog = p;
-  state.progAt = now;
-});
+  });
 
-void listen<OpResult>("nova://done", async (ev) => {
-  const r = ev.payload;
-  setBusy(false);
-  // setBusy hides the track; on success bring it back full for a moment. The
-  // whole point of a progress bar is the frame where it is complete, and that
-  // frame used to be an erased bar.
-  if (r.ok) {
-    el.progressWrap.classList.remove("indeterminate", "stalled", "hidden");
-    el.progress.style.width = "100%";
-    el.progressRead.style.width = "100%";
-    setTimeout(() => el.progressWrap.classList.add("hidden"), 600);
-  }
-  if (!r.ok) {
-    setStatus(r.message, true);
-    return;
-  }
-  setStatus(r.details.join(" · ") || "Готово");
-  if (state.archive) await loadArchive(state.archive);
-});
+  void listen<OpProgress>("nova://progress", (ev) => {
+    const p = ev.payload;
+    const now = performance.now();
+    // Events arrive up to ~20 times a second and must not each drag three DOM
+    // writes with them; they only update the model. renderProgress paints.
+    const prev = state.prog;
+    if (prev && now > state.progAt) {
+      const dt = (now - state.progAt) / 1000;
+      const db = p.bytes_done - prev.bytes_done;
+      if (db >= 0 && dt > 0) {
+        const inst = db / dt;
+        state.rate = state.rate > 0 ? state.rate * 0.7 + inst * 0.3 : inst;
+      }
+    }
+    state.prog = p;
+    state.progAt = now;
+  });
+
+  void listen<OpResult>("nova://done", async (ev) => {
+    const r = ev.payload;
+    setBusy(false);
+    // setBusy hides the track; on success bring it back full for a moment. The
+    // whole point of a progress bar is the frame where it is complete, and that
+    // frame used to be an erased bar.
+    if (r.ok) {
+      el.progressWrap.classList.remove("indeterminate", "stalled", "hidden");
+      el.progress.style.width = "100%";
+      el.progressRead.style.width = "100%";
+      setTimeout(() => el.progressWrap.classList.add("hidden"), 600);
+    }
+    if (!r.ok) {
+      setStatus(r.message, true);
+      return;
+    }
+    setStatus(r.details.join(" · ") || "Готово");
+    if (state.archive) await loadArchive(state.archive);
+  });
+}
 
 void (async () => {
   const m = await invoke<{ cores: number; memory_total: number | null; budget: number }>("machine_info");

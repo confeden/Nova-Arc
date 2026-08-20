@@ -19,10 +19,11 @@
   has `--force` / `--skip-existing` (default: refuse to clobber). `rename`
   moves an entry or a whole folder by rewriting the manifest ONLY: 77 entries
   in 0.053 s, zero new units, byte-identical output.
-- GUI (nova-gui, VERIFIED running): open/create/add/extract/remove/compact,
-  virtualized list with glyphs + unit badges, sortable columns, multi-select,
-  context menu, double-click opens from a temp dir, Explorer drag&drop both ways,
-  throttled progress, level/memory in toolbar (DEFAULT max), argv[1] opens.
+- GUI (nova-gui, VERIFIED running, UI already fully RU): open/create/add/
+  extract/remove/compact, virtualized list with glyphs + unit badges, sortable
+  columns, multi-select, context menu, double-click opens from a temp dir,
+  Explorer drag&drop both ways, throttled progress, level/memory in toolbar
+  (DEFAULT max), argv[1] opens, folder tree derived from the entry paths.
 - 117 tests green (122 with `--features rar`), clippy clean in both: roundtrip,
   append without rewrite, dedup, replace, remove+compact, rename, selective
   extract, crash recovery, torn manifest, embedded/forged footer, writer lock,
@@ -507,10 +508,9 @@
 ## Open issues
 
 - Not preserved: empty dirs, symlinks, NTFS attrs/ADS, ACLs. Manifest in RAM;
-  long Windows paths untested. Solid-block members are read whole into RAM
-  at pack time (up to 8 MiB outside the pipeline budget). No trained
-  dictionaries; no MP3 recompression. A container past the solo cap is
-  recompressed only if it is audio (Plans 1).
+  long Windows paths untested. Solid-block members are read whole into RAM at
+  pack time (up to 8 MiB outside the pipeline budget). No trained dictionaries,
+  no MP3; a container past the solo cap is recompressed only if audio (Plans 1).
 - The outer extraction loop is still per FILE; lanes engage only below workers.
   `--eco`/`--full`/EcoQoS are built but not measured under load.
 - Progress granularity at max is bounded by the UNIT COUNT, not fixable in the
@@ -541,9 +541,10 @@ than out-tune LZMA. Remaining, in measured order of value:
 4. DONE: zip+7z+rar READ and zip WRITE. `create x.zip` is deflate-only on
    purpose (interop; ratio is `.nva`'s job) and lands 0.9% above
    `7z -tzip -mx9` at max — miniz_oxide's deflate, not a bug. rar is
-   extract-only behind `--features rar` (Negative knowledge). Left, all GUI:
-   shell icons/thumbnails (research 06/07), .nva association, folder tree,
-   RU localization. Later: GPU (08), encryption, installers, ports.
+   extract-only behind `--features rar` (Negative knowledge). Folder tree DONE;
+   RU localization already was. Left: shell icons/thumbnails (research 06/07)
+   and `.nva` association — both want an installer. Later: GPU (08),
+   encryption, ports.
 
 NOT on this list, and deliberately: bigger units to buy solidity on executables,
 and BCJ2-style per-site probability. Both PRICED and rejected — see Recompression.
