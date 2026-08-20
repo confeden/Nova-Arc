@@ -23,7 +23,7 @@
   virtualized list with glyphs + unit badges, sortable columns, multi-select,
   context menu, double-click opens from a temp dir, Explorer drag&drop both ways,
   throttled progress, level/memory in toolbar (DEFAULT max), argv[1] opens.
-- 106 tests green, clippy clean: roundtrip, append without rewrite, dedup,
+- 114 tests green, clippy clean: roundtrip, append without rewrite, dedup,
   replace, remove+compact, rename, selective extract, crash recovery, torn
   manifest, embedded/forged footer, writer lock, selectors, pre-1970 mtime,
   overwrite policy, compact-detects-corruption, the progress contract,
@@ -60,10 +60,9 @@
   in `Budget::acquire` holding it and stalls the writer. Throttling lives in
   core, clocks in the GUI — do NOT add a timer thread to core.
 - Memory model: `budget ≈ 32 MiB base + workers × (tables + 8 MiB) + queued`;
-  workers capped by the budget, in-flight bytes by the workers (table cost
-  per tier in `Tier::worker_memory()`). Chunk hash =
-  blake3(uncompressed)[..16]: dedup AND integrity; dead records stay as
-  dedup sources until compact.
+  workers capped by budget, in-flight bytes by workers (table cost per tier
+  in `Tier::worker_memory()`). Chunk hash = blake3(uncompressed)[..16]:
+  dedup AND integrity; dead records stay as dedup sources until compact.
 - INTRA-FILE DECODE LANES. Threads the file count cannot use become lanes
   INSIDE each file (`lanes_per_worker = budget / workers`), so a one-file
   archive stops using one thread while total concurrency, memory, ordering,
@@ -106,18 +105,20 @@
 - Precompressed magic does NOT mean store — it is a claim about the FORMAT, not
   the bytes; storing on it alone cost 1.12 MB on a 4.93 MiB corpus. A 1 MiB
   zstd-1 trial must save >= 1%: compressible deflate lands at −3.9..−25.6%,
-  finished data at +0.00..0.01%.
-- Memory invariant: ops bounded by a few MAX_CHUNK buffers + the manifest.
-  Weak-PC extraction is a hard requirement.
+  finished data at +0.00..0.01%. Memory invariant: ops bounded by a few
+  MAX_CHUNK buffers + the manifest — weak-PC extraction is a requirement.
 - Archive paths: relative, UTF-8, '/'-separated; `paths::sanitize` on extract
   rejects traversal/absolute/drive/ADS/reserved-device/trailing-dot names.
   Owner's machine: 32 GB RAM, RTX 5060 Ti 8 GB, Windows 11, 8 logical cores.
 
 ## Gotchas
 
-- A zip entry may use `\` instead of the spec's `/` (PowerShell's
-  `Compress-Archive` does) — normalize to `/` BEFORE `paths::sanitize`, not
-  inside it, so a `..\` traversal still hits the real `..`-component rule.
+- A zip entry may use `\` instead of `/` (PowerShell's `Compress-Archive`
+  does; real 7z from 7-Zip.exe did not, but `foreign_7z` normalizes the
+  same way on principle) — fix BEFORE `paths::sanitize`, not inside it, so
+  `..\` still hits the real `..`-component rule. `foreign_7z::extract` uses
+  `for_each_entries`, one decode pass, never `read_file` per entry, which
+  the crate's own docs say redecodes a whole solid block per file.
 - Windows: cannot rename over an open file — compact consumes `self`, closes the
   handle, then replaces in place. `tempfile` is a REGULAR dep for it.
 - Windows file locks are MANDATORY per byte range: a whole-file `File::try_lock`
@@ -130,10 +131,9 @@
   the shipped exe opened localhost:5173 and a plain `cargo build --release`
   silently overwrote a good exe with that one, twice. Every build now embeds
   `ui/dist` and build.rs FAILS if `ui/dist/index.html` is missing.
-- Windows: quote a path with spaces or Start-Process -ArgumentList splits it and
-  argv[1] is truncated (this fooled a GUI test).
-- .cmd launchers mangle Cyrillic (OEM codepage); use a BOM'd .ps1. A formatter
-  hook rewrites files after every Write/Edit here.
+- Windows: quote a path with spaces or Start-Process -ArgumentList splits it
+  and argv[1] is truncated. .cmd launchers mangle Cyrillic (OEM codepage);
+  use a BOM'd .ps1. A formatter hook rewrites files after every Write/Edit.
 - `zpaqfranz x ... -to DIR` needs a TRAILING SLASH or it refuses, and a bench
   records the refusal as the decode time.
 - Per-worker memory is match tables, not the window.
@@ -330,8 +330,8 @@
   87,566,439 B vs nova 95,721,462 → **+9.3%, our weakest case**. Findings:
   · The codec+filter vote must be cast per CHUNK (`Packer::current` + `place`):
     cast once at the file's start it put 150 MB of a 176 MB xul.dll in units
-    with no BCJ. Worth 506,834 B.
-  · The gap is ALL x86: .dll +11.8%, omni.ja +0.1%, everything else −6.2%.
+    with no BCJ, worth 506,834 B. The gap is ALL x86: .dll +11.8%, omni.ja
+    +0.1%, everything else −6.2%.
   · SOLIDITY IS NOT THE CAUSE (234.3 MiB DLL set, LZMA2 -9e): solid+BCJ
     70,463,272 B · 64 MiB units 71,410,491 · 32 MiB 72,082,105 · no filter
     72,509,466. Geometry costs 1.3%, BCJ 2.8%, and 7-Zip sits 8.7% BELOW
@@ -359,8 +359,8 @@
   existing archive stops decoding. `Filter::apply` returns `Applied::{InPlace,
   Rebuilt}` because the store fallback must undo the first and NOT the second.
   Ids 34/35/37 pin library versions; an upgrade spends a NEW id. A recompressible
-  file gets a unit of ITS OWN (>= 64 KiB, <= 2x unit): the scanners each need one
-  whole container.
+  file gets a unit of ITS OWN (>= 64 KiB, <= 2x unit): the scanners each need
+  one whole container.
 - SAFETY, enforced not intended: the packer round-trips every rebuilt unit and
   falls back on any mismatch; a filter that refuses is a fallback; the
   transformed form may not exceed `MAX_CODED_CHUNK` (256 MiB), charged as pieces
@@ -507,10 +507,10 @@
 ## Open issues
 
 - Not preserved: empty dirs, symlinks, NTFS attrs/ADS, ACLs. Manifest in RAM;
-  long Windows paths untested.
-- Solid-block members are read whole into RAM at pack time (up to 8 MiB outside
-  the pipeline budget). No trained dictionaries; no MP3 recompression. A
-  container past the solo cap is recompressed only if it is audio (Plans 1).
+  long Windows paths untested. Solid-block members are read whole into RAM
+  at pack time (up to 8 MiB outside the pipeline budget). No trained
+  dictionaries; no MP3 recompression. A container past the solo cap is
+  recompressed only if it is audio (Plans 1).
 - The outer extraction loop is still per FILE; lanes engage only below workers.
   `--eco`/`--full`/EcoQoS are built but not measured under load.
 - Progress granularity at max is bounded by the UNIT COUNT, not fixable in the
@@ -541,10 +541,10 @@ than out-tune LZMA. Remaining, in measured order of value:
    full recommendation, dispack explicitly rejected there. What remains
    needs a CM codec: research 14 §10's lpaq/TPAQ tier, 41.5-43 MiB on
    Silesia (today ~49.3), 2x slower, 1-3 GiB/worker. Owner call first.
-4. DONE: zip READ, `nova-core::foreign_zip` (backslash finding: Gotchas).
-   Left: 7z read (sevenz-rust2), zip WRITE, rar unpack (unrar). GUI: shell
-   icons/thumbnails (research 06/07), .nva association, folder tree, RU
-   localization. Later: GPU (research 08), encryption, installers, ports.
+4. DONE: zip and 7z READ (`foreign_zip`, `foreign_7z` — see Gotchas). Left:
+   zip WRITE, rar unpack (unrar). GUI: shell icons/thumbnails (research
+   06/07), .nva association, folder tree, RU localization. Later: GPU
+   (research 08), encryption, installers, ports.
 
 NOT on this list, and deliberately: bigger units to buy solidity on executables,
 and BCJ2-style per-site probability. Both PRICED and rejected — see Recompression.

@@ -29,6 +29,7 @@ claxon = "0.4"
 filetime = "0.2"
 rmp-serde = "1"
 serde = { version = "1", features = ["derive"] }
+sevenz-rust2 = "0.21"
 tempfile = "3"
 walkdir = "2"
 windows-sys = "0.60"

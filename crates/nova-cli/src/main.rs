@@ -156,6 +156,21 @@ fn human(n: u64) -> String {
     }
 }
 
+/// Shared by every foreign-format `list`: they carry only a path and a size,
+/// unlike native `.nva` listing's extra "Stored" column, which has no
+/// foreign-format analogue.
+fn print_foreign_list(entries: impl IntoIterator<Item = (String, u64)>) {
+    let mut total = 0u64;
+    let mut count = 0usize;
+    println!("{:>12}  Path", "Size");
+    for (path, size) in entries {
+        println!("{:>12}  {}", human(size), path);
+        total += size;
+        count += 1;
+    }
+    println!("{:>12}  {} file(s)", human(total), count);
+}
+
 /// Peak working set, so users (and benchmarks) can see that packing really
 /// stays inside its memory budget.
 fn report_peak() {
@@ -244,6 +259,8 @@ fn main() -> Result<()> {
             };
             let s = if nova_core::foreign_zip::sniff(&archive) {
                 nova_core::foreign_zip::extract(&archive, &output, sel, policy)?
+            } else if nova_core::foreign_7z::sniff(&archive) {
+                nova_core::foreign_7z::extract(&archive, &output, sel, policy)?
             } else {
                 let a = Archive::open_ro(&archive)?;
                 a.extract_with(&output, sel, policy, &pack(Level::Normal))?
@@ -263,18 +280,21 @@ fn main() -> Result<()> {
             }
         }
         Cmd::List { archive } => {
-            let mut total = 0u64;
-            let mut count = 0usize;
             if nova_core::foreign_zip::sniff(&archive) {
-                println!("{:>12}  Path", "Size");
-                for e in nova_core::foreign_zip::list(&archive)? {
-                    println!("{:>12}  {}", human(e.size), e.path);
-                    total += e.size;
-                    count += 1;
-                }
-                println!("{:>12}  {} file(s)", human(total), count);
+                print_foreign_list(
+                    nova_core::foreign_zip::list(&archive)?
+                        .into_iter()
+                        .map(|e| (e.path, e.size)),
+                );
+            } else if nova_core::foreign_7z::sniff(&archive) {
+                print_foreign_list(
+                    nova_core::foreign_7z::list(&archive)?
+                        .into_iter()
+                        .map(|e| (e.path, e.size)),
+                );
             } else {
                 let a = Archive::open_ro(&archive)?;
+                let mut total = 0u64;
                 let mut stored = 0u64;
                 println!("{:>12}  {:>12}  Path", "Size", "Stored");
                 for f in &a.manifest.files {

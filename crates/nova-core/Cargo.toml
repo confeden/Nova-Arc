@@ -21,6 +21,7 @@ claxon.workspace = true
 filetime.workspace = true
 rmp-serde.workspace = true
 serde.workspace = true
+sevenz-rust2.workspace = true
 tempfile.workspace = true
 walkdir.workspace = true
 zip.workspace = true

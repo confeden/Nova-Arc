@@ -20,6 +20,7 @@ pub mod codec;
 pub mod deflate;
 pub mod filters;
 pub mod footer;
+pub mod foreign_7z;
 pub mod foreign_zip;
 pub mod manifest;
 mod pack;
