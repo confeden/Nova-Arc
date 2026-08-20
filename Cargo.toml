@@ -31,6 +31,12 @@ rmp-serde = "1"
 serde = { version = "1", features = ["derive"] }
 sevenz-rust2 = "0.21"
 tempfile = "3"
+# Extraction only, and OFF BY DEFAULT (feature `rar`). The wrapper is
+# MIT/Apache-2.0 but it vendors RARLAB's unrar sources, whose licence is not
+# OSI and is GPL-incompatible: keeping it behind a feature means the default
+# build carries none of it and nova's own licence stays an open choice.
+# Creating RAR is forbidden by that licence and is not planned.
+unrar = "0.5"
 walkdir = "2"
 windows-sys = "0.60"
 zip = "8"

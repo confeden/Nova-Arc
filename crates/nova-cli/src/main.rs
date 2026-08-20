@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{bail, Result};
@@ -156,6 +156,56 @@ fn human(n: u64) -> String {
     }
 }
 
+/// RAR extraction is an optional feature (see `foreign_rar`), so the two
+/// entry points exist either way: with the feature they call it, without it
+/// they say so. Detection itself is always on — the alternative is telling
+/// someone their rar is "not a NOVA archive", which sounds like corruption.
+#[cfg(feature = "rar")]
+fn rar_list(archive: &Path) -> Result<Vec<(String, u64)>> {
+    Ok(nova_core::foreign_rar::list(archive)?
+        .into_iter()
+        .map(|e| (e.path, e.size))
+        .collect())
+}
+
+#[cfg(not(feature = "rar"))]
+fn rar_list(archive: &Path) -> Result<Vec<(String, u64)>> {
+    bail!(no_rar(archive))
+}
+
+#[cfg(feature = "rar")]
+fn rar_extract(
+    archive: &Path,
+    output: &Path,
+    sel: Option<&[String]>,
+    policy: Overwrite,
+) -> Result<nova_core::ExtractStats> {
+    nova_core::foreign_rar::extract(archive, output, sel, policy)
+}
+
+#[cfg(not(feature = "rar"))]
+fn rar_extract(
+    archive: &Path,
+    _output: &Path,
+    _sel: Option<&[String]>,
+    _policy: Overwrite,
+) -> Result<nova_core::ExtractStats> {
+    bail!(no_rar(archive))
+}
+
+/// Whether this build can read a rar at all. `add` needs it too: without it,
+/// telling someone nova "can list and extract" their rar would be a lie.
+const RAR_READABLE: bool = cfg!(feature = "rar");
+
+#[allow(dead_code)] // used only by the no-feature arms above
+fn no_rar(archive: &Path) -> String {
+    format!(
+        "{} is a RAR archive, and this build has no RAR support \
+         (rebuild with --features rar)",
+        archive.display()
+    )
+}
+
 /// Shared by every foreign-format `list`: they carry only a path and a size,
 /// unlike native `.nva` listing's extra "Stored" column, which has no
 /// foreign-format analogue.
@@ -248,7 +298,13 @@ fn main() -> Result<()> {
             // Without this the message would be "not a NOVA archive (bad
             // magic)", which reads as "unreadable" for a file nova lists and
             // extracts perfectly well.
-            if nova_core::foreign_zip::sniff(&archive) || nova_core::foreign_7z::sniff(&archive) {
+            if nova_core::foreign_rar::sniff(&archive) && !RAR_READABLE {
+                bail!(no_rar(&archive));
+            }
+            if nova_core::foreign_zip::sniff(&archive)
+                || nova_core::foreign_7z::sniff(&archive)
+                || nova_core::foreign_rar::sniff(&archive)
+            {
                 bail!(
                     "{} is a foreign archive - nova can list and extract it, \
                      but not add to it",
@@ -281,6 +337,8 @@ fn main() -> Result<()> {
                 nova_core::foreign_zip::extract(&archive, &output, sel, policy)?
             } else if nova_core::foreign_7z::sniff(&archive) {
                 nova_core::foreign_7z::extract(&archive, &output, sel, policy)?
+            } else if nova_core::foreign_rar::sniff(&archive) {
+                rar_extract(&archive, &output, sel, policy)?
             } else {
                 let a = Archive::open_ro(&archive)?;
                 a.extract_with(&output, sel, policy, &pack(Level::Normal))?
@@ -312,6 +370,8 @@ fn main() -> Result<()> {
                         .into_iter()
                         .map(|e| (e.path, e.size)),
                 );
+            } else if nova_core::foreign_rar::sniff(&archive) {
+                print_foreign_list(rar_list(&archive)?);
             } else {
                 let a = Archive::open_ro(&archive)?;
                 let mut total = 0u64;

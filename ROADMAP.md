@@ -4,7 +4,7 @@
 
 - Cargo workspace, Rust 1.95, edition 2021: `nova-core` (format,
   `#![forbid(unsafe_code)]`), `nova-cli` (binary `nova`), `nova-platform` (OS
-  and unsafe), `nova-bsc` (libbsc FFI), `nova-gui` (Tauri 2). Frontend `ui/`
+  and unsafe), `nova-bsc` (libbsc FFI), `nova-gui` (Tauri 2), frontend `ui/`
   (TS + Vite, no framework).
 - Format v0.2 = v0.1 + solid blocks + per-chunk filter/param bytes + LZMA2/PPMd7
   + manifest `geometry`. Container VERIFIED: append-only chunk log, FastCDC,
@@ -15,21 +15,21 @@
   compresses, writer appends in submission order, byte-budget backpressure.
   Extract threads key off the archive's codecs. CLI: `-j`, `--memory`, `--eco`,
   `--full`; packing prints peak RAM.
-- CLI: create/add/extract/list/remove/rename/compact/info (+aliases), extract has
-  `--force` / `--skip-existing` (default: refuse to clobber).
-- `rename` moves an entry or a whole folder by rewriting the manifest ONLY:
-  77 entries in 0.053 s, zero new units, byte-identical output.
+- CLI: create/add/extract/list/remove/rename/compact/info (+aliases); extract
+  has `--force` / `--skip-existing` (default: refuse to clobber). `rename`
+  moves an entry or a whole folder by rewriting the manifest ONLY: 77 entries
+  in 0.053 s, zero new units, byte-identical output.
 - GUI (nova-gui, VERIFIED running): open/create/add/extract/remove/compact,
   virtualized list with glyphs + unit badges, sortable columns, multi-select,
   context menu, double-click opens from a temp dir, Explorer drag&drop both ways,
   throttled progress, level/memory in toolbar (DEFAULT max), argv[1] opens.
-- 117 tests green, clippy clean: roundtrip, append without rewrite, dedup,
-  replace, remove+compact, rename, selective extract, crash recovery, torn
-  manifest, embedded/forged footer, writer lock, selectors, pre-1970 mtime,
-  overwrite policy, compact-detects-corruption, the progress contract,
-  deflate/JPEG/PDF/WAV round-trips, the PDF traps, a stored JPEG inside a
-  zip, the record-width filter on PCM, a split .wav, decode lanes, the
-  foreign-zip zip-slip defense, and the `legacy-*.nva` fixtures.
+- 117 tests green (122 with `--features rar`), clippy clean in both: roundtrip,
+  append without rewrite, dedup, replace, remove+compact, rename, selective
+  extract, crash recovery, torn manifest, embedded/forged footer, writer lock,
+  selectors, pre-1970 mtime, overwrite policy, compact-detects-corruption, the
+  progress contract, deflate/JPEG/PDF/WAV round-trips, the PDF traps, a stored
+  JPEG inside a zip, the record-width filter on PCM, a split .wav, decode
+  lanes, the foreign zip-slip defense, and the `legacy-*.nva` fixtures.
 - Compression v2 DONE: codec+filter per content class, solid blocks by extension,
   LZMA2 + PPMd7 + bsc, BCJ x86 + delta (BCJ verified against liblzma).
 - Measured residue: BCJ on real .exe +4.4-5.7% vs unfiltered. PPMd7 vs zstd-19
@@ -74,9 +74,9 @@
   — not stored per chunk, so changing them breaks old archives. Order 10 beat
   12/16: a pool-exhaustion restart costs more than depth gains.
 - LZMA2 presets 6..9 differ only in dictionary size, which the chunk cap
-  overrides, so max raises nice_len (xz -e).
-- Codec and filter ids are tabulated in `docs/format.md`; keep it in step. A
-  NEW id must never be added by widening the delta range — `2..=MAX_DELTA_ID =>
+  overrides — so max raises nice_len instead (xz -e).
+- Codec and filter ids are tabulated in `docs/format.md`; keep it in step. A NEW
+  id must never be added by widening the delta range — `2..=MAX_DELTA_ID =>
   Delta(id - 1)` would have made 34 decode as Delta(33), silently. Per-chunk raw
   fallback if not smaller, and then the filter byte MUST be cleared too.
 - Fixed order: pack = filter → compress; unpack = decompress → unfilter. The
@@ -136,9 +136,9 @@
   and argv[1] is truncated. .cmd launchers mangle Cyrillic (OEM codepage);
   use a BOM'd .ps1. A formatter hook rewrites files after every Write/Edit.
 - `zpaqfranz x ... -to DIR` needs a TRAILING SLASH or it refuses, and a bench
-  records the refusal as the decode time.
-- Per-worker memory is match tables, not the window.
-- zstd/blake3/libbsc build C or C++ via MSVC. git identity: user.name "Brent", email confeden@cryptolab.net.
+  records the refusal as the decode time. Per-worker memory is match tables,
+  not the window. zstd/blake3/libbsc/unrar build C or C++ via MSVC. git
+  identity: user.name "Brent", email confeden@cryptolab.net.
 
 ## Resource policy (decided, from research 09)
 
@@ -197,8 +197,8 @@
 - PPMd7 AS THE TEXT CODEC IS DOMINATED: on enwik8 kanzi -l9 is smaller and
   faster both ways, and bsc out-votes it.
 - nova max is NOT faster than 7-Zip: Silesia 52.7 s vs 44.4 s, enwik8 77.7 s vs
-  43.3 s. The old "6.8 s vs 49 s" predates the tournament; never requote it.
-- DECODE is DATA-DEPENDENT: Silesia nova 1.8 s vs kanzi -l9 50.5 s; enwik8 4.6 s.
+  43.3 s; the old "6.8 s vs 49 s" predates the tournament, never requote it.
+  DECODE is data-dependent: Silesia 1.8 s vs kanzi -l9's 50.5 s; enwik8 4.6 s.
 - kanzi -l7: Silesia 47,308,780 B in 6.15 s, the fast tier's bar. Its default
   `-j` is HALF the cores, so bench-std gave it 4 threads against our 8.
   · enwik8 block sweep: 8 MiB 23,593,148 · 32 21,983,674 · 128 20,803,016 — MILD
@@ -232,15 +232,15 @@
   (682,799 B raw: zstd 19 84,565 vs LZMA2 74,690). The codec is read off the
   BYTES — a zstd frame starts 28 B5 2F FD, a raw LZMA2 stream never can — so
   there is no format field and every manifest ever written still decodes.
-- Diagnostics: `NOVA_UNIT_TRACE=<file>` logs one line per unit as it is built —
-  the cut reason exists only at pack time. `nova info --units` dumps the rest.
+- Diagnostics: `NOVA_UNIT_TRACE=<file>` logs one line per unit as it is built
+  (the cut reason exists only at pack time); `nova info --units` the rest.
 
 ## Recompression — DEFLATE, JPEG and PDF ARE LANDED (research 02, measured here)
 
 - Corpora: `test/precomp-web` (public, below; supersedes `test/precomp`),
-  `test/incompress` (control, must stay stored), `test/photos`,
-  `test/zipphoto` (same photos, zipped Store), `test/pdfs`, `test/firefox`,
-  `test/audio` + `test/audio-wav`. Probes in `test/probe-preflate`, outside the workspace.
+  `test/incompress` (control, must stay stored), `test/photos`, `test/zipphoto`
+  (same photos, zipped Store), `test/pdfs`, `test/firefox`, `test/audio` +
+  `test/audio-wav`. Probes in `test/probe-preflate`, outside the workspace.
 - MIN_STREAM = 64 bytes, MEASURED; 4096 cost 15 points. "A record cannot pay
   for itself on 2 KB" is true per FILE, false inside a unit. `preflate-rs 0.7.6`
   (Microsoft, Apache-2.0) is byte-exact on every file of both corpora.
@@ -251,30 +251,28 @@
   and the 24 Kodak PNGs. nova max **74,865,900 (80.2%)** · zpaqfranz -m5
   86,761,587 · 7z -mx9 86,991,164 · brotli 87,005,350 · xz 87,027,656 · kanzi
   -l9 87,363,217. **−13.7% to the best of the rest**, repeatable by anyone.
-  · A SECOND CEILING, found the moment the corpus stopped being 4.9 MiB. The
-    filter reaches 28 of 29 units (41,507,277 → 25,800,674); the 29th is
-    `binutils-2.42.tar.gz`, which FITS the solo cap at 51,892,456 B and is still
-    refused, because it expands to 319,897,600 B — past `MAX_CODED_CHUNK`
-    (256 MiB). Worse than the solo cap: it scales with how well the payload
-    compresses, so it bites hardest where recompression would pay most.
+  · A SECOND CEILING: the filter reaches 28 of 29 units (41,507,277 →
+    25,800,674); the 29th, `binutils-2.42.tar.gz`, FITS the solo cap at
+    51,892,456 B yet is refused because it expands to 319,897,600 B, past
+    `MAX_CODED_CHUNK` (256 MiB) — a bound that scales with how well the
+    payload compresses, so it bites hardest where recompression would pay most.
   · That cap was charged PER UNIT: one oversized member made the WHOLE unit
     `bail!`, losing every other stream's gain too. FIXED — an outsized member
     is now skipped alone, not its neighbours. Byte-identical here: binutils
     is a lone stream, so this fixes a different case, untested by this corpus.
   · fast lands at 99.7% here and that is CORRECT: PNG-filtered photographic
     scanlines do not beat the original deflate under zstd-3.
-- STORED ZIP ENTRIES ARE SCANNED TOO, and skipping them had been throwing away
-  the best data in the archive: a zip does not deflate what deflate cannot help,
-  so a photo backup STORES its JPEGs, an epub its illustrations, an apk its
-  PNGs. `zip` now hands a method-0 entry back to `dispatch` (depth-capped at 3),
-  which covers stored JPEG, stored PNG and zip-in-zip with one arm. A bare JPEG
-  is only dispatched at depth > 0 — at the top it is filter 35's business and
-  adding it would change what every existing unit scans to.
-  · MEASURED on the case it exists for, six camera photos zipped with method
-    Store: 17,326,548 → **13,992,258 (80.8%)** against zpaqfranz -m5's
-    16,854,983 and 7z -mx9's 17,289,656, so **−17.0% to the best of the rest**
-    where we used to store it too. On the public corpus it is worth only 27,781
-    B — that corpus holds 257 KB of stored JPEG and 571 KB of stored PNG.
+- STORED ZIP ENTRIES ARE SCANNED TOO — a zip does not deflate what deflate
+  cannot help, so a photo backup STORES its JPEGs, an epub its illustrations,
+  an apk its PNGs, and skipping method-0 threw away the archive's best data.
+  `zip` hands such an entry back to `dispatch` (depth-capped at 3), covering
+  stored JPEG, stored PNG and zip-in-zip with one arm. A bare JPEG is only
+  dispatched at depth > 0 — at the top it is filter 35's business and adding
+  it would change what every existing unit scans to.
+  · MEASURED on six camera photos zipped with method Store: 17,326,548 →
+    **13,992,258 (80.8%)** vs zpaqfranz -m5's 16,854,983 and 7z -mx9's
+    17,289,656 — **−17.0% to the best of the rest** where we used to store it
+    too. Worth only 27,781 B on the public corpus (257 KB stored JPEG there).
 - JPEG (lepton, id 35) SHIPPED. test/photos, 6 camera JPEGs: raw 17,324,730 ·
   best of the rest 16,844,561 · **nova 13,990,872 (−16.9%)**.
   · The stored payload is the LEPTON FORM ITSELF: already entropy-coded, no codec
@@ -286,10 +284,10 @@
 - PDF IMAGES SHIPPED as filter id 37, a mixed container. 18.5% of a real
   19-document corpus is `/DCTDecode` — whole JPEGs, which lepton takes 20.3% off
   (39 of 39). pdfs max → **5,064,071**; against 7z -mx9's 6,606,978, **−23.4%**.
-  · Id 34's framing cannot say what a stream IS, so it only carries deflate. Id
-    37 adds a kind byte and a `NDf2` magic; the decoder reads both, so everything
-    written still opens and 34 is decode-only — an id is a promise, not a slot.
-    A `/DCTDecode` stream is the JPEG itself: no zlib wrapper, starts at SOI.
+  · Id 34's framing cannot say what a stream IS, so it only carries deflate;
+    id 37 adds a kind byte and a `NDf2` magic, the decoder reads both, so
+    everything written still opens and 34 is decode-only — an id is a promise,
+    not a slot. A `/DCTDecode` stream IS the JPEG: no zlib wrapper, starts SOI.
   · THE TRAP (found via id 34, deflate-only, before id 37 added JPEG): PDF's
     `/FlateDecode` is RFC 1950, so a stream carries two zlib header bytes and
     a four-byte adler32 that are NOT deflate. Handed those, preflate modelled
@@ -311,8 +309,8 @@
     standard FLAC stream, so a better encoder never spends an id. What it DOES
     pin is the wrapper — the whole file with only the `data` payload cut out,
     spliced back on decode. That, not FLAC, is what makes the round trip exact:
-    chunk order, odd sizes with pad bytes, a `RIFF` length that disagrees with
-    the file and trailing garbage all survive, none of it rebuilt from a parse.
+    chunk order, odd sizes with pad bytes, a bad `RIFF` length and trailing
+    garbage all survive, none of it rebuilt from a parse.
   · A .wav past the solo cap is CUT, not given up on: `Packer::add_wav_split`
     emits unit-sized runs of whole frames, the header riding with the first
     piece and the trailing chunks with the last. 276,221,291 → **265,279,793**
@@ -321,9 +319,9 @@
   · Middle pieces are bare PCM with no `fmt `, so the format travels in
     `Job.wav`; the record always carried it, so decoding is unchanged. An
     `Extent`'s offset is inside the UNIT, not the file — the file offset gave
-    "extent outside its unit" on extract.
-  · A .wav that cannot be split falls back to the GENERIC path, NOT the
-    precompressed one — `plan_precompressed` would drop the delta filter too.
+    "extent outside its unit" on extract. A .wav that cannot be split falls
+    back to the GENERIC path, NOT the precompressed one, which would drop the
+    delta filter too.
 - Installed-program corpus (test/firefox, 341.7 MiB, 68.6% .dll): 7z -mx9
   87,566,439 B vs nova 95,721,462 → **+9.3%, our weakest case**. Findings:
   · The codec+filter vote must be cast per CHUNK (`Packer::current` + `place`):
@@ -381,11 +379,11 @@
   big units and fails only in a band, while LZMA2 with a narrow window fails as
   intermittent corruption.
 - COMPAT FIXTURES: `tests/fixtures/legacy-{max,normal,ppmd}.nva` are real
-  pre-recompression archives; `archives_from_before_recompression_still_extract`
-  extracts them fully. Any change to the derived LZMA2 window or PPMd7 pool is
-  caught here and NOWHERE else. Their magic was re-signed in place when the
-  format magic changed — header bytes plus BOTH footers, since the footer
-  self-hash covers the magic. Payload untouched, which is what the test is for.
+  pre-recompression archives, extracted in full by one test — any change to the
+  derived LZMA2 window or PPMd7 pool is caught there and NOWHERE else. Their
+  magic was re-signed in place when the format magic changed (header plus BOTH
+  footers, since the footer self-hash covers it); payload untouched, which is
+  the whole point.
 
 ## Negative knowledge
 
@@ -438,8 +436,12 @@
   max, +598,383 B on Silesia in the real packer. THE LESSON: one LZMA2 chain
   cannot see what a mixed unit gives up — a unit has ONE codec and ONE filter,
   and one winner cannot filter two classes.
-- Creating RAR archives is legally impossible (RARLAB license); unrar may only
-  extract. Plan: pack zip/7z/nova, unpack adds rar.
+- Creating RAR is legally impossible (RARLAB licence): extract only, behind the
+  OFF-BY-DEFAULT `rar` feature, so the default build links no RARLAB code and
+  nova's licence stays an open choice. `sniff` is OUTSIDE the gate (magic bytes
+  need none of it) so that build says "is a rar, not built for it" instead of
+  "not a NOVA archive". Only WinRAR makes fixtures (licensed:
+  `D:/Programs/compressors/WinRAR`), so `tests/fixtures/sample.rar` is checked in.
 - `PROCESS_MODE_BACKGROUND_BEGIN` — Very Low I/O/memory priority (~250x
   slowdowns). IDLE/EcoQoS default — starved by daemons. IoPriorityHintVeryLow
   default — 1-3% of disk. Job-object working-set caps/CPU-rate control —
@@ -518,11 +520,8 @@
 
 ## Plans
 
-DONE: v0.2 (pipeline, memory, priority) · v0.5 (filters, solid groups,
-LZMA2/PPMd) · v0.6 (tournament, geometry, cut floor, byte-majority verdict) ·
-v0.7 recompression — deflate id 34, JPEG id 35, x86 split id 36, PDF images id
-37 · bsc codec id 4 · GUI (basic) · manifest LZMA2 · rename to the current name
-(magic NOVA/NOVAEND1, extension `.nva`, binary `nova`, GUI `nova-prism`).
+Shipped work is in CHANGELOG.md, format ids in `docs/format.md`. Names: magic
+NOVA/NOVAEND1, extension `.nva`, binary `nova`, GUI `nova-prism`.
 
 The standing direction is the owner's: beat 7-Zip where it has NOTHING, rather
 than out-tune LZMA. Remaining, in measured order of value:
@@ -539,12 +538,12 @@ than out-tune LZMA. Remaining, in measured order of value:
    full recommendation, dispack explicitly rejected there. What remains
    needs a CM codec: research 14 §10's lpaq/TPAQ tier, 41.5-43 MiB on
    Silesia (today ~49.3), 2x slower, 1-3 GiB/worker. Owner call first.
-4. DONE: zip+7z READ and zip WRITE (`foreign_zip`, `foreign_7z` — Gotchas).
-   `create x.zip` is deflate-only on purpose (interop; ratio is `.nva`'s
-   job) and lands 0.9% above `7z -tzip -mx9` at max on a 5 MiB tree —
-   miniz_oxide's deflate, not a bug. Left: rar unpack (unrar). GUI: shell
-   icons/thumbnails (research 06/07), .nva association, folder tree, RU
-   localization. Later: GPU (research 08), encryption, installers, ports.
+4. DONE: zip+7z+rar READ and zip WRITE. `create x.zip` is deflate-only on
+   purpose (interop; ratio is `.nva`'s job) and lands 0.9% above
+   `7z -tzip -mx9` at max — miniz_oxide's deflate, not a bug. rar is
+   extract-only behind `--features rar` (Negative knowledge). Left, all GUI:
+   shell icons/thumbnails (research 06/07), .nva association, folder tree,
+   RU localization. Later: GPU (08), encryption, installers, ports.
 
 NOT on this list, and deliberately: bigger units to buy solidity on executables,
 and BCJ2-style per-site probability. Both PRICED and rejected — see Recompression.

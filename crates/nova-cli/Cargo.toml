@@ -14,3 +14,7 @@ anyhow.workspace = true
 clap.workspace = true
 nova-core = { path = "../nova-core" }
 nova-platform = { path = "../nova-platform" }
+
+[features]
+# RAR extraction. Off by default — see the note in the workspace manifest.
+rar = ["nova-core/rar"]

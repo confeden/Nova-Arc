@@ -23,9 +23,14 @@ rmp-serde.workspace = true
 serde.workspace = true
 sevenz-rust2.workspace = true
 tempfile.workspace = true
+unrar = { workspace = true, optional = true }
 walkdir.workspace = true
 zip.workspace = true
 zstd.workspace = true
+
+[features]
+# RAR extraction. Off by default — see the note in the workspace manifest.
+rar = ["dep:unrar"]
 
 [dev-dependencies]
 # Only to BUILD deflate streams for the recompression tests.
