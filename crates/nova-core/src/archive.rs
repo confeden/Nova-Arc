@@ -550,54 +550,13 @@ so unchanged data still deduplicates",
         // to build the total, and its `filter_map` dropped stat failures
         // silently — those files were still read, so the reading could exceed
         // 100% with nothing to explain it.
-        let mut work: Vec<(PathBuf, String, u64)> = Vec::new();
-        for input in inputs {
-            let meta = fs::symlink_metadata(input)
-                .with_context(|| format!("cannot access {}", input.display()))?;
-            if meta.file_type().is_symlink() {
-                stats.symlinks_skipped += 1;
-                continue;
-            }
-            if meta.is_file() {
-                let rel = match input.file_name() {
-                    Some(n) => paths::normalize_rel(Path::new(n))?,
-                    None => bail!("cannot determine archive name for {}", input.display()),
-                };
-                work.push((input.clone(), rel, meta.len()));
-                reporter.scanned(work.len() as u64);
-            } else {
-                let root_name = input.file_name().map(|n| n.to_owned());
-                for entry in walkdir::WalkDir::new(input)
-                    .sort_by_file_name()
-                    .follow_links(false)
-                {
-                    let entry = entry?;
-                    if entry.file_type().is_symlink() {
-                        stats.symlinks_skipped += 1;
-                        continue;
-                    }
-                    if !entry.file_type().is_file() {
-                        continue;
-                    }
-                    let inner = entry
-                        .path()
-                        .strip_prefix(input)
-                        .expect("walkdir yields children of its root");
-                    let mut relp = PathBuf::new();
-                    if let Some(ref n) = root_name {
-                        relp.push(n);
-                    }
-                    relp.push(inner);
-                    let len = entry.metadata().map(|m| m.len()).unwrap_or(0);
-                    work.push((
-                        entry.path().to_path_buf(),
-                        paths::normalize_rel(&relp)?,
-                        len,
-                    ));
-                    reporter.scanned(work.len() as u64);
-                }
-            }
-        }
+        let walk = paths::walk_inputs(inputs, |n| reporter.scanned(n))?;
+        stats.symlinks_skipped += walk.symlinks_skipped;
+        let mut work: Vec<(PathBuf, String, u64)> = walk
+            .files
+            .into_iter()
+            .map(|f| (f.disk, f.rel, f.size))
+            .collect();
         work.sort_by(|a, b| {
             group_key(&a.1)
                 .cmp(&group_key(&b.1))

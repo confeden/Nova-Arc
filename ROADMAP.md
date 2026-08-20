@@ -23,7 +23,7 @@
   virtualized list with glyphs + unit badges, sortable columns, multi-select,
   context menu, double-click opens from a temp dir, Explorer drag&drop both ways,
   throttled progress, level/memory in toolbar (DEFAULT max), argv[1] opens.
-- 114 tests green, clippy clean: roundtrip, append without rewrite, dedup,
+- 117 tests green, clippy clean: roundtrip, append without rewrite, dedup,
   replace, remove+compact, rename, selective extract, crash recovery, torn
   manifest, embedded/forged footer, writer lock, selectors, pre-1970 mtime,
   overwrite policy, compact-detects-corruption, the progress contract,
@@ -36,16 +36,15 @@
   on 4 MiB prose -24%; LZMA2 vs zstd-19 on prose ±2%. Peak RAM tracks `--memory`
   on EXTRACT too (256M→153 MiB, default→1.0 GiB) — bounded, but "~10 MiB peak"
   is long gone, units are the cost.
-- `test/` = playground (gitignored). zip/7z/rar and GPU: not started.
+- `test/` = playground (gitignored), benches `test/*.sh`. rar and GPU: not
+  started; zip/7z read and zip write are done (Plans 4).
 
 ## Architecture & invariants
 
 - Archive layout: `[header][manifest g1][footer g1]` from `create`, then
   `[chunks…][manifest gN][footer gN]` per update; committed bytes are NEVER
-  rewritten except by `compact`.
-- Benches: `test/*.sh`.
-- Commit = manifest → fsync → footer → fsync; without the barrier a valid
-  footer can point at a torn manifest.
+  rewritten except by `compact`. Commit = manifest → fsync → footer → fsync;
+  without the barrier a valid footer can point at a torn manifest.
 - Footer self-hash covers its own absolute offset, so a `.nva` inside another
   archive cannot be mistaken for a commit. Readers verify each candidate's
   manifest and resume the backward scan on failure (≤64).
@@ -109,6 +108,8 @@
   MAX_CHUNK buffers + the manifest — weak-PC extraction is a requirement.
 - Archive paths: relative, UTF-8, '/'-separated; `paths::sanitize` on extract
   rejects traversal/absolute/drive/ADS/reserved-device/trailing-dot names.
+  EVERY writer (.nva and foreign alike) walks inputs through the one
+  `paths::walk_inputs`, so what `create` accepts cannot drift per format.
   Owner's machine: 32 GB RAM, RTX 5060 Ti 8 GB, Windows 11, 8 logical cores.
 
 ## Gotchas
@@ -159,13 +160,10 @@
 - No single codec wins: PPMd7 beats LZMA2 13-24% on prose, LZMA2 beats PPMd7 16%
   on binaries. MAX runs a per-unit tournament (LZMA2 + PPMd7 o10/o16 + bsc);
   fast trusts the analyzer, normal races it against bsc.
-- THE TOURNAMENT IS NOT FOR EVERYTHING. A unit the analyzer classed
-  Precompressed — magic says entropy-coded, and only the 1% trial bar cleared —
-  gets normal's two-horse race instead: PPMd7 models symbol contexts, and data
-  an entropy coder has already been over has none left to model. On a 268 MB
-  FLAC library that is BYTE-IDENTICAL output in 28-43 s instead of 109-306.
-  Priced: +315 B on the deflate corpus (+0.01%), where one small precompressed
-  unit did give PPMd7 something.
+- THE TOURNAMENT IS NOT FOR EVERYTHING. A unit classed Precompressed gets
+  normal's two-horse race instead: PPMd7 models symbol contexts and an entropy
+  coder has left none. On a 268 MB FLAC library that is BYTE-IDENTICAL output
+  in 28-43 s instead of 109-306; priced at +315 B on the deflate corpus.
 - TOURNAMENT WINNERS by corpus (`info --units`): enwik8 bsc 2 · Silesia bsc 7 /
   lzma2 4 · source tree lzma2 4 / ppmd7-10 1 · Firefox lzma2 13 / **ppmd7-16 4**
   · pdfs lzma2 14 / **ppmd7-16 5**. Order 16 earns its place — "it never wins"
@@ -186,9 +184,9 @@
     every other corpus byte-identical.
   · A ZSTD VERDICT CANNOT SPEAK FOR BSC and no threshold fixes it. 1 MiB heads,
     zstd margin / bsc margin: x-ray −25.7% / **+0.9%**, mr −12.4 / +1.6, sao
-    −0.7 / +5.6, a 16-bit stereo .wav −20.5 / **−28.7**. x-ray's zstd margin is
-    the LARGER one, so no threshold takes the right side; judged by zstd the
-    filter costs 0.77% on Silesia. Same root cause as the byte-plane split.
+    −0.7 / +5.6, .wav −20.5 / **−28.7** — x-ray's zstd margin is the LARGER
+    one, so no threshold takes the right side (judged by zstd the filter
+    costs 0.77% on Silesia). Same root cause as the byte-plane split.
 - WHERE WE STAND (`test/bench-std.sh`). Competitor columns predate bsc; nova's
   are current. Max tier unless noted.
   · enwik8  nova **21,506,314** · zpaqfranz -m5 19,625,056 · kanzi -l9
@@ -541,10 +539,12 @@ than out-tune LZMA. Remaining, in measured order of value:
    full recommendation, dispack explicitly rejected there. What remains
    needs a CM codec: research 14 §10's lpaq/TPAQ tier, 41.5-43 MiB on
    Silesia (today ~49.3), 2x slower, 1-3 GiB/worker. Owner call first.
-4. DONE: zip and 7z READ (`foreign_zip`, `foreign_7z` — see Gotchas). Left:
-   zip WRITE, rar unpack (unrar). GUI: shell icons/thumbnails (research
-   06/07), .nva association, folder tree, RU localization. Later: GPU
-   (research 08), encryption, installers, ports.
+4. DONE: zip+7z READ and zip WRITE (`foreign_zip`, `foreign_7z` — Gotchas).
+   `create x.zip` is deflate-only on purpose (interop; ratio is `.nva`'s
+   job) and lands 0.9% above `7z -tzip -mx9` at max on a 5 MiB tree —
+   miniz_oxide's deflate, not a bug. Left: rar unpack (unrar). GUI: shell
+   icons/thumbnails (research 06/07), .nva association, folder tree, RU
+   localization. Later: GPU (research 08), encryption, installers, ports.
 
 NOT on this list, and deliberately: bigger units to buy solidity on executables,
 and BCJ2-style per-site probability. Both PRICED and rejected — see Recompression.

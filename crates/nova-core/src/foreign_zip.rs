@@ -1,10 +1,11 @@
-//! Reading a plain, foreign .zip file directly — not nova's own container.
+//! Reading and writing a plain, foreign .zip file — not nova's own container.
 //!
 //! `deflate::zip` already understands zip's central directory as a SOURCE of
 //! deflate streams to recompress when a zip is being packed INTO an archive.
 //! This module is the opposite direction: treating a `.zip` on disk as a
-//! first-class, listable, extractable archive in its own right, so `nova
-//! list`/`nova extract` work on it without ever creating a `.nva`.
+//! first-class archive in its own right, so `nova list`/`nova extract` work on
+//! it without ever creating a `.nva`, and `nova create out.zip` produces one
+//! anybody can open.
 
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
@@ -13,7 +14,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 
-use crate::archive::{ExtractStats, Overwrite};
+use crate::analyze::Tier;
+use crate::archive::{AddStats, ExtractStats, Overwrite};
 use crate::paths;
 
 /// One entry as listed from a foreign zip's central directory.
@@ -169,6 +171,67 @@ pub fn extract(
     Ok(stats)
 }
 
+/// Write a plain zip at `path` holding every file under `inputs`.
+///
+/// Deflate only, at a level taken from the tier. The stronger methods zip
+/// allows (bzip2, zstd, xz) would beat it on ratio, but a zip is written to
+/// be opened by something that is not nova — and deflate is the one method
+/// every reader in existence supports. Anyone who wants ratio wants `.nva`.
+///
+/// Entries keep the order the walk produced. Sorting by extension is what
+/// `.nva` does to pack similar files into one solid unit; a zip compresses
+/// each entry on its own, so the sort would buy nothing and only scramble
+/// the listing.
+pub fn create(path: &Path, inputs: &[PathBuf], tier: Tier) -> Result<AddStats> {
+    let mut stats = AddStats::default();
+    let walk = paths::walk_inputs(inputs, |_| {})?;
+    stats.symlinks_skipped = walk.symlinks_skipped;
+
+    // create_new, like `Archive::create`: an archiver must not silently
+    // destroy whatever the output path already names.
+    let out = File::create_new(path)
+        .with_context(|| format!("cannot create {} (already exists?)", path.display()))?;
+    let mut zip = zip::ZipWriter::new(out);
+    let level = match tier {
+        Tier::Fast => 1,
+        Tier::Normal => 6,
+        Tier::Max => 9,
+    };
+
+    let mut seen: HashSet<String> = HashSet::new();
+    for f in &walk.files {
+        if !seen.insert(paths::collision_key(&f.rel)) {
+            stats.warnings.push(format!(
+                "skipped {:?}: another file maps to the same archive name",
+                f.rel
+            ));
+            continue;
+        }
+        // ZIP64 costs 20 bytes an entry, and without it the crate refuses a
+        // member over 4 GiB outright — so it is asked for per entry, from the
+        // size the walk already read, instead of always or never.
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated)
+            .compression_level(Some(level))
+            .large_file(f.size >= u32::MAX as u64);
+        zip.start_file(&f.rel, opts)
+            .with_context(|| format!("cannot start zip entry {:?}", f.rel))?;
+        let mut src =
+            File::open(&f.disk).with_context(|| format!("cannot read {}", f.disk.display()))?;
+        let n = std::io::copy(&mut src, &mut zip)
+            .with_context(|| format!("cannot store {}", f.disk.display()))?;
+        stats.files += 1;
+        stats.bytes_in += n;
+    }
+    zip.finish()
+        .with_context(|| format!("cannot finish {}", path.display()))?;
+
+    // The zip's own size on disk, not a sum of per-entry sizes: it is the
+    // number the user sees, headers and central directory included.
+    stats.bytes_stored = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    Ok(stats)
+}
+
 fn open(path: &Path) -> Result<zip::ZipArchive<BufReader<File>>> {
     let f = File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
     zip::ZipArchive::new(BufReader::new(f))
@@ -319,5 +382,76 @@ mod tests {
         assert_eq!(stats.skipped_existing, 1);
         assert_eq!(stats.files, 0);
         assert_eq!(fs::read(out.join("a.txt")).unwrap(), b"first");
+    }
+
+    /// Build a tree on disk, zip it, then read it back through this module's
+    /// own reader — and through the `zip` crate directly, so the test would
+    /// still catch a writer that only our own reader happens to accept.
+    #[test]
+    fn create_round_trips_a_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        fs::create_dir_all(src.join("sub")).unwrap();
+        let body = "compressible text ".repeat(500);
+        fs::write(src.join("a.txt"), &body).unwrap();
+        fs::write(src.join("sub/b.bin"), [7u8; 300]).unwrap();
+
+        let made = tmp.path().join("made.zip");
+        let stats = create(&made, std::slice::from_ref(&src), Tier::Normal).unwrap();
+        assert_eq!(stats.files, 2);
+        assert_eq!(stats.bytes_in, body.len() as u64 + 300);
+        assert!(stats.bytes_stored > 0);
+        assert!(
+            stats.bytes_stored < stats.bytes_in,
+            "deflate must actually compress: {} vs {}",
+            stats.bytes_stored,
+            stats.bytes_in
+        );
+
+        assert!(sniff(&made), "what we write must sniff as a zip");
+        let mut names: Vec<String> = list(&made).unwrap().into_iter().map(|e| e.path).collect();
+        names.sort();
+        assert_eq!(names, ["src/a.txt", "src/sub/b.bin"]);
+
+        let back = tmp.path().join("back");
+        extract(&made, &back, None, Overwrite::Fail).unwrap();
+        assert_eq!(fs::read(back.join("src/a.txt")).unwrap(), body.as_bytes());
+        assert_eq!(fs::read(back.join("src/sub/b.bin")).unwrap(), [7u8; 300]);
+    }
+
+    #[test]
+    fn create_refuses_to_clobber() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("f.txt");
+        fs::write(&src, b"x").unwrap();
+        let out = write_temp(tmp.path(), "taken.zip", b"do not destroy me");
+
+        assert!(create(&out, &[src], Tier::Fast).is_err());
+        assert_eq!(fs::read(&out).unwrap(), b"do not destroy me");
+    }
+
+    /// Every tier must produce a zip, and a stronger one must not be bigger —
+    /// the tier only picks a deflate level, so this pins the mapping without
+    /// asserting an exact size the zlib version could move.
+    #[test]
+    fn create_honours_the_tier() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("f.txt");
+        fs::write(&src, "the quick brown fox ".repeat(2000)).unwrap();
+
+        let mut sizes = Vec::new();
+        for (i, tier) in [Tier::Fast, Tier::Normal, Tier::Max]
+            .into_iter()
+            .enumerate()
+        {
+            let out = tmp.path().join(format!("t{i}.zip"));
+            let stats = create(&out, std::slice::from_ref(&src), tier).unwrap();
+            assert_eq!(stats.files, 1);
+            sizes.push(stats.bytes_stored);
+        }
+        assert!(
+            sizes[0] >= sizes[2],
+            "max must not be larger than fast: {sizes:?}"
+        );
     }
 }

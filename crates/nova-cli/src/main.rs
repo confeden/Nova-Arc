@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use nova_core::{AddStats, Archive, Overwrite, PackOptions, Tier};
 use nova_platform::PriorityMode;
@@ -225,8 +225,18 @@ fn main() -> Result<()> {
             level,
         } => {
             let t = Instant::now();
-            let mut a = Archive::create(&archive)?;
-            let s = a.add_paths(&inputs, &pack(level))?;
+            // The one command that cannot sniff its format: nothing has been
+            // written yet, so the name is the only thing that can say what to
+            // write. Everywhere else the bytes decide.
+            let s = if archive
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("zip"))
+            {
+                nova_core::foreign_zip::create(&archive, &inputs, level.into())?
+            } else {
+                let mut a = Archive::create(&archive)?;
+                a.add_paths(&inputs, &pack(level))?
+            };
             report_add(&s, t);
         }
         Cmd::Add {
@@ -235,6 +245,16 @@ fn main() -> Result<()> {
             level,
         } => {
             let t = Instant::now();
+            // Without this the message would be "not a NOVA archive (bad
+            // magic)", which reads as "unreadable" for a file nova lists and
+            // extracts perfectly well.
+            if nova_core::foreign_zip::sniff(&archive) || nova_core::foreign_7z::sniff(&archive) {
+                bail!(
+                    "{} is a foreign archive - nova can list and extract it, \
+                     but not add to it",
+                    archive.display()
+                );
+            }
             let mut a = Archive::open_rw(&archive)?;
             let s = a.add_paths(&inputs, &pack(level))?;
             report_add(&s, t);

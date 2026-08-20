@@ -8,7 +8,7 @@
 
 use std::path::{Component, Path, PathBuf};
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 
 const RESERVED: &[&str] = &[
     "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
@@ -74,6 +74,87 @@ pub fn sanitize(rel: &str) -> Result<PathBuf> {
         out.push(comp);
     }
     Ok(out)
+}
+
+/// One file the walk found: where it is on disk, what it is called inside
+/// the archive, and how big it was when the walk read its metadata.
+pub struct Found {
+    pub disk: PathBuf,
+    pub rel: String,
+    pub size: u64,
+}
+
+/// What [`walk_inputs`] found, plus what it refused.
+pub struct Walk {
+    pub files: Vec<Found>,
+    pub symlinks_skipped: usize,
+}
+
+/// Expand input paths into the files an archive would store.
+///
+/// Shared by every writer, `.nva` and foreign alike, so that whatever
+/// `nova create` accepts into one format it accepts into all of them —
+/// naming, symlink handling and the rules in [`normalize_rel`] cannot drift
+/// apart if there is only one walk.
+///
+/// `on_found` is called with the running file count so a caller with a
+/// progress reporter can show the scan advancing; pass `|_| {}` if not.
+pub fn walk_inputs(inputs: &[PathBuf], mut on_found: impl FnMut(u64)) -> Result<Walk> {
+    let mut w = Walk {
+        files: Vec::new(),
+        symlinks_skipped: 0,
+    };
+    for input in inputs {
+        let meta = std::fs::symlink_metadata(input)
+            .with_context(|| format!("cannot access {}", input.display()))?;
+        if meta.file_type().is_symlink() {
+            w.symlinks_skipped += 1;
+            continue;
+        }
+        if meta.is_file() {
+            let rel = match input.file_name() {
+                Some(n) => normalize_rel(Path::new(n))?,
+                None => bail!("cannot determine archive name for {}", input.display()),
+            };
+            w.files.push(Found {
+                disk: input.to_path_buf(),
+                rel,
+                size: meta.len(),
+            });
+            on_found(w.files.len() as u64);
+        } else {
+            let root_name = input.file_name().map(|n| n.to_owned());
+            for entry in walkdir::WalkDir::new(input)
+                .sort_by_file_name()
+                .follow_links(false)
+            {
+                let entry = entry?;
+                if entry.file_type().is_symlink() {
+                    w.symlinks_skipped += 1;
+                    continue;
+                }
+                if !entry.file_type().is_file() {
+                    continue;
+                }
+                let inner = entry
+                    .path()
+                    .strip_prefix(input)
+                    .expect("walkdir yields children of its root");
+                let mut relp = PathBuf::new();
+                if let Some(ref n) = root_name {
+                    relp.push(n);
+                }
+                relp.push(inner);
+                w.files.push(Found {
+                    disk: entry.path().to_path_buf(),
+                    rel: normalize_rel(&relp)?,
+                    size: entry.metadata().map(|m| m.len()).unwrap_or(0),
+                });
+                on_found(w.files.len() as u64);
+            }
+        }
+    }
+    Ok(w)
 }
 
 /// Normalize a user-supplied selector ("src\docs" on Windows) to the
