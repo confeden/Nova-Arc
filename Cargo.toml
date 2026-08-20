@@ -32,4 +32,5 @@ serde = { version = "1", features = ["derive"] }
 tempfile = "3"
 walkdir = "2"
 windows-sys = "0.60"
+zip = "8"
 zstd = "0.13"

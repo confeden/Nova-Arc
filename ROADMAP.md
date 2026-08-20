@@ -23,13 +23,13 @@
   virtualized list with glyphs + unit badges, sortable columns, multi-select,
   context menu, double-click opens from a temp dir, Explorer drag&drop both ways,
   throttled progress, level/memory in toolbar (DEFAULT max), argv[1] opens.
-- 98 tests green, clippy clean: roundtrip, append without rewrite, dedup,
+- 106 tests green, clippy clean: roundtrip, append without rewrite, dedup,
   replace, remove+compact, rename, selective extract, crash recovery, torn
   manifest, embedded/forged footer, writer lock, selectors, pre-1970 mtime,
   overwrite policy, compact-detects-corruption, the progress contract,
-  deflate/JPEG/PDF/WAV round-trips, the PDF traps, a stored JPEG inside a zip,
-  the record-width filter on PCM, a split .wav, one large file through the
-  decode lanes, and the `legacy-*.nva` fixtures.
+  deflate/JPEG/PDF/WAV round-trips, the PDF traps, a stored JPEG inside a
+  zip, the record-width filter on PCM, a split .wav, decode lanes, the
+  foreign-zip zip-slip defense, and the `legacy-*.nva` fixtures.
 - Compression v2 DONE: codec+filter per content class, solid blocks by extension,
   LZMA2 + PPMd7 + bsc, BCJ x86 + delta (BCJ verified against liblzma).
 - Measured residue: BCJ on real .exe +4.4-5.7% vs unfiltered. PPMd7 vs zstd-19
@@ -60,10 +60,10 @@
   in `Budget::acquire` holding it and stalls the writer. Throttling lives in
   core, clocks in the GUI — do NOT add a timer thread to core.
 - Memory model: `budget ≈ 32 MiB base + workers × (tables + 8 MiB) + queued`;
-  workers capped by the budget, in-flight bytes by the workers. Table cost per
-  tier in `Tier::worker_memory()`.
-- Chunk hash = blake3(uncompressed)[..16]: dedup AND integrity; dead records stay
-  as dedup sources until compact.
+  workers capped by the budget, in-flight bytes by the workers (table cost
+  per tier in `Tier::worker_memory()`). Chunk hash =
+  blake3(uncompressed)[..16]: dedup AND integrity; dead records stay as
+  dedup sources until compact.
 - INTRA-FILE DECODE LANES. Threads the file count cannot use become lanes
   INSIDE each file (`lanes_per_worker = budget / workers`), so a one-file
   archive stops using one thread while total concurrency, memory, ordering,
@@ -115,6 +115,9 @@
 
 ## Gotchas
 
+- A zip entry may use `\` instead of the spec's `/` (PowerShell's
+  `Compress-Archive` does) — normalize to `/` BEFORE `paths::sanitize`, not
+  inside it, so a `..\` traversal still hits the real `..`-component rule.
 - Windows: cannot rename over an open file — compact consumes `self`, closes the
   handle, then replaces in place. `tempfile` is a REGULAR dep for it.
 - Windows file locks are MANDATORY per byte range: a whole-file `File::try_lock`
@@ -212,17 +215,15 @@
   · ALSO AT NORMAL, the bigger win: enwik8 −24.6%, Silesia −19.0%, pdfs −10.0%,
     precomp −9.0%, source tree −6.2%, for 1.6-1.9x the encode. Normal beats
     7z -mx9 on Silesia in a SIXTH of its time.
-  · TRAP: `bsc` decodes 100 MB in 0.9 s, which reads like 110 MB/s — but that is
-    multithreaded across blocks and nova disables libbsc's own threads. Single
-    -threaded it is ~25 MB/s; treating it as fast in `extract_workers` made a
-    normal Silesia archive extract in 8.7 s against zstd's 0.5. The real cost:
-    normal Silesia 0.5 → 2.1 s for −19%.
+  · TRAP: `bsc` decodes 100 MB in 0.9 s — multithreaded across blocks, but
+    nova disables libbsc's own threads, so single-threaded it's ~25 MB/s.
+    Treating it as fast in `extract_workers` made normal Silesia extract in
+    8.7 s against zstd's 0.5 s; real cost: 0.5 → 2.1 s for −19%.
   · FAST STAYS WITHOUT IT, measured twice, the second time after decode lanes
     landed — which the first refusal had named as its condition. Fast with bsc
     would be 47.8 MB / 2.90 s pack / 3.19 s extract against NORMAL's 46.4 /
-    7.0 / 2.09: better only in pack time. Not a fast tier, a worse normal one.
-  · libbsc is C++ and nova-core is `#![forbid(unsafe_code)]`, so it needs its
-    own crate.
+    7.0 / 2.09: better only in pack time, a worse normal tier. libbsc is C++
+    and nova-core is `#![forbid(unsafe_code)]`, so it needs its own crate.
 - Cut floor + byte-majority verdict on test/corpus: fast −7.6%, normal −0.2%,
   max −4.0%. The fast win is the VOTE (the floor ALONE made fast 5.1 MB worse).
 - Edit cost at max is ~4.7 MiB and ~40 s — the edited file lives in a 30-60 MB
@@ -433,8 +434,7 @@
 - "The record-width filter is only for data that would otherwise be stored raw"
   — WRONG, it cost 27% on PCM. See Compression design: the guard is `pays_off`.
 - Flushing a unit on every change of content class — shatters a source tree
-  into 246 units (median 1.4 KiB) and costs 1.8 MiB. Only files >= 4 KiB may
-  trigger a class split.
+  into 246 units (median 1.4 KiB, +1.8 MiB); only files >= 4 KiB may trigger it.
 - Letting a class change slide until the unit is half the target — TRIED AND
   REVERTED: a 171 KB win in a fixed-codec counterfactual cost +1,002,157 B at
   max, +598,383 B on Silesia in the real packer. THE LESSON: one LZMA2 chain
@@ -509,8 +509,8 @@
 - Not preserved: empty dirs, symlinks, NTFS attrs/ADS, ACLs. Manifest in RAM;
   long Windows paths untested.
 - Solid-block members are read whole into RAM at pack time (up to 8 MiB outside
-  the pipeline budget). No trained dictionaries; no MP3 recompression.
-- A container past the solo cap is recompressed only if it is audio (Plans 1).
+  the pipeline budget). No trained dictionaries; no MP3 recompression. A
+  container past the solo cap is recompressed only if it is audio (Plans 1).
 - The outer extraction loop is still per FILE; lanes engage only below workers.
   `--eco`/`--full`/EcoQoS are built but not measured under load.
 - Progress granularity at max is bounded by the UNIT COUNT, not fixable in the
@@ -541,10 +541,10 @@ than out-tune LZMA. Remaining, in measured order of value:
    full recommendation, dispack explicitly rejected there. What remains
    needs a CM codec: research 14 §10's lpaq/TPAQ tier, 41.5-43 MiB on
    Silesia (today ~49.3), 2x slower, 1-3 GiB/worker. Owner call first.
-4. zip/7z unpack + zip pack (sevenz-rust2), rar unpack (unrar). GUI: shell
-   icons/thumbnails (research 06/07), .nva association + installer, folder tree,
-   RU localization. Later: GPU (research 08), encryption (XChaCha20-Poly1305),
-   Explorer integration, installers, Linux/macOS/Android ports.
+4. DONE: zip READ, `nova-core::foreign_zip` (backslash finding: Gotchas).
+   Left: 7z read (sevenz-rust2), zip WRITE, rar unpack (unrar). GUI: shell
+   icons/thumbnails (research 06/07), .nva association, folder tree, RU
+   localization. Later: GPU (research 08), encryption, installers, ports.
 
 NOT on this list, and deliberately: bigger units to buy solidity on executables,
 and BCJ2-style per-site probability. Both PRICED and rejected — see Recompression.

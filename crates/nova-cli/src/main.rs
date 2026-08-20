@@ -232,7 +232,6 @@ fn main() -> Result<()> {
             skip_existing,
         } => {
             let t = Instant::now();
-            let a = Archive::open_ro(&archive)?;
             let sel = if paths.is_empty() {
                 None
             } else {
@@ -243,7 +242,12 @@ fn main() -> Result<()> {
                 (_, true) => Overwrite::Skip,
                 _ => Overwrite::Fail,
             };
-            let s = a.extract_with(&output, sel, policy, &pack(Level::Normal))?;
+            let s = if nova_core::foreign_zip::sniff(&archive) {
+                nova_core::foreign_zip::extract(&archive, &output, sel, policy)?
+            } else {
+                let a = Archive::open_ro(&archive)?;
+                a.extract_with(&output, sel, policy, &pack(Level::Normal))?
+            };
             println!(
                 "Extracted {} file(s), {} in {:.1}s",
                 s.files,
@@ -259,22 +263,33 @@ fn main() -> Result<()> {
             }
         }
         Cmd::List { archive } => {
-            let a = Archive::open_ro(&archive)?;
             let mut total = 0u64;
-            let mut stored = 0u64;
-            println!("{:>12}  {:>12}  Path", "Size", "Stored");
-            for f in &a.manifest.files {
-                let st = a.stored_size(f);
-                println!("{:>12}  {:>12}  {}", human(f.size), human(st), f.path);
-                total += f.size;
-                stored += st;
+            let mut count = 0usize;
+            if nova_core::foreign_zip::sniff(&archive) {
+                println!("{:>12}  Path", "Size");
+                for e in nova_core::foreign_zip::list(&archive)? {
+                    println!("{:>12}  {}", human(e.size), e.path);
+                    total += e.size;
+                    count += 1;
+                }
+                println!("{:>12}  {} file(s)", human(total), count);
+            } else {
+                let a = Archive::open_ro(&archive)?;
+                let mut stored = 0u64;
+                println!("{:>12}  {:>12}  Path", "Size", "Stored");
+                for f in &a.manifest.files {
+                    let st = a.stored_size(f);
+                    println!("{:>12}  {:>12}  {}", human(f.size), human(st), f.path);
+                    total += f.size;
+                    stored += st;
+                }
+                println!(
+                    "{:>12}  {:>12}  {} file(s)",
+                    human(total),
+                    human(stored),
+                    a.manifest.files.len()
+                );
             }
-            println!(
-                "{:>12}  {:>12}  {} file(s)",
-                human(total),
-                human(stored),
-                a.manifest.files.len()
-            );
         }
         Cmd::Remove { archive, paths } => {
             let mut a = Archive::open_rw(&archive)?;
