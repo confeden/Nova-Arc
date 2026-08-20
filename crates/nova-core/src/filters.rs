@@ -287,17 +287,21 @@ fn jpeg_decode(data: &[u8]) -> Result<Vec<u8>> {
 ///
 /// A stream that preflate refuses is simply left as it is — the transform is
 /// per stream, and a container full of streams it cannot model still gains from
-/// the ones it can.
+/// the ones it can. The coded-size cap is enforced the same way: a stream whose
+/// growth would cross it is skipped, not the whole container's transform.
 fn deflate_encode(data: &[u8]) -> Result<Vec<u8>> {
-    container_encode_inner(data, false)
+    container_encode_inner(data, false, crate::archive::MAX_CODED_CHUNK as usize)
 }
 
 /// The v2 path: the same framing, but JPEG streams are transformed too.
 fn container_encode(data: &[u8]) -> Result<Vec<u8>> {
-    container_encode_inner(data, true)
+    container_encode_inner(data, true, crate::archive::MAX_CODED_CHUNK as usize)
 }
 
-fn container_encode_inner(data: &[u8], v2: bool) -> Result<Vec<u8>> {
+/// `cap` is a parameter rather than reading `MAX_CODED_CHUNK` directly so a
+/// test can shrink it and exercise the per-stream skip on ordinary-sized data
+/// instead of needing hundreds of MiB to cross the real bound.
+fn container_encode_inner(data: &[u8], v2: bool, cap: usize) -> Result<Vec<u8>> {
     use crate::deflate::{encode, find_streams, Kind, Piece};
     let mut streams = find_streams(data);
     // Id 34's framing has no room to say what a stream is, so it may only ever
@@ -314,7 +318,7 @@ fn container_encode_inner(data: &[u8], v2: bool) -> Result<Vec<u8>> {
     // bound the decoder enforces, or nova would write archives it refuses to
     // read; and the packing memory budget charges for the unit, not for what a
     // filter might grow it into.
-    let cap = crate::archive::MAX_CODED_CHUNK as usize;
+    //
     // preflate verifies each stream itself; the caller then round-trips the
     // whole buffer, which also covers this module's framing.
     let cfg = preflate_rs::PreflateConfig {
@@ -333,6 +337,12 @@ fn container_encode_inner(data: &[u8], v2: bool) -> Result<Vec<u8>> {
     // them lets the transformed form reach `cap + data.len()`. That is not a
     // rounding error: the read side refuses a coded length above the cap, so
     // the overrun is an archive nova writes and then cannot extract.
+    //
+    // Checked PER STREAM, not summed and judged once at the end: a unit is one
+    // container that may hold hundreds of independent streams (a zip, a PDF),
+    // and one outsized member must not cancel every other stream's gain. A
+    // rejected stream's growth is never folded into `total`, so it does not
+    // poison the streams that come after it.
     let mut total = data.len();
     for s in &streams {
         let raw = s.gather(data);
@@ -356,12 +366,13 @@ fn container_encode_inner(data: &[u8], v2: bool) -> Result<Vec<u8>> {
                 _ => continue,
             },
         };
-        total = total
+        let grown = total
             .saturating_add(plain.len())
             .saturating_add(corrections.len());
-        if total > cap {
-            bail!("undoing this container would exceed the coded-size bound");
+        if grown > cap {
+            continue;
         }
+        total = grown;
         parts.push(Piece {
             pieces: s.pieces.clone(),
             kind: s.kind,
@@ -1139,6 +1150,69 @@ mod tests {
             delta * 2 < plain,
             "delta-4 on stereo PCM: {plain} -> {delta}"
         );
+    }
+
+    /// The coded-size cap used to be judged on the SUM of every stream in the
+    /// container, so one oversized member made the whole transform `bail!`,
+    /// discarding every stream's gain including the ones already comfortably
+    /// under the cap. It must be judged per stream: an outsized member is
+    /// skipped, its neighbours are not — the real case is a PDF or a zip with
+    /// one implausibly large member among many ordinary ones.
+    #[test]
+    fn an_oversized_stream_does_not_cancel_its_neighbours() {
+        fn zlib_stream(body: &[u8]) -> Vec<u8> {
+            let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::new(9));
+            z.write_all(body).unwrap();
+            z.finish().unwrap()
+        }
+        fn pdf_obj(num: u32, body: &[u8]) -> Vec<u8> {
+            let mut o = format!(
+                "{num} 0 obj\n<< /Filter /FlateDecode /Length {} >>\nstream\n",
+                body.len()
+            )
+            .into_bytes();
+            o.extend_from_slice(body);
+            o.extend_from_slice(b"\nendstream\nendobj\n");
+            o
+        }
+        // Compressible text, so preflate has something real to model rather
+        // than a stream it refuses. A unique tail per object keeps the
+        // compressed form above MIN_STREAM: pure repetition of one pattern
+        // can fold below the 64-byte floor and the scanner would drop it
+        // before this function ever sees it.
+        fn text(n: usize, tag: u32) -> Vec<u8> {
+            const PANGRAM: &[u8] = b"the quick brown fox jumps over the lazy dog ";
+            let mut v: Vec<u8> = (0..n).map(|i| PANGRAM[i % PANGRAM.len()]).collect();
+            v.extend_from_slice(format!("unique tail {tag}").as_bytes());
+            v
+        }
+
+        let mut pdf = b"%PDF-1.7\n".to_vec();
+        for i in 1..=4u32 {
+            pdf.extend(pdf_obj(i, &zlib_stream(&text(3_000, i))));
+        }
+        let big = pdf_obj(5, &zlib_stream(&text(100_000, 5)));
+        pdf.extend_from_slice(&big);
+        assert_eq!(
+            crate::deflate::find_streams(&pdf).len(),
+            5,
+            "test setup: the scanner must see all five streams"
+        );
+
+        // Comfortably fits the container plus the four small streams' ~3,000
+        // bytes of plain text each (~12,000 total), but not the fifth
+        // stream's 100,000-byte plain text on top of that.
+        let cap = pdf.len() + 20_000;
+
+        let encoded = container_encode_inner(&pdf, false, cap)
+            .expect("the four small streams must still transform");
+        let decoded = crate::deflate::decode(&encoded).unwrap();
+        assert_eq!(
+            decoded.streams.len(),
+            4,
+            "the oversized stream must be skipped, not the whole container"
+        );
+        assert_eq!(deflate_decode(&encoded).unwrap(), pdf);
     }
 }
 

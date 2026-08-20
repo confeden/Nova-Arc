@@ -23,7 +23,7 @@
   virtualized list with glyphs + unit badges, sortable columns, multi-select,
   context menu, double-click opens from a temp dir, Explorer drag&drop both ways,
   throttled progress, level/memory in toolbar (DEFAULT max), argv[1] opens.
-- 97 tests green, clippy clean: roundtrip, append without rewrite, dedup,
+- 98 tests green, clippy clean: roundtrip, append without rewrite, dedup,
   replace, remove+compact, rename, selective extract, crash recovery, torn
   manifest, embedded/forged footer, writer lock, selectors, pre-1970 mtime,
   overwrite policy, compact-detects-corruption, the progress contract,
@@ -238,11 +238,10 @@
 
 ## Recompression — DEFLATE, JPEG and PDF ARE LANDED (research 02, measured here)
 
-- Corpora: `test/precomp-web` (public, below), `test/precomp` (its improvised
-  4.93 MiB predecessor: nova 2,408,562 vs 3,988,643), `test/incompress` (the
-  control that must stay stored), `test/photos`, `test/zipphoto` (the same
-  photos, zipped with method Store), `test/pdfs`, `test/firefox`, `test/audio` +
-  `test/audio-wav`. Probes are in `test/probe-preflate`, outside the workspace.
+- Corpora: `test/precomp-web` (public, below; supersedes `test/precomp`),
+  `test/incompress` (control, must stay stored), `test/photos`,
+  `test/zipphoto` (same photos, zipped Store), `test/pdfs`, `test/firefox`,
+  `test/audio` + `test/audio-wav`. Probes in `test/probe-preflate`, outside the workspace.
 - MIN_STREAM = 64 bytes, MEASURED; 4096 cost 15 points. "A record cannot pay
   for itself on 2 KB" is true per FILE, false inside a unit. `preflate-rs 0.7.6`
   (Microsoft, Apache-2.0) is byte-exact on every file of both corpora.
@@ -259,6 +258,10 @@
     refused, because it expands to 319,897,600 B — past `MAX_CODED_CHUNK`
     (256 MiB). Worse than the solo cap: it scales with how well the payload
     compresses, so it bites hardest where recompression would pay most.
+  · That cap was charged PER UNIT: one oversized member made the WHOLE unit
+    `bail!`, losing every other stream's gain too. FIXED — an outsized member
+    is now skipped alone, not its neighbours. Byte-identical here: binutils
+    is a lone stream, so this fixes a different case, untested by this corpus.
   · fast lands at 99.7% here and that is CORRECT: PNG-filtered photographic
     scanlines do not beat the original deflate under zstd-3.
 - STORED ZIP ENTRIES ARE SCANNED TOO, and skipping them had been throwing away
@@ -288,11 +291,10 @@
     37 adds a kind byte and a `NDf2` magic; the decoder reads both, so everything
     written still opens and 34 is decode-only — an id is a promise, not a slot.
     A `/DCTDecode` stream is the JPEG itself: no zlib wrapper, starts at SOI.
-  · Id 34 came first, on deflate only: 7,626,464 → 5,290,810 vs brotli's
-    6,536,147. THE TRAP: PDF's `/FlateDecode` is RFC 1950, so a stream carries
-    two zlib header bytes and a four-byte adler32 that are NOT deflate. Handed
-    those, preflate modelled **0 of 957** streams while the scanner reported 72%
-    coverage — wired and doing nothing. Strip 2 + 4.
+  · THE TRAP (found via id 34, deflate-only, before id 37 added JPEG): PDF's
+    `/FlateDecode` is RFC 1950, so a stream carries two zlib header bytes and
+    a four-byte adler32 that are NOT deflate. Handed those, preflate modelled
+    **0 of 957** streams while the scanner reported 72% coverage. Strip 2 + 4.
   · The scan is LEXICAL; "PDF needs a full object parse" deferred it and was
     WRONG. Rules: `stream` must follow `>>`; the FIRST name after `/Filter`
     decides the kind; `/Length` needs whitespace or `/Length1` is read as the
@@ -451,11 +453,10 @@
 - LZMA2 as the universal max-tier codec — on 4 MiB chunks it is only ±2% vs
   zstd-19 on text, its edge coming from >4 MiB dictionaries that chunking
   removes. It stays for binary/generic data; text goes to PPMd7 (−24%).
-- Capping zstd WindowLog for 4 MiB chunks — no effect, zstd already shrinks
-  the window to the source size.
-- Parallel EXTRACTION with zstd — SLOWER: 5751 small files take 1.0 s on 1
-  thread, 2.5 s on 8 (NTFS metadata contention + seeks). Default extract workers
-  = 1 for zstd/store; `-j` still honoured.
+- Capping zstd WindowLog for 4 MiB chunks — no effect, already shrinks to
+  the source size. Parallel EXTRACTION with zstd is SLOWER too (NTFS
+  metadata contention): 5751 files, 1.0 s on 1 thread vs 2.5 s on 8; default
+  extract workers = 1 for zstd/store, `-j` still honoured.
 - GPU for blake3/dedup — slower than CPU SIMD, PCIe erases gains. GPU high-ratio
   compression (LZMA-class) does not exist in 2026; GPU codecs land near zstd-1..3
   and Blackwell's HW decompressor is datacenter-only (a 5060 Ti has none).
@@ -531,10 +532,10 @@ v0.7 recompression — deflate id 34, JPEG id 35, x86 split id 36, PDF images id
 The standing direction is the owner's: beat 7-Zip where it has NOTHING, rather
 than out-tune LZMA. Remaining, in measured order of value:
 
-1. A container past the solo cap still loses recompression for zip, PDF and
-   JPEG — audio is done, and those cannot be cut the way FLAC frames could.
-   Raising the cap is not the answer either: it IS `MAX_STORED_CHUNK`. What is
-   left is either a format change or per-format splitting.
+1. FIXED the multi-stream half (per-stream cap, above). The single-stream
+   half is UNSOLVED: WAV-style splitting does not generalise — preflate-rs
+   only returns reconstruction parameters for its FIRST chunk, so one lone
+   stream (`binutils-2.42.tar.gz`) cannot be cut. Left: a format change.
 2. AUDIO IS OTHERWISE DONE — see Negative knowledge for why FLAC residuals are
    not worth it. MP3 (packMP3, ~16%, LGPL-3.0, dormant) is the only piece left,
    and it is a licensing question before it is a code one.
