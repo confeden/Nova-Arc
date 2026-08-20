@@ -18,7 +18,7 @@
 
 <rect x="0" y="0" width="640" height="400" rx="18" fill="url(#npBgGlow)"/>
 
-<g font-family="'Courier New',Consolas,monospace" font-weight="700" font-size="15" letter-spacing="2">
+<g font-family="'Courier New',Consolas,monospace" font-weight="7000" font-size="15" letter-spacing="2">
   <text x="42" y="95"  fill="#ff3b3b">110100101111010010111101001</text>
   <text x="42" y="136" fill="#ff9138">1101001011110100101111010</text>
   <text x="42" y="177" fill="#ffd23b">11010010111101001011110</text>
