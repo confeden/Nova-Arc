@@ -2,15 +2,9 @@
   <img src="docs/logo.svg" alt="Nova Prism — архиватор с рекомпрессией JPEG, PDF и zip" width="560">
 </p>
 
-<p align="center">
-  <img alt="Rust" src="https://img.shields.io/badge/язык-Rust-DE4C36?style=flat-square&logo=rust&logoColor=white">
-  <img alt="Статус" src="https://img.shields.io/badge/статус-бета%200.8-3b82f6?style=flat-square">
-  <img alt="Платформа" src="https://img.shields.io/badge/платформа-Windows-6e40c9?style=flat-square">
-  <img alt="Тесты" src="https://img.shields.io/badge/тесты-106%20зелёных-1fb866?style=flat-square">
-  <img alt="Телеметрия" src="https://img.shields.io/badge/телеметрия-0-lightgrey?style=flat-square">
-</p>
-
 # Nova Prism
+
+> Проект в активной разработке: формат, интерфейс и набор возможностей ещё меняются.
 
 **Сжать несжимаемое.** Nova Prism — архиватор нового поколения с открытым исходным кодом на Rust, альтернатива 7-Zip, WinRAR и PeaZip для Windows: не просто упаковывает JPEG, PDF, zip, PNG и WAV, а разбирает и сжимает их заново.
 

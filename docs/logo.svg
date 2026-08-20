@@ -1,6 +1,6 @@
 <svg width="640" height="400" viewBox="0 0 640 400" xmlns="http://www.w3.org/2000/svg" role="img">
 <title>Nova Prism</title>
-<desc>A glowing triangle taking in rainbow-colored binary digits on the left and emitting a single white binary stream on the right, with the Nova Prism wordmark below.</desc>
+<desc>An equilateral glowing triangle taking in rainbow-colored binary digits that stop at its edge on the left and emitting a single white binary stream that starts past its edge on the right, with the Nova Prism wordmark centered below it.</desc>
 <defs>
   <radialGradient id="npBgGlow" cx="62%" cy="34%" r="68%">
     <stop offset="0%" stop-color="#111c33"/>
@@ -19,23 +19,23 @@
 <rect x="0" y="0" width="640" height="400" rx="18" fill="url(#npBgGlow)"/>
 
 <g font-family="'Courier New',Consolas,monospace" font-weight="700" font-size="15" letter-spacing="2">
-  <text x="42" y="95"  fill="#ff3b3b">1011010010111001011010011101001011</text>
-  <text x="42" y="136" fill="#ff9138">0110100101110100110100101101</text>
-  <text x="42" y="177" fill="#ffd23b">10110100111010010110100101</text>
-  <text x="42" y="218" fill="#4ce26a">0110100101110100101101</text>
-  <text x="42" y="259" fill="#34d3c4">1011001011101001011</text>
-  <text x="42" y="300" fill="#3b82f6">01101001011010011</text>
+  <text x="42" y="95"  fill="#ff3b3b">110100101111010010111101001</text>
+  <text x="42" y="136" fill="#ff9138">1101001011110100101111010</text>
+  <text x="42" y="177" fill="#ffd23b">11010010111101001011110</text>
+  <text x="42" y="218" fill="#4ce26a">110100101111010010111</text>
+  <text x="42" y="259" fill="#34d3c4">1101001011110100101</text>
+  <text x="42" y="300" fill="#3b82f6">11010010111101001</text>
 </g>
 
-<polygon points="392,54 256,318 508,318" fill="none" stroke="#eafcff" stroke-width="3.5"
+<polygon points="380,54 227.5,318 532.5,318" fill="none" stroke="#eafcff" stroke-width="3.5"
   stroke-linejoin="round" filter="url(#npGlowStrong)"/>
 
-<text x="452" y="190" font-family="'Courier New',Consolas,monospace" font-weight="700" font-size="15"
-  letter-spacing="2" fill="#ffffff" filter="url(#npGlowSoft)">01101001011101001</text>
+<text x="473" y="190" font-family="'Courier New',Consolas,monospace" font-weight="700" font-size="15"
+  letter-spacing="2" fill="#ffffff" filter="url(#npGlowSoft)">110100101111</text>
 
-<text x="320" y="362" text-anchor="middle" font-family="Arial,Helvetica,sans-serif" font-weight="800"
-  font-size="46" letter-spacing="2" fill="#ffffff"><tspan>NOVA </tspan><tspan fill="#b088f0">P</tspan><tspan fill="#3b6fe0">R</tspan><tspan fill="#f0e9d2">I</tspan><tspan fill="#26cfc2">S</tspan><tspan fill="#1fb866">M</tspan></text>
+<text x="380" y="362" text-anchor="middle" font-family="Arial,Helvetica,sans-serif" font-weight="800"
+  font-size="46" letter-spacing="2" fill="#ffffff"><tspan>NOVA </tspan><tspan fill="#9d4edd">P</tspan><tspan fill="#3b82f6">R</tspan><tspan fill="#14b8a6">I</tspan><tspan fill="#22c55e">S</tspan><tspan fill="#eab308">M</tspan></text>
 
-<text x="320" y="388" text-anchor="middle" font-family="'Courier New',Consolas,monospace" font-size="13"
+<text x="380" y="388" text-anchor="middle" font-family="'Courier New',Consolas,monospace" font-size="13"
   letter-spacing="6" fill="#66788f">MODERN ARCHIVER</text>
 </svg>
