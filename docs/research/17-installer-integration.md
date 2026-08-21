@@ -1,8 +1,8 @@
 # 17 — Putting nova's max tier inside installers
 
 Owner's ask: let installer authors compress their payload with nova's max
-tier as easily as they use LZMA today, under a short name — proposed
-**PRISM** — with a self-extraction story. Not scheduled; this is the plan to
+tier as easily as they use LZMA today, under a short name — **nova**, decided
+(§7) — with a self-extraction story. Not scheduled; this is the plan to
 argue with before any of it is built.
 
 Everything measured here is from this repo's own benches (see ROADMAP for the
@@ -64,41 +64,89 @@ point anywhere. This requirement is met outright.
 
 ---
 
-## 3. The one number that decides everything: decoder size
+## 3. The one number that decides everything: decoder size — MEASURED
 
-`nova.exe` (full CLI, release) is **4.80 MiB measured**. That figure includes
-every encoder — flacenc, lepton's encoder, preflate's encoder, the four-codec
-tournament, the zip/7z/rar readers, clap — none of which a decoder needs.
+This was the open question the whole document hung on. It is answered, and the
+answer is much better than the 4.80 MiB of `nova.exe` suggested — that figure
+is a full CLI at default release settings, and clap plus the encoders are most
+of it.
 
-A decode-only build is **NOT MEASURED**. It still has to carry, at minimum:
+`test/size-probe.sh` builds one binary per feature set with the settings a
+shipped stub would use (`opt-level="z"`, fat LTO, `codegen-units=1`,
+`panic="abort"`, stripped), each one calling its decoder on a file from argv so
+nothing can be dead-code-eliminated. `floor` is a Rust std binary with no
+decoder in it, so **feature − floor is what that decoder really costs**:
 
-- LZMA2 decode (`lzma-rust2`, pure Rust)
-- PPMd7 decode (`ppmd-rust`, pure Rust)
-- bsc decode (`nova-bsc` → **libbsc, C++**)
-- zstd decode (**C**)
-- the filters: BCJ, BCJ2, delta, record-width (ours, pure Rust, small)
-- preflate *recreate* (for filter 34/37 payloads)
-- lepton *decode* (for filter 35)
-- claxon (for filter 38)
+| build | bytes | | cost over floor |
+|---|---:|---|---:|
+| floor (Rust std, no decoder) | 117,760 | 115.0 KiB | — |
+| + LZMA2 decode | 132,608 | 129.5 KiB | **14.5 KiB** |
+| + PPMd7 decode | 131,072 | 128.0 KiB | **13.0 KiB** |
+| + claxon (FLAC, filter 38) | 152,064 | 148.5 KiB | **33.5 KiB** |
+| + blake3 + MessagePack manifest | 244,224 | 238.5 KiB | **123.5 KiB** |
+| + zstd (**C**) | 279,552 | 273.0 KiB | **158.0 KiB** |
+| + libbsc (**C++**) | 282,624 | 276.0 KiB | **161.0 KiB** |
+| + preflate recreate (filter 34/37) | 284,160 | 277.5 KiB | **162.5 KiB** |
+| + lepton decode (filter 35) | 351,232 | 343.0 KiB | **228.0 KiB** |
 
-That list is the honest answer to "why not just make it small": nova's max
-tier is not a codec, it is a tournament plus a filter set, and **a decoder
-must implement every branch the encoder was allowed to take.** Recompression
-is where nova's advantage comes from, and each of those filters drags a
-third-party library into the bootstrapper.
+The pure-Rust strong codecs are nearly free — **LZMA2 decode is 14.5 KiB and
+PPMd7 decode is 13.0 KiB**, because a range decoder plus a model is small and
+all the memory is allocated at runtime. What costs is the C/C++ libraries
+(whose crates build the *encoder* too, so those rows are beatable) and, oddly,
+our own manifest layer: blake3 + serde + rmp-serde is 123.5 KiB, the second
+largest line item after lepton.
 
-> **Measure this first, before anything else in this document.** Build a
-> decode-only binary behind a cargo feature that strips the encoders, and
-> report its stripped size. If it lands near 1 MiB, the SFX story is viable
-> for mid-sized installers. If it lands near 4 MiB, only very large payloads
-> can justify it and the plan below narrows to §6a.
+**And the ceiling, also measured.** nova-core exactly as it stands — every
+encoder, the four-codec tournament, the zip/7z readers, the whole pack and
+extract pipeline — linked into a binary with no CLI, same stub settings:
+**1,185,280 B (1.13 MiB)**. A decode-only build cannot be larger than that.
+So the honest bracket for a max-everything stub is **0.98–1.13 MiB**, and
+4.80 MiB was never the relevant number.
+
+### The design this buys: a profile ladder, not one decoder
+
+A decoder must implement every branch the encoder was allowed to take — that
+part of the old objection stands. The answer is to **bound what the encoder is
+allowed to take**, per archive, and ship one stub per bound:
+
+| profile | contains | measured stub, decoders only |
+|---|---|---:|
+| **core** | store + LZMA2, BCJ/BCJ2/delta/record, manifest | **257,536 B (251.5 KiB)** |
+| **media** | core + preflate + lepton + FLAC | **672,256 B (656.5 KiB)** |
+| **max** | media + PPMd7 + libbsc + zstd | **1,005,568 B (982.0 KiB)** |
+
+Add roughly 200 KiB of nova's own container/extract logic to each (the gap
+between the 982 KiB max row and the 1.13 MiB whole-engine ceiling) and a real
+stub is ~450 KiB at core, ~1.2 MiB at max.
+
+Three things follow, and they are the plan:
+
+1. **`nova create --profile core|media|max`** — the packer refuses codecs and
+   filters outside the profile. An installer build server pins `core` and gets
+   an archive any 450 KiB stub can open. Encoder-side only; no format change.
+2. **`nova sfx` picks the smallest stub that fits.** The manifest already
+   records every codec and filter actually used (`info --units` reads them), so
+   the tool computes the required profile from the archive rather than being
+   told. Nobody ships lepton to unpack a DLL tree.
+3. **The stub size only matters against the payload.** +700 KiB of stub to take
+   20% off a 200 MB media pack is 40 MB saved; the same stub on a 5 MB payload
+   is absurd. That ratio, not an absolute KiB target, is what the tool should
+   reason about — and what the pitch should say.
+
+**One encoder-side fix the core profile needs.** A manifest under 128 KiB is
+zstd-compressed, and the codec is detected from the frame magic, so today even
+a trivial archive drags **C** into the smallest decoder. Force the manifest to
+LZMA2 (or store) under `--profile core` and the core stub is **pure Rust with
+no C or C++ at all** — which §9 correctly names as the thing that makes a
+decoder easy to integrate. Backward compatible by construction: the reader
+already picks the codec off the bytes.
 
 ---
 
 ## 4. Where this genuinely wins, and where it must not be sold
 
 The Firefox row above is the warning: on an **installed program tree** —
-mostly DLLs — nova is 6.7% *worse* than 7-Zip. A generic "use PRISM for your
+mostly DLLs — nova is 6.7% *worse* than 7-Zip. A generic "use nova for your
 installer" pitch would lose on exactly the payload most installers carry.
 
 The win is where the payload is **already-compressed data an LZMA-based
@@ -109,7 +157,7 @@ against 7-Zip on those, and nothing else in the installer world does it.
 
 So the pitch is not "better LZMA". It is: **"your art and media pack shrinks
 by a fifth; your DLLs do not."** A serious integration would let an author
-mix — PRISM for asset archives, LZMA for the binary tree — which the format
+mix — nova for asset archives, LZMA for the binary tree — which the format
 already supports per unit.
 
 ---
@@ -128,30 +176,49 @@ Prepend a stub of size S and every offset shifts by S; the self-hash stops
 matching and the archive refuses to open. The anti-embedding defence and the
 SFX trick are the same mechanism pointed in opposite directions.
 
-Three ways out, in order of preference:
+Three ways out. The first was written off here as a format change; it is not,
+and it is the right answer.
 
-1. **Base-offset-aware open.** Teach the reader an explicit `base` and hash
-   `at - base`. Small, but it is a **format-visible change** and weakens the
-   embedding defence unless the base is authenticated too. Needs care.
-2. **Payload as a PE resource or a named section**, not concatenated. The
-   stub reads it through a byte range it already knows. No format change, no
-   weakening — costs a resource-extraction step and a 2 GB-ish practical
-   ceiling on some toolchains.
+1. **Base-offset-aware open — RECOMMENDED, and not a format change.** Teach
+   the *reader* an explicit `base` and hash `at - base`. The archive bytes are
+   then **byte-identical to a standalone `.nva`**: build it normally, then
+   `copy /b stub.exe + payload.nva setup.exe`. Nothing in the file changes,
+   nothing in the spec changes, and every existing archive still opens.
+
+   The embedding defence survives intact *provided the base comes from
+   out-of-band knowledge, never from the file*. That is the whole rule. A
+   normal open uses `base = 0`, so a `.nva` sitting inside a data file still
+   cannot pass its self-hash — the defence is exactly as strong as today. Only
+   a caller that already knows where its own payload starts may pass a nonzero
+   base, and a stub knows that about itself. If the base were ever read out of
+   a header, the defence would collapse; so it must not be, and the API should
+   make that impossible by taking the base as an argument rather than a field.
+
+2. **Payload as a PE resource or a named section.** Also works, no format
+   change, but it costs a resource-extraction step, makes the build need `rc`,
+   and hits a practical size ceiling on some toolchains. Keep as the fallback.
+
 3. **Two files** (`setup.exe` + `data.nva`). Zero work, and unacceptable for
    most distributors; listed only to be dismissed.
 
-**Recommendation: (2) first** — it needs nothing from the format — and treat
-(1) as a format-version question to decide deliberately, not as a patch.
+**How the stub finds its own payload, and why not the obvious way.** Do *not*
+put a marker at EOF. Installers are code-signed, and Authenticode appends the
+certificate table to the end of the file — an EOF trailer written before
+signing is no longer at EOF afterwards. Parse the stub's own PE headers
+instead: the payload begins at the end of the image (`SizeOfHeaders` plus the
+sum of every section's `SizeOfRawData`, rounded to `FileAlignment`). That is
+what NSIS and 7-Zip's SFX do, it is stable under signing because the cert table
+lands *after* the payload, and it needs nothing appended anywhere.
 
 ---
 
 ## 6. Integration shapes, ranked
 
-**(a) `prism-sfx`: a decode-only stub that makes a self-extracting exe.**
+**(a) `nova-sfx`: a decode-only stub that makes a self-extracting exe.**
 Smallest surface, no third party involved, and the natural first deliverable.
 Blocked on §3's measurement and §5's choice.
 
-**(b) `prism-dec`: a decode-only static lib / DLL with a flat C ABI.**
+**(b) `nova-dec`: a decode-only static lib / DLL with a flat C ABI.**
 This is what actually gets adoption: Inno Setup takes external compression
 DLLs, NSIS takes plugins, WiX/InstallShield take custom actions. A C ABI of
 about five functions — open, list, extract-to-callback, memory-limit, free —
@@ -170,27 +237,27 @@ inviting third parties.
 
 ---
 
-## 7. The name
+## 7. The name — DECIDED: **nova**
 
-"PRISM" is short, it matches the product, and it reads as a method rather
-than a codec — which is accurate, since the max tier *is* a tournament and a
-filter set rather than one algorithm. On that count it is a good name.
+The method installer authors ask for is called **nova**, not PRISM. Owner's
+call, and it also settles the two cautions PRISM carried: the word is widely
+known as the NSA surveillance programme disclosed in 2013 — an unforced
+headwind for something that ships inside other people's installers — and
+several products already use Prism/Prisma, so it would have needed a
+trademark search first.
 
-Two cautions, both worth checking before it appears in anyone's installer:
+`nova` keeps what made PRISM a good candidate. It is short, it reads as a
+method rather than a codec — accurate, since the max tier *is* a tournament
+and a filter set rather than one algorithm — and it costs nothing to explain,
+because it is already the binary name, the format magic and the product.
+"Nova Prism" stays the product; `nova` is the method inside it, the same way
+LZMA is the method inside 7-Zip.
 
-- **Collision.** PRISM is widely known as the NSA surveillance programme
-  disclosed in 2013. For a format that ships inside other people's installers
-  and touches user data, that association is an unforced headwind. It is not
-  disqualifying — plenty of software reuses the word — but it should be a
-  decision, not an accident.
-- **Trademark.** Several shipping products use Prism/Prisma. A search is
-  cheap and is the owner's call.
+Define it precisely wherever it appears in a spec, so it never gets read as
+"a new entropy coder": **nova = the max tier — a per-unit tournament over
+LZMA2, PPMd7 and BWT, with the recompression filter set.**
 
-If a change is wanted, the same logic ("names a method, not a codec") is
-served by anything short and neutral. If PRISM stays, define it precisely in
-the spec: **PRISM = nova's max tier — per-unit tournament over LZMA2, PPMd7
-and BWT, with the recompression filter set** — so it never gets read as "a
-new entropy coder".
+Naming that follows from it: `nova-sfx`, `nova-dec`, `NOVA_*` for the C ABI.
 
 ---
 
@@ -198,27 +265,35 @@ new entropy coder".
 
 | Stage | Deliverable | Gate to the next |
 |---|---|---|
-| 0 | Decode-only build behind a cargo feature; report stripped size | Size decides whether (a) is viable at all |
-| 1 | Decide §5: PE resource vs base-offset format change | Owner decision; format change needs a version bump |
-| 2 | `prism-sfx` stub + `nova sfx out.exe archive.nva` | A self-extracting exe that runs on a clean VM |
-| 3 | Installer profile: pinned low memory, documented ratio cost | Measured ratio at 64/128/256 MiB decode budgets |
-| 4 | `prism-dec` C ABI + one real integration (Inno Setup DLL) | An installer built by someone who is not us |
-| 5 | Spec completion for third-party decoders | Someone reimplements the decoder from the doc alone |
+| 0 | **DONE** — per-feature and per-profile stub sizes (`test/size-probe.sh`) | 251 KiB core / 982 KiB max: (a) is viable |
+| 1 | **DECIDED** — §5: base-offset open, payload appended, found via PE headers | No format change, so no version bump |
+| 2 | `--profile core\|media\|max` on the packer + manifest forced off zstd at core | A core archive that a pure-Rust decoder opens |
+| 3 | Decode-only cargo features across nova-core (strip the encoders) | The 982 KiB becomes a real binary, not a probe |
+| 4 | `nova-sfx` stub + `nova sfx out.exe archive.nva`, picking the smallest fitting profile | A self-extracting exe that runs on a clean VM |
+| 5 | Installer profile: pinned low memory, documented ratio cost | Measured ratio at 64/128/256 MiB decode budgets |
+| 6 | `nova-dec` C ABI + one real integration (Inno Setup DLL) | An installer built by someone who is not us |
+| 7 | Spec completion for third-party decoders | Someone reimplements the decoder from the doc alone |
 
-Stage 0 is a day. Stage 1 is a decision, not work. Nothing past stage 2 is
-worth starting until an installer author has said the −20% on media is worth
-the decoder to them.
+Stages 0 and 1 are done. Stage 2 is small and encoder-side. Stage 3 is the
+real work — feature-gating the encoders out of nova-core touches `analyze`,
+`pack`, `pipeline` and `filters` — and it is also the only way the numbers in
+§3 turn into something shippable. Nothing past stage 4 is worth starting until
+an installer author has said the −20% on media is worth the decoder to them.
 
 ---
 
 ## 9. What could kill this
 
-- **Decoder size** (§3). The single most likely reason this never ships.
+- ~~**Decoder size**~~ — RETIRED by §3. 251 KiB at core, under 1.13 MiB for
+  everything nova can do. This was the most likely killer and it is not one.
 - **Memory floor.** If the installer profile has to sit at 64 MiB, the ratio
-  advantage shrinks toward LZMA's and the pitch evaporates. Unmeasured.
-- **bsc's C++.** A pure-Rust decoder is a much easier sell to integrators
-  than one that needs a C++ toolchain; dropping bsc from an installer profile
-  costs ratio on text but might be the right trade. Measurable today.
+  advantage shrinks toward LZMA's and the pitch evaporates. Unmeasured, and
+  now the *first* unmeasured thing on the list.
+- **bsc's C++ and zstd's C.** A pure-Rust decoder is a much easier sell to
+  integrators than one that needs a C++ toolchain. The core profile is already
+  pure Rust once the manifest stops using zstd (§3), and it costs nothing on
+  the payload most installers carry; at max, bsc and zstd are 319 KiB of the
+  982 and both crates build their encoders too, so both rows are beatable.
 - **Format stability.** Ids 34/35/37 pin library versions by design; an
   installer built against one and unpacked by another must still work. The
   `legacy-*.nva` fixtures are the existing guard and would need extending.
