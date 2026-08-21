@@ -100,11 +100,11 @@
   so a level-1 zip reads as +0.02% on 64 KiB and −25.6% on 1 MiB. Free —
   `add_file` chains the head in front of the file. Sub-tests keep their caps
   (`TRIAL_SAMPLE` 64 KiB; the delta detector MUST stay capped).
-- Precompressed magic does NOT mean store — it is a claim about the FORMAT, not
-  the bytes; storing on it alone cost 1.12 MB on a 4.93 MiB corpus. A 1 MiB
-  zstd-1 trial must save >= 1%: compressible deflate lands at −3.9..−25.6%,
-  finished data at +0.00..0.01%. Memory invariant: ops bounded by a few
-  MAX_CHUNK buffers + the manifest — weak-PC extraction is a requirement.
+- Precompressed magic does NOT mean store — it claims a FORMAT, not bytes;
+  storing on it alone cost 1.12 MB on a 4.93 MiB corpus. A 1 MiB zstd-1 trial
+  must save >= 1%: compressible deflate lands at −3.9..−25.6%, finished data at
+  +0.00..0.01%. Memory invariant: ops bounded by a few MAX_CHUNK buffers plus
+  the manifest — weak-PC extraction is a hard requirement.
 - Archive paths: relative, UTF-8, '/'-separated; `paths::sanitize` on extract
   rejects traversal/absolute/drive/ADS/reserved-device/trailing-dot names.
   EVERY writer (.nva and foreign alike) walks inputs through the one
@@ -241,15 +241,18 @@
 
 ## Recompression — DEFLATE, JPEG and PDF ARE LANDED (research 02, measured here)
 
-- Corpora: `test/precomp-web` (public, below; supersedes `test/precomp`),
+- Corpora: `test/precomp-web` and `test/audio-pub`+`-pub-wav` (public, pinned),
   `test/incompress` (control, must stay stored), `test/photos`, `test/zipphoto`
-  (same photos, zipped Store), `test/pdfs`, `test/firefox`, `test/audio` +
-  `test/audio-wav`. Probes in `test/probe-preflate`, outside the workspace.
-  `/test/` is ignored EXCEPT the recipe — `precomp-web.json`, both fetch
-  scripts, the harnesses README quotes — because a reproducibility claim
-  nobody can open is not one. Only precomp-web is SHA-pinned; photos come
-  from Commons unpinned, audio is a private library, PDFs are printed here.
-  README states that per corpus; do not regress it into "all public".
+  (same photos, zipped Store), `test/pdfs`, `test/firefox`. The old private
+  `test/audio*` is superseded. Probes in `test/probe-preflate`.
+  `/test/` is ignored EXCEPT the recipe — the manifests, the fetch scripts and
+  the harnesses README quotes — because a reproducibility claim nobody can
+  open is not one. precomp-web and audio-web are SHA-pinned; photos come from
+  Commons unpinned, PDFs are still printed here. README states that per
+  corpus; do not regress it into "all public".
+  · COMMONS THROTTLES BULK FETCHES HARD — 429, six retries at up to 120 s were
+    not enough for seven files. `fetch-audio.py` sleeps and resumes; a BIGGER
+    audio corpus wants archive.org, a host built for bulk.
 - MIN_STREAM = 64 bytes, MEASURED; 4096 cost 15 points. "A record cannot pay
   for itself on 2 KB" is true per FILE, false inside a unit. `preflate-rs 0.7.6`
   (Microsoft, Apache-2.0) is byte-exact on every file of both corpora.
@@ -307,26 +310,26 @@
     matched neither `obj` nor `/Filter`, so both sweeps ran in full — 47 s for
     16 MiB vs 45 ms of real PDF. Probes: `probe-preflate --bin pdfscan|lepton`.
 - WAV → FLAC SHIPPED as filter id 38 (`crate::wav`, flacenc + claxon, pure Rust
-  Apache-2.0). 518 MB of PCM: 439,050,506 → **265,279,793**, against 7z -mx9's
-  342,942,386 and zpaqfranz -m5's 335,792,867. Decode 14 s for the corpus at
-  233 MiB peak — claxon is cheap, unlike lepton.
+  Apache-2.0). PUBLIC corpus (`test/audio-web.json`, 372,452,770 B of PCM from
+  Commons): max **202,220,333** / 25.0 s, normal **196,969,329** / 12.4 s, vs
+  zpaqfranz -m5 249,323,326 / 280 s and 7z -mx9 255,906,731 / 138 s — max is
+  −18.9% on the best of the rest, and NORMAL BEATS MAX by 2.6% because over a
+  FLAC stream the codec decides almost nothing and max only spends time. On
+  the FLAC control nobody compresses: all four within 0.5%.
   · ID 38 PINS THE DECODER, NOT THE ENCODER, unlike 34/35/37: the payload is a
     standard FLAC stream, so a better encoder never spends an id. What it DOES
     pin is the wrapper — the whole file with only the `data` payload cut out,
-    spliced back on decode. That, not FLAC, is what makes the round trip exact:
-    chunk order, odd sizes with pad bytes, a bad `RIFF` length and trailing
-    garbage all survive, none of it rebuilt from a parse.
-  · A .wav past the solo cap is CUT, not given up on: `Packer::add_wav_split`
-    emits unit-sized runs of whole frames, the header riding with the first
-    piece and the trailing chunks with the last. 276,221,291 → **265,279,793**
-    at max, 305,746,008 → **265,307,452** at normal — and normal now MATCHES
-    max, because over a FLAC stream the codec barely decides anything.
+    spliced back on decode. That, not FLAC, makes the round trip exact: chunk
+    order, odd sizes with pad bytes, a bad `RIFF` length and trailing garbage
+    all survive, none of it rebuilt from a parse.
+  · A .wav past the solo cap is CUT: `Packer::add_wav_split` emits unit-sized
+    runs of whole frames, header with the first piece, trailing chunks with
+    the last. Worth 276,221,291 → 265,279,793 at max when it landed.
   · Middle pieces are bare PCM with no `fmt `, so the format travels in
     `Job.wav`; the record always carried it, so decoding is unchanged. An
     `Extent`'s offset is inside the UNIT, not the file — the file offset gave
-    "extent outside its unit" on extract. A .wav that cannot be split falls
-    back to the GENERIC path, NOT the precompressed one, which would drop the
-    delta filter too.
+    "extent outside its unit". A .wav that cannot be split falls back to the
+    GENERIC path, NOT the precompressed one, which drops the delta filter.
 - Installed-program corpus (test/firefox, 341.7 MiB, 68.6% .dll): 7z -mx9
   87,566,439 B vs nova 95,721,462 → **+9.3%, our weakest case**. Findings:
   · The codec+filter vote must be cast per CHUNK (`Packer::current` + `place`):
@@ -394,14 +397,11 @@
   default by 0.01-0.16%. It does not generalise, and the target stream cannot
   get its own parameters without splitting the unit into two coder streams.
 - A stronger FLAC encoder — MEASURED −0.94% on 268 MB of real music (flacenc,
-  LPC order 24 against `flac -8`'s 12, direct MSE, exhaustive Rice, round-trip
-  verified). Real files already sit at the format's limit, and every archiver
-  stores FLAC (nova max −0.17%, 7z −0.25%, zpaqfranz −0.47%), so what is left
-  needs the RESIDUALS re-coded lepton-style, not a better encoder.
-- THE WHOLE AUDIO CEILING IS ~5%, measured: paq8px -8 takes one 14,394,284 B
-  .wav to 6,613,802 against our 6,952,563 through filter 38 — **−4.9% in
-  11m47s**, ~700x slower than the budget allows. Re-coding FLAC's Rice
-  residuals could capture only part of that. Audio is SOLVED.
+  LPC order 24 vs `flac -8`'s 12, exhaustive Rice, round-trip verified). Real
+  files already sit at the format's limit and every archiver stores FLAC, so
+  what is left needs the RESIDUALS re-coded lepton-style, not a better encoder.
+  THE CEILING IS ~5%: paq8px -8 takes one 14,394,284 B .wav to 6,613,802
+  against our 6,952,563 — **−4.9% in 11m47s**, ~700x past the budget. SOLVED.
 - Raising the packer's solo-unit cap on its own — it is the READER's bound in
   disguise. `read_packed` refuses a chunk above `MAX_STORED_CHUNK` (2x
   MAX_CHUNK = 64 MiB) and `unit * 2` merely equalled it. At `unit * 4` a real
