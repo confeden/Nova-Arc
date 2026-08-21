@@ -83,6 +83,51 @@ pub struct Archive {
     pub manifest: Manifest,
     last_manifest_packed: u64,
     writable: bool,
+    /// Set when opening had to fall back over a COMMITTED generation. `None` on
+    /// every healthy archive; see [`Damage`].
+    pub damage: Option<Damage>,
+}
+
+/// What [`Archive::open`] had to skip past to find a manifest it could read.
+///
+/// The distinction this records is the difference between dropping garbage and
+/// destroying an archive, so it is a value and not a log line.
+///
+/// A footer's self-hash covers its own absolute offset, so `find_footer_before`
+/// only ever returns a footer that was genuinely committed at that position.
+/// The commit order is manifest → fsync → footer → fsync, so a crash leaves the
+/// tail with NO valid footer in it — which is why dropping that tail is safe and
+/// why `crash_recovery_ignores_trailing_garbage` passes. A footer that verified
+/// its own hash but whose MANIFEST will not decode is therefore not a crash: it
+/// is damage to bytes that were already committed, and everything behind it
+/// belongs to a generation this build cannot read.
+///
+/// Getting that backwards cost the archive. Measured on 12,583,583 B: one
+/// flipped bit inside the newest manifest made `list` print "0 file(s)" and
+/// exit 0, `info` print "Reclaimable: 12.0 MiB (run 'nova compact')", and then
+/// `compact` reduce the file to 133 B and `add` to 429 B — both reporting
+/// success. The tool recommended the command that destroyed the data.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Damage {
+    /// Generation of the newest committed footer whose manifest would not read.
+    pub lost_generation: u64,
+    /// Generation actually opened, the newest one that still reads.
+    pub opened_generation: u64,
+    /// Committed bytes sitting past the opened footer. These are real data that
+    /// the opened manifest knows nothing about, so every size the opened
+    /// manifest reports — including "reclaimable" — is wrong about them.
+    pub stranded_bytes: u64,
+}
+
+impl std::fmt::Display for Damage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "generation {} is damaged: its manifest does not decode, so only generation {} \
+             could be opened and {} byte(s) of committed data are not accounted for by it",
+            self.lost_generation, self.opened_generation, self.stranded_bytes
+        )
+    }
 }
 
 /// Which part of an operation is running. A byte count alone cannot explain a
@@ -419,6 +464,7 @@ impl Archive {
             manifest: Manifest::default(),
             last_manifest_packed: 0,
             writable: true,
+            damage: None,
         };
         a.file.write_all(&footer::header_bytes())?;
         a.commit()?;
@@ -450,9 +496,14 @@ impl Archive {
         // it points at may be torn (crash between the two writes), and a
         // stored chunk may even contain a valid-looking footer image. So walk
         // candidates from EOF backwards until one yields a good manifest.
-        let mut limit = file.metadata()?.len();
+        let file_len = file.metadata()?.len();
+        let mut limit = file_len;
         let mut last_err = None;
         let mut found = None;
+        // The newest footer that verified its own hash and whose manifest then
+        // refused to decode. That footer is a COMMITTED record, so this is the
+        // one thing that separates damage from a crash.
+        let mut skipped_commit: Option<u64> = None;
         for _ in 0..MAX_FOOTER_CANDIDATES {
             let (ftr, off) = match footer::find_footer_before(&mut file, limit) {
                 Ok(v) => v,
@@ -468,6 +519,7 @@ impl Archive {
                 }
                 Err(e) => {
                     last_err = Some(e);
+                    skipped_commit.get_or_insert(ftr.generation);
                     if off <= HEADER_LEN {
                         break;
                     }
@@ -479,10 +531,33 @@ impl Archive {
             last_err.unwrap_or_else(|| anyhow::anyhow!("archive is corrupt: no usable footer"))
         })?;
 
-        // Drop uncommitted trailing garbage (e.g. after a crash mid-update)
-        // so new appends land right after the committed footer.
         let committed_end = ftr_off + FOOTER_LEN;
-        if writable && file.metadata()?.len() > committed_end {
+        let damage = skipped_commit.map(|lost| Damage {
+            lost_generation: lost,
+            opened_generation: manifest.generation,
+            stranded_bytes: file_len.saturating_sub(committed_end),
+        });
+
+        // A DAMAGED ARCHIVE IS NEVER OPENED FOR WRITING. Every write path ends
+        // in a commit whose footer describes only what the opened manifest
+        // knows, so `add` would strand the newer generation's bytes and
+        // `compact` would rewrite the file without them — and both would report
+        // success. Refusing here is the whole fix: extraction still works, so
+        // whatever the older generation can reach is still recoverable.
+        if writable {
+            if let Some(d) = damage {
+                bail!(
+                    "{}\n  Writing to it would destroy those bytes, so this is refused. \
+                     Recover what is readable with `nova extract`, then build a new archive.",
+                    d
+                );
+            }
+        }
+
+        // Drop uncommitted trailing garbage (e.g. after a crash mid-update) so
+        // new appends land right after the committed footer. Only reachable
+        // when `damage` is None, i.e. nothing committed lives in that tail.
+        if writable && file_len > committed_end {
             file.set_len(committed_end)?;
         }
         Ok(Archive {
@@ -491,6 +566,7 @@ impl Archive {
             manifest,
             last_manifest_packed: ftr.manifest_packed,
             writable,
+            damage,
         })
     }
 

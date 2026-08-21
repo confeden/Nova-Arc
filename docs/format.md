@@ -76,9 +76,22 @@ A unit is identified by the blake3 hash of its **original, unfiltered,
 uncompressed** content truncated to 128 bits, which serves both dedup and
 integrity checking.
 
-Codec ids: `0` = store (raw), `1` = zstd, `2` = LZMA2 (bare stream, dictionary
-= unit size, capped at 64 MiB), `3` = PPMd7 (order in the per-unit parameter,
-pool 8x the unit capped at 256 MiB), `4` = bsc (BWT + QLFC).
+Codec ids: `0` = store (raw), `1` = zstd, `2` = LZMA2, `3` = PPMd7, `4` = bsc
+(BWT + QLFC).
+
+**Two of those carry a size a decoder must reproduce exactly, and neither is
+stored.** Both are derived from the CODED length — `filtered` when it is
+non-zero, otherwise `unpacked` — so both sides always land on the same number:
+
+- LZMA2 dictionary = `clamp(coded_len, 4096, 64 MiB)`. A bare LZMA2 stream
+  carries the props byte but not the dictionary size, and a decoder window may
+  be wider than the encoder's but never narrower.
+- PPMd7 suballocator pool = `clamp(coded_len * 32, 1 MiB, 256 MiB)`, with the
+  model order in the per-unit `param` byte (`0` means the default, 10).
+
+Get either wrong and the stream decodes into garbage of exactly the right
+length: PPMd7's pool saturates at both ends, so a wrong formula still works on
+very small and very large units and fails only in a band between them.
 
 Filter ids:
 
@@ -118,15 +131,26 @@ boundary.
 
 ### Manifest
 
-MessagePack (with field names, for forward evolution), compressed with zstd.
+MessagePack (with field names, for forward evolution), then compressed. A
+manifest below 128 KiB is compressed with zstd; at or above it, LZMA2 is also
+tried and the smaller wins. There is no format field for which one was used —
+the codec is read off the bytes, because a zstd frame starts `28 B5 2F FD` and
+a raw LZMA2 stream cannot, so every manifest ever written still decodes.
 
 ```
 Manifest  { generation: u64, files: [FileEntry], chunks: [ChunkRec], geometry: Geometry? }
 Geometry  { chunk_min: u32, chunk_avg: u32, chunk_max: u32, unit: u64, chunked_from: u64 }
 FileEntry { path: str, size: u64, mtime: i64, extents: [Extent] }
 Extent    { unit: u32, off: u64, len: u64 }
-ChunkRec  { offset: u64, packed: u64, unpacked: u64, codec: u8, param: u8, filter: u8, hash: bin16 }
+ChunkRec  { offset: u64, packed: u64, unpacked: u64, filtered: u64,
+            codec: u8, param: u8, filter: u8, hash: bin16 }
 ```
+
+`filtered` is what a length-changing filter (ids 34-39) produced and therefore
+the length the CODEC was given; `0` means "same as `unpacked`". A decoder must
+read it, because `unpacked` keeps one meaning forever — the ORIGINAL length,
+the one `hash` covers and `Extent` indexes into — and the LZMA2 window and
+PPMd7 pool are derived from the CODED length on both sides.
 
 `chunks` is the unit table. A file's `extents` name byte ranges of units, in
 file order: one extent for a small file inside a shared unit, a run of them

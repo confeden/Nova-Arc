@@ -223,6 +223,24 @@ fn print_foreign_list(entries: impl IntoIterator<Item = (String, u64)>) {
 
 /// Peak working set, so users (and benchmarks) can see that packing really
 /// stays inside its memory budget.
+/// Say it, loudly, before printing anything that looks like an inventory.
+///
+/// A damaged archive opens read-only and reports the last generation whose
+/// manifest still decodes. That number can be zero files, and a bare "0
+/// file(s)" reads as "this archive is empty" rather than "this archive lost
+/// its index" -- which is how a flipped bit ended with the user being advised
+/// to run `compact` on twelve megabytes of intact data.
+fn warn_if_damaged(a: &Archive) {
+    if let Some(d) = a.damage {
+        eprintln!("warning: {d}");
+        eprintln!(
+            "warning: what follows is generation {}, NOT the archive's latest state. \
+             Writing is refused; extract what you can and rebuild.",
+            d.opened_generation
+        );
+    }
+}
+
 fn report_peak() {
     if let Some(p) = nova_platform::peak_memory() {
         println!("Peak RAM: {}", human(p));
@@ -374,6 +392,7 @@ fn main() -> Result<()> {
                 print_foreign_list(rar_list(&archive)?);
             } else {
                 let a = Archive::open_ro(&archive)?;
+                warn_if_damaged(&a);
                 let mut total = 0u64;
                 let mut stored = 0u64;
                 println!("{:>12}  {:>12}  Path", "Size", "Stored");
@@ -417,16 +436,28 @@ fn main() -> Result<()> {
         }
         Cmd::Info { archive, units } => {
             let a = Archive::open_ro(&archive)?;
+            warn_if_damaged(&a);
             let i = a.info();
             println!("Generation:   {}", i.generation);
             println!("Files:        {}", i.files);
             println!("Chunks:       {}", i.chunks);
             println!("Archive size: {}", human(i.file_len));
             println!("Live data:    {}", human(i.live_bytes));
-            println!(
-                "Reclaimable:  {} (run 'nova compact')",
-                human(i.reclaimable)
-            );
+            // "Reclaimable" means "space compact can safely return". On a
+            // damaged archive the unreadable generation's bytes land in that
+            // number too, and compact is exactly the command that would delete
+            // them -- so the advice is withheld rather than printed.
+            if a.damage.is_some() {
+                println!(
+                    "Unaccounted:  {} - NOT reclaimable, see the warning above",
+                    human(i.reclaimable)
+                );
+            } else {
+                println!(
+                    "Reclaimable:  {} (run 'nova compact')",
+                    human(i.reclaimable)
+                );
+            }
             if i.units > 0 {
                 println!(
                     "Units:        {} (min {}, median {}, max {})",

@@ -177,6 +177,22 @@ fn parse(b: &[u8]) -> Option<Header> {
     })
 }
 
+/// Read frame `i` out of a run's column-major header plane: byte `col` of frame
+/// `i` sits at `hp + col * n + i`.
+///
+/// A free function because `decode` reads the plane TWICE — once to total the
+/// other planes and once to rebuild — rather than keeping 24-byte `Header`s for
+/// a plane that costs 4 bytes a frame.
+fn header_at(data: &[u8], hp: usize, n: usize, i: usize) -> Result<Header> {
+    let b = [
+        data[hp + i],
+        data[hp + n + i],
+        data[hp + 2 * n + i],
+        data[hp + 3 * n + i],
+    ];
+    parse(&b).ok_or_else(|| anyhow::anyhow!("mp3: corrupt frame header"))
+}
+
 /// One frame, located in the source buffer.
 #[derive(Clone, Copy, Debug)]
 struct Frame {
@@ -214,7 +230,15 @@ fn chains(data: &[u8], at: usize, first: &Header) -> bool {
             // A run may change bitrate freely (that is what VBR is), but a
             // change of version or sample rate inside one file is a re-sync,
             // not a frame — and it would change `side_len` under the plane.
-            Some(h) if h.mpeg == first.mpeg && h.rate_idx == first.rate_idx => {
+            // side_len TOO, not just version and rate: the run loop below ends
+            // a run when it changes, so a chain check that ignored it declared
+            // a run the loop then cut after one frame — five bytes of segment
+            // table per frame on a stream that alternates channel mode.
+            Some(h)
+                if h.mpeg == first.mpeg
+                    && h.rate_idx == first.rate_idx
+                    && h.side_len == first.side_len =>
+            {
                 if p + h.len > data.len() {
                     return false;
                 }
@@ -328,8 +352,10 @@ fn first_id3_frame_looks_real(b: &[u8], tag_size: usize) -> bool {
 }
 
 /// Is this plausibly an MPEG Layer III file? Answered from the head alone,
-/// because the packer needs it before the file is cut into chunks — a
-/// recompressible file gets a unit of its own.
+/// because `analyze::plan` runs on the head and the answer picks the filter for
+/// every chunk of the file. (Unlike the zip, JPEG and WAV filters this one does
+/// NOT ask for a unit of its own — every frame carries its own length, so any
+/// slice splits on its own.)
 ///
 /// Deliberately cheap and deliberately optimistic in one direction only: a
 /// "yes" that turns out wrong costs one refused transform, while a "no" throws
@@ -356,14 +382,19 @@ pub fn is_mp3(b: &[u8]) -> bool {
             | ((b[8] as usize) << 7)
             | (b[9] as usize);
         start = 10 + size;
+        // A valid ten-byte header WHOSE FIRST FRAME ALSO READS LIKE ONE is
+        // evidence on its own, and it is taken unconditionally. Making it
+        // conditional on the tag running past the head — which is what this did
+        // — produced an inversion: a head ending INSIDE a big tag said yes,
+        // while a slightly longer head, ending just after it with too few
+        // frames left to chain, said no. More data must never flip the answer
+        // from yes to no. An extended header (flag 0x40) sits where that first
+        // frame would be, so it is accepted unchecked.
+        if b[5] & 0x40 != 0 || first_id3_frame_looks_real(b, size) {
+            return true;
+        }
         if start >= b.len() {
-            // The tag runs past the head sample — embedded cover art does this
-            // routinely, so a plain "no" here would lose the transform on the
-            // files most likely to have one. Believe the tag, but only after
-            // reading its FIRST FRAME, which is where a tag stops being just
-            // ten plausible bytes. An extended header (flag 0x40) sits where
-            // that frame would be, so it is accepted unchecked.
-            return b[5] & 0x40 != 0 || first_id3_frame_looks_real(b, size);
+            return false;
         }
     }
     // Otherwise look for a real chain within reach of the head.
@@ -401,8 +432,6 @@ pub fn encode(data: &[u8]) -> Result<Vec<u8>> {
             Seg::Run(f) => f.len(),
             Seg::Raw { .. } => 0,
         })
-        .collect::<Vec<_>>()
-        .iter()
         .sum();
     if frames < MIN_FRAMES {
         bail!("mp3: only {frames} frames found, not worth a transform");
@@ -553,41 +582,45 @@ pub fn decode(data: &[u8]) -> Result<Vec<u8>> {
         "mp3: header plane overruns the payload"
     );
 
-    // Read every header first: they carry all the remaining lengths.
-    let mut headers: Vec<Vec<Header>> = Vec::new();
+    // Read every header first: they carry all the remaining lengths. But do NOT
+    // KEEP what they say. A `Header` is 24 bytes and the plane is 4 bytes per
+    // frame, so retaining them inflated a hostile payload SIX-FOLD before the
+    // "planes overrun" check below could fire — measured 1,610,612,872 B for a
+    // chunk at the 256 MiB coded cap, per decode lane, and Rust aborts on
+    // allocation failure instead of unwinding. The plane is still sitting in
+    // `data`, so the rebuild pass simply reads it again; the only thing that
+    // has to survive is one `side_len` per RUN, and the run count is already
+    // bounded by the segment table.
+    let mut side_lens: Vec<usize> = Vec::new();
     let mut hp = hdr_base;
     let mut crc_total = 0usize;
     let mut side_total = 0usize;
     let mut main_total = 0usize;
+    let oflow = || anyhow::anyhow!("mp3: plane lengths overflow");
     for (kind, n) in &table {
         if *kind != KIND_RUN {
             continue;
         }
         let n = *n;
-        let mut run = Vec::with_capacity(n);
-        let mut side_len = None;
+        let mut side_len = 0usize;
         for i in 0..n {
-            // Column-major: byte `col` of frame `i` sits at `hp + col * n + i`.
-            let b = [
-                data[hp + i],
-                data[hp + n + i],
-                data[hp + 2 * n + i],
-                data[hp + 3 * n + i],
-            ];
-            let h = parse(&b).ok_or_else(|| anyhow::anyhow!("mp3: corrupt frame header"))?;
-            match side_len {
-                None => side_len = Some(h.side_len),
-                Some(s) => ensure!(s == h.side_len, "mp3: side length changed inside a run"),
+            let h = header_at(data, hp, n, i)?;
+            if i == 0 {
+                side_len = h.side_len;
+            } else {
+                ensure!(
+                    side_len == h.side_len,
+                    "mp3: side length changed inside a run"
+                );
             }
-            crc_total += h.crc_len();
-            main_total = main_total
-                .checked_add(h.main_len())
-                .ok_or_else(|| anyhow::anyhow!("mp3: frame lengths overflow"))?;
-            run.push(h);
+            crc_total = crc_total.checked_add(h.crc_len()).ok_or_else(oflow)?;
+            main_total = main_total.checked_add(h.main_len()).ok_or_else(oflow)?;
         }
-        side_total += n * side_len.unwrap_or(0);
+        side_total = side_total
+            .checked_add(n.checked_mul(side_len).ok_or_else(oflow)?)
+            .ok_or_else(oflow)?;
         hp += 4 * n;
-        headers.push(run);
+        side_lens.push(side_len);
     }
 
     let crc_base = hdr_base + hdr_len;
@@ -614,10 +647,13 @@ pub fn decode(data: &[u8]) -> Result<Vec<u8>> {
             continue;
         }
         let n = *n;
-        let run = &headers[run_i];
+        let side_len = side_lens[run_i];
         run_i += 1;
-        let side_len = run.first().map_or(0, |h| h.side_len);
-        for (i, h) in run.iter().enumerate() {
+        for i in 0..n {
+            // Re-parsed, not remembered: see the note on the first pass. The
+            // bytes are the same ones it validated, so this cannot disagree
+            // with the totals the plane bases were computed from.
+            let h = header_at(data, hp, n, i)?;
             for col in 0..4 {
                 out.push(data[hp + col * n + i]);
             }
@@ -1021,4 +1057,50 @@ fn corpus() {
         t_split as f64 * 100.0 / t_raw as f64,
         (t_plain as f64 - t_split as f64) * 100.0 / t_plain as f64,
     );
+}
+
+#[cfg(test)]
+mod detection_tests {
+    use super::*;
+
+    /// More data must never flip the answer from yes to no.
+    ///
+    /// Found by review. The ID3 first-frame evidence used to be consulted only
+    /// when the tag ran past the buffer, so a head that ended INSIDE a big tag
+    /// said yes while a slightly longer head — ending just after the tag, with
+    /// too few frames left to chain — said no. The head sample is a fixed
+    /// 1 MiB, so which side of that line a real file lands on is an accident of
+    /// its cover-art size.
+    #[test]
+    fn a_longer_head_never_turns_a_yes_into_a_no() {
+        // ID3v2.4, one real TIT2 frame, then a 4 KiB tag body, then audio.
+        let mut file = b"ID3\x04\x00\x00\x00\x00\x20\x00".to_vec();
+        file.extend_from_slice(b"TIT2\x00\x00\x00\x08\x00\x00");
+        file.resize(10 + 4096, 0);
+        let audio_at = file.len();
+        for i in 0..64u8 {
+            let mut f = vec![0xFF, 0xFB, 0x90, 0x40];
+            f.extend(std::iter::repeat_n(i, 413));
+            file.extend_from_slice(&f);
+        }
+        assert!(is_mp3(&file), "the whole file must be recognised");
+
+        // Every prefix from "inside the tag" through "one frame in" to "the
+        // whole thing" has to keep saying yes.
+        for cut in [
+            64,
+            1000,
+            audio_at - 1,
+            audio_at,
+            audio_at + 1,
+            audio_at + 417,
+            audio_at + 834,
+            file.len(),
+        ] {
+            assert!(
+                is_mp3(&file[..cut]),
+                "a {cut}-byte head said no while shorter heads said yes"
+            );
+        }
+    }
 }

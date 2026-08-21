@@ -1642,3 +1642,66 @@ fn mp3_audio_is_plane_split_and_still_extracts() {
     a.extract(&out, None, Overwrite::Fail).unwrap();
     assert_same_tree(&src, &out.join("music"));
 }
+
+/// A damaged manifest must not let the tool destroy the archive.
+///
+/// This is the worst failure an archiver can have and it was live: one flipped
+/// bit inside the newest manifest made `Archive::open` fall back to generation
+/// 1 — which `create` writes EMPTY — and the read-write path then truncated the
+/// file to that footer. Measured on 12,583,583 B of real data: `list` printed
+/// "0 file(s)" and exited 0, `info` printed "Reclaimable: 12.0 MiB (run 'nova
+/// compact')", and `compact` then produced a 133-byte file while reporting
+/// success. The tool recommended the command that destroyed the data.
+///
+/// The discriminator is that a footer's self-hash covers its own offset, so a
+/// footer that verified and whose manifest then failed is a COMMITTED record —
+/// unlike a crash, which leaves no valid footer in the tail at all, because the
+/// commit order is manifest → fsync → footer → fsync. `crash_recovery_ignores_
+/// trailing_garbage` is the other side of this test and both must pass.
+#[test]
+fn a_damaged_manifest_does_not_let_a_write_destroy_the_archive() {
+    let fx = fixture();
+    let mut a = Archive::create(&fx.arc).unwrap();
+    a.add_paths(std::slice::from_ref(&fx.src), &PackOptions::new(Tier::Fast))
+        .unwrap();
+    drop(a);
+    let intact = fs::read(&fx.arc).unwrap();
+    assert!(intact.len() > 10_000, "need a body worth losing");
+
+    // Flip one bit in the middle of the newest manifest, leaving its footer
+    // valid — bit rot, not a crash.
+    // `footer_fields` gives the manifest offset and the footer offset, so the
+    // manifest is everything between them.
+    let (moff, foff) = footer_fields(&fx.arc);
+    let mut bytes = intact.clone();
+    bytes[(moff + (foff - moff) / 2) as usize] ^= 0x01;
+    fs::write(&fx.arc, &bytes).unwrap();
+
+    // Read-only still opens, still reports the fallback generation, and now
+    // says so instead of pretending the archive is empty.
+    let ro = Archive::open_ro(&fx.arc).unwrap();
+    let d = ro.damage.expect("damage must be reported, not swallowed");
+    assert_eq!(d.opened_generation, 1);
+    assert!(d.lost_generation > d.opened_generation, "{d:?}");
+    assert!(
+        d.stranded_bytes > 10_000,
+        "the stranded bytes are the whole point: {d:?}"
+    );
+    drop(ro);
+
+    // Every write path must refuse, and the file must be untouched afterwards.
+    let err = match Archive::open_rw(&fx.arc) {
+        Ok(_) => panic!("open_rw accepted a damaged archive"),
+        Err(e) => e.to_string(),
+    };
+    assert!(err.contains("damaged"), "{err}");
+    assert_eq!(
+        fs::read(&fx.arc).unwrap().len(),
+        bytes.len(),
+        "open_rw truncated a damaged archive"
+    );
+
+    // And the bytes are all still there, so a recovery tool has something to
+    // work with even though nova itself will not write to it.
+    assert_eq!(fs::read(&fx.arc).unwrap(), bytes);
+}
