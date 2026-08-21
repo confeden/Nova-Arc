@@ -19,17 +19,40 @@ than out-tuning LZMA. Pre-1.0; format may still change.
 | S10 | Empty dirs, symlinks, NTFS attrs/ADS, ACLs, sub-second mtime | broken | not preserved, nothing warns |
 
 ## Map
+Paths are repo-relative. `file:line` where the file is over ~800 lines.
+
 | ID | To touch... | Go to |
 |---|---|---|
-| M1 | open/commit/footer/damage, extract, compact | `crates/nova-core/src/archive.rs` |
-| M2 | codec choice, tiers, tournament, geometry | `analyze.rs`, `codec.rs` |
-| M3 | recompression filters and the `NDf*` framing | `filters.rs`, `deflate.rs` |
-| M4 | MP3 planes · WAV/FLAC | `mp3.rs` · `wav.rs` |
-| M5 | unit formation, solo units, the per-chunk vote | `pack.rs` |
-| M6 | worker pool, backpressure, store fallback, round-trip check | `pipeline.rs` |
-| M7 | OS priority, memory budget | `crates/nova-platform/src/lib.rs` |
-| M8 | on-disk spec for a third party | `docs/format.md` |
-| M9 | benches and corpus recipes | `test/*.sh`, `test/fetch-*.py` |
+| M1 | open, backward footer scan, `Damage` (I3, G1) | `crates/nova-core/src/archive.rs:482` |
+| M2 | commit barrier, manifest tail write (I1) | `crates/nova-core/src/archive.rs:575` · `:1547` |
+| M3 | extract, decode lanes, `UnitCache` grouping | `crates/nova-core/src/archive.rs:743` · `:1262` · `:1354` |
+| M4 | `compact` (verify → replace, consumes `self`) | `crates/nova-core/src/archive.rs:1171` |
+| M5 | progress contract: `Phase`, `Progress`, `Reporter` | `crates/nova-core/src/archive.rs:138-390` |
+| M6 | chunk read + `verify_chunk`, `MAX_STORED_CHUNK` bound (N4) | `crates/nova-core/src/archive.rs:1492-1546` |
+| M7 | filter id table, `apply`/`unapply`, `Applied` (I5) | `crates/nova-core/src/filters.rs:108-300` |
+| M8 | filter 40 chunked container, preflate pass budget (G6, G7) | `crates/nova-core/src/filters.rs:350-570` |
+| M9 | BCJ x86 + delta (I9) | `crates/nova-core/src/filters.rs:614-749` |
+| M10 | x86 split, filter id 36 | `crates/nova-core/src/filters.rs:788-926` |
+| M11 | deflate stream scanner: zip / gzip / png / pdf (G4, G5) | `crates/nova-core/src/deflate.rs:70-460` |
+| M12 | `NDf*` container framing and varints | `crates/nova-core/src/deflate.rs:559-606` |
+| M13 | MP3 planes: segment, encode, decode (P4) | `crates/nova-core/src/mp3.rs:256` · `:427` · `:519` |
+| M14 | WAV/FLAC split and rebuild | `crates/nova-core/src/wav.rs` |
+| M15 | tier geometry: `unit`, `chunked_from`, `cdc`, `worker_memory` | `crates/nova-core/src/analyze.rs:20-164` |
+| M16 | `plan()`, `classify`, `pays_off`, trial sampling | `crates/nova-core/src/analyze.rs:211-590` |
+| M17 | codec ids, LZMA2 dict, PPMd7 order/pool (I6) | `crates/nova-core/src/codec.rs` |
+| M18 | unit formation, solo units, byte-majority `unit_plan` (I10) | `crates/nova-core/src/pack.rs:462` · `:600` |
+| M19 | worker pool, `Budget` backpressure, `PackOptions::resolve` | `crates/nova-core/src/pipeline.rs:74` · `:196` · `:331` |
+| M20 | manifest encode/decode, `Geometry`, `ChunkRec` | `crates/nova-core/src/manifest.rs` |
+| M21 | header/footer magic, self-hash, version tuple | `crates/nova-core/src/footer.rs` |
+| M22 | `sanitize` + `walk_inputs` — the single input gate (G12) | `crates/nova-core/src/paths.rs` |
+| M23 | OS priority, memory budget, byte-range lock (G3), replace | `crates/nova-platform/src/lib.rs` |
+| M24 | foreign zip / 7z / rar read, zip write | `crates/nova-core/src/foreign_{zip,7z,rar}.rs` |
+| M25 | CLI verbs and flags | `crates/nova-cli/src/main.rs` |
+| M26 | GUI commands · frontend · bundle config (G10, G11) | `crates/nova-gui/src/main.rs` · `ui/src/main.ts` · `crates/nova-gui/tauri.conf.json` |
+| M27 | integration tests, compat fixtures | `crates/nova-core/tests/basic.rs` |
+| M28 | on-disk spec for a third party | `docs/format.md` |
+| M29 | benches and corpus recipes | `test/bench-std.sh`, `test/scaling.sh`, `test/mp3-bench.sh`, `test/fetch-*.py` |
+| M30 | what already SHIPPED, per release — the record of done work | `CHANGELOG.md` (RU, D7/D8) |
 
 ## Invariants
 | ID | Rule | Why |
@@ -61,7 +84,8 @@ than out-tuning LZMA. Pre-1.0; format may still change.
 - **G12** A zip entry path uses `\` (PowerShell `Compress-Archive`) → normalise BEFORE `paths::sanitize`, never inside it.
 - **G13** argv[1] truncated → an unquoted path with spaces; `.cmd` launchers mangle Cyrillic → use a BOM'd `.ps1`.
 - **G14** A bench records zpaqfranz's decode time as a refusal → `zpaqfranz x … -to DIR` needs a TRAILING SLASH.
-- Full reproductions and the numbers: `kb/format.md`, `kb/recompression.md`, `kb/platform.md`.
+- **G15** `create x.zip` lands 0.9% above `7z -tzip -mx9` → miniz_oxide's deflate encoder, on a writer that is deflate-only for interop → NOT a bug, do not re-measure; `kb/platform.md#g15`.
+- Full reproductions and the numbers: `kb/format.md`, `kb/recompression.md`, `kb/platform.md`; G9 is in `kb/negative.md`.
 
 ## Negative knowledge
 - **N1** Ordering files by content similarity, not name → −0.07% on 33 DLLs; extensions already cluster them.
@@ -83,32 +107,44 @@ than out-tuning LZMA. Pre-1.0; format may still change.
 - **N17** Capping zstd WindowLog; parallel EXTRACTION with zstd → no effect; NTFS metadata contention makes 8 threads 2.5x SLOWER than 1.
 - **N18** GPU for hashing or high-ratio compression → PCIe erases gains; LZMA-class GPU codecs do not exist and nvCOMP would make `.nva` NVIDIA-only.
 - **N19** Bigger units for solidity on executables, BCJ2-style per-site probability → priced and rejected.
-- Full reasoning and every measurement: `kb/negative.md`.
+- **N20** packMP3 for the MP3 filter (research 02 §MP3, ~16%) → rejected on LICENCE, not on ratio: LGPL-3.0 pre-empts the licence choice D11 leaves open. Filter 39 is our own pure-Rust plane split for exactly that reason.
+- **N21** A CM codec (research 14 §10's lpaq/TPAQ) for what BCJ2 leaves on executables → ~2x slower and 1-3 GiB per worker; speed AND memory budgets disqualify the WHOLE CM class, not just D4's cmix/paq8px/nncp end-points.
+- **N22** Re-opening research 04 §5, or research 14's "51% of paq8px" executable headroom → CORRECTED and CLOSED: BCJ2 (id 36) IS 04 §5's full recommendation and already collects that headroom at the filter level; what is left is N21's.
+- **N23** bsc-m03 as a fifth entrant → −5.8% on enwik8 but DECODE 34.7 s against our 4.6 s, and it is GPL-3.0. Decode speed is defended; no.
+- **N24** PPMd7 at order 32/64 as a fifth entrant → wins big per FILE (xml −7.3%, nci −20.1%) and ZERO units in the real packer: inside a 32 MiB unit it competes with bsc and LZMA2, not with itself. Silesia and the source tree came out byte-identical. Do not re-run.
+- Full reasoning and every measurement: `kb/negative.md` — except N19's numbers, which sit with the BCJ2 work in `kb/recompression.md`.
 
 ## Decisions
 - **D1** Rust preferred, not required — a codec may be C/C++ behind FFI; do NOT reject an algorithm for want of a Rust crate.
 - **D2** Zero telemetry, ads or analytics, ever.
 - **D3** `.gitignore` is NOT tracked; rules live in `.git/info/exclude`.
-- **D4** Speed budget: not much slower than `7z -mx9`. Disqualifies cmix/paq8px/nncp BY CONSTRUCTION; they stay a ceiling reference.
+- **D4** Speed budget: not much slower than `7z -mx9`. Disqualifies cmix/paq8px/nncp BY CONSTRUCTION; they stay a ceiling reference. Together with the memory budget it also closes the whole mid-weight CM class — N21, not just those three names.
 - **D5** Benchmark set is plural (7z, xz, brotli, kanzi, zpaqfranz) on STANDARD corpora; prefer data anyone can fetch by link. A private corpus must be labelled one.
 - **D6** Scaling matters at both ends: work on ONE core, use 8+, and threads must not cost ratio (I8).
 - **D7** Chat with the owner in Russian; code, `docs/` and CLI output in English. README.md and CHANGELOG.md are RUSSIAN; the GUI ships RU.
 - **D8** CHANGELOG: `## [X.Y.Z]` newest first, flat bullets, NO DATES.
 - **D9** The differentiator, in order: recompress what is already compressed → per-file method choice → editing without repack.
 - **D10** Installers call the max tier **`nova`**; PRISM dropped (NSA-programme collision, live Prism/Prisma marks).
-- **D11** No LICENSE yet — the owner will choose one before the first release.
+- **D11** No LICENSE yet — the owner will choose one before the first release. It already costs real ratio: every LGPL recompressor is off the table while it is open (N20).
 - Full reasoning: `kb/decisions.md`.
 
 ## Now
+Weak spots are mapped per file (`test/weakspots.sh`, `kb/compression.md`): against
+the LZ family we are −11.8% on Silesia per file, and the whole gap is to the
+CM/BWT family. Four of the five worst files are units the tournament gave to
+LZMA2, and two of them — samba and mozilla — are TARBALLS, which is P11.
+
 Filter 40 (chunked container) just landed: an oversized deflate stream is modelled
 in as many preflate passes as the budget allows instead of being skipped whole.
-Public deflate corpus 74,865,900 → **60,703,266 B (−30.0% on the best of the rest)**.
+Public deflate corpus 74,865,900 → **60,703,266 B (−18.9% on our own previous
+output; −30.0% against the best of the rest, zpaqfranz -m5 at 86,761,587)**.
 Remaining on it: the last third needs passes to span units, which trades away unit
 independence — price it before building (P1).
 
 ## Next
 | ID | Task | Why / blocked on |
 |---|---|---|
+| P11 | **Split tar members before unit formation** | MEASURED −8.6% on Silesia's mozilla, −1.1% on samba, −2.75% on Silesia overall; gap to zpaqfranz +7.95% → +4.98%. A tarball switches off BOTH differentiators — per-file method AND nested recompression — and the win comes from the second: eleven jar/deflate units became visible. Compounds with filter 40, which now recovers a 305 MiB tar and hands it over whole. `kb/compression.md#p11` |
 | P1 | Decide whether deflate passes may span units | worth ~7.3 MB more on binutils; costs unit independence, which random access and decode lanes rest on |
 | P2 | `nova test` + extract that skips a bad chunk instead of dying | S9; every competitor has it and `compact` already has the machinery |
 | P3 | Charge a rebuilding filter's working set to `--memory` | G8; `--memory 512M` currently packs at 1.1 GiB |
@@ -126,8 +162,8 @@ independence — price it before building (P1).
 | `kb/overview.md` | what exists in detail: crates, container features, CLI verbs, GUI, test coverage, open issues | "what does this actually do already" — before proposing anything |
 | `kb/format.md` | archive layout, commit barrier, damage detection, chunk records, progress contract, memory model | touching `archive.rs`, the footer, or anything about opening a broken archive |
 | `kb/compression.md` | tiers, the 4-codec tournament, geometry, record-width filter, bsc wiring, resource policy | changing codec choice, unit size or the OS priority policy |
-| `kb/recompression.md` | filters 34-40 in full, every trap, the corpora and their numbers | touching any recompression filter or adding a new format |
+| `kb/recompression.md` | filters 34-40 in full, every trap, the corpora and their numbers, the BCJ2 measurements behind N19/N22 | touching any recompression filter or adding a new format |
 | `kb/platform.md` | Windows locking, GUI build, NSIS installer, bench harness quirks | building the GUI or the installer, or a bench behaving oddly |
-| `kb/negative.md` | every disproven approach with its measurement | about to propose something that sounds clever |
+| `kb/negative.md` | every disproven approach with its measurement, plus G9 | about to propose something that sounds clever |
 | `kb/decisions.md` | owner decisions with full reasoning | a decision seems arbitrary or worth revisiting |
 | `kb/_legacy-roadmap.md` | verbatim pre-restructure file — historical, may be stale | a fact seems missing above; grep only, never read whole |
