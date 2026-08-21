@@ -210,7 +210,7 @@ fn png(f: &[u8]) -> (Vec<Stream>, usize) {
 }
 
 /// Drop `front` bytes from the start of a piece list and `back` from its end.
-fn trim(pieces: &mut Vec<(usize, usize)>, front: usize, back: usize) {
+pub fn trim(pieces: &mut Vec<(usize, usize)>, front: usize, back: usize) {
     let mut left = front;
     while left > 0 && !pieces.is_empty() {
         let take = left.min(pieces[0].1);
@@ -551,6 +551,22 @@ fn trim_eol(f: &[u8], start: usize, mut end: usize) -> usize {
 /// encoder moved on, and it moved on under a NEW filter id.
 const MAGIC: &[u8; 4] = b"NDf1";
 const MAGIC_V2: &[u8; 4] = b"NDf2";
+const MAGIC_V3: &[u8; 4] = b"NDf3";
+
+/// Which framing to write. Reading accepts all three forever — an id is a
+/// promise — but only the newest is ever produced.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ver {
+    /// `NDf1`, filter id 34: deflate only, one blob per stream.
+    V1,
+    /// `NDf2`, filter id 37: adds a kind byte so JPEG streams can travel too.
+    V2,
+    /// `NDf3`, filter id 40: adds a CHUNK LIST per stream, so one deflate
+    /// stream may be modelled in several preflate passes instead of one. That
+    /// is what lets a stream larger than the coded cap be transformed at all —
+    /// as far as the budget reaches — rather than skipped whole.
+    V3,
+}
 
 fn put(out: &mut Vec<u8>, mut v: u64) {
     loop {
@@ -579,14 +595,28 @@ fn get(inp: &mut &[u8]) -> Result<u64> {
     bail!("malformed varint in recompression header")
 }
 
-/// What one transformed stream needs in order to be rebuilt. For deflate that
-/// is preflate's plaintext and correction record; for JPEG it is the lepton
-/// blob in `plain`, with `corrections` empty.
+/// What one transformed stream needs in order to be rebuilt.
+///
+/// `chunks` is one entry per preflate pass: its plaintext and its correction
+/// record. Most streams have exactly one. A stream too large to model in a
+/// single pass has several, and they must be replayed IN ORDER, because each
+/// pass continues the previous one's predictor — that is the whole reason the
+/// list exists rather than a single blob. A JPEG is always exactly one entry,
+/// the lepton blob, with empty corrections.
 pub struct Piece {
     pub pieces: Vec<(usize, usize)>,
     pub kind: Kind,
-    pub plain: Vec<u8>,
-    pub corrections: Vec<u8>,
+    pub chunks: Vec<(Vec<u8>, Vec<u8>)>,
+}
+
+impl Piece {
+    fn plain_len(&self) -> usize {
+        self.chunks.iter().map(|(p, _)| p.len()).sum()
+    }
+
+    fn corr_len(&self) -> usize {
+        self.chunks.iter().map(|(_, c)| c.len()).sum()
+    }
 }
 
 /// Lay out the transformed form: header, then the container's own bytes, then
@@ -595,7 +625,7 @@ pub struct Piece {
 /// The grouping is deliberate. Plaintexts are the same kind of data as each
 /// other and compress together; correction records are near-random and would
 /// otherwise sit between them, cutting every match.
-pub fn encode(original: &[u8], parts: &[Piece], v2: bool) -> Result<Vec<u8>> {
+pub fn encode(original: &[u8], parts: &[Piece], ver: Ver) -> Result<Vec<u8>> {
     // Validated rather than assumed. The pieces come from this module's own
     // scanner, but a scanner bug must surface as a refusal and a fallback to
     // storing the data, never as an out-of-range slice inside a library that
@@ -609,15 +639,27 @@ pub fn encode(original: &[u8], parts: &[Piece], v2: bool) -> Result<Vec<u8>> {
             seen = off + len;
         }
     }
-    if !v2 && parts.iter().any(|p| p.kind != Kind::Deflate) {
+    if ver == Ver::V1 && parts.iter().any(|p| p.kind != Kind::Deflate) {
         bail!("the v1 framing cannot carry a non-deflate stream");
     }
+    // Only V3 has a place to say how many passes a stream took, so the older
+    // framings may only carry streams that took exactly one.
+    if ver != Ver::V3 && parts.iter().any(|p| p.chunks.len() != 1) {
+        bail!("only the v3 framing can carry a multi-pass stream");
+    }
+    if parts.iter().any(|p| p.chunks.is_empty()) {
+        bail!("a transformed stream with no chunks carries nothing");
+    }
     let mut header = Vec::new();
-    header.extend_from_slice(if v2 { MAGIC_V2 } else { MAGIC });
+    header.extend_from_slice(match ver {
+        Ver::V1 => MAGIC,
+        Ver::V2 => MAGIC_V2,
+        Ver::V3 => MAGIC_V3,
+    });
     put(&mut header, original.len() as u64);
     put(&mut header, parts.len() as u64);
     for p in parts {
-        if v2 {
+        if ver != Ver::V1 {
             header.push(match p.kind {
                 Kind::Deflate => 0,
                 Kind::Jpeg => 1,
@@ -628,8 +670,16 @@ pub fn encode(original: &[u8], parts: &[Piece], v2: bool) -> Result<Vec<u8>> {
             put(&mut header, off as u64);
             put(&mut header, len as u64);
         }
-        put(&mut header, p.plain.len() as u64);
-        put(&mut header, p.corrections.len() as u64);
+        if ver == Ver::V3 {
+            put(&mut header, p.chunks.len() as u64);
+            for (plain, corr) in &p.chunks {
+                put(&mut header, plain.len() as u64);
+                put(&mut header, corr.len() as u64);
+            }
+        } else {
+            put(&mut header, p.plain_len() as u64);
+            put(&mut header, p.corr_len() as u64);
+        }
     }
 
     let mut out = header;
@@ -645,11 +695,20 @@ pub fn encode(original: &[u8], parts: &[Piece], v2: bool) -> Result<Vec<u8>> {
         at = at.max(off + len);
     }
     out.extend_from_slice(&original[at..]);
+    // Plaintexts first, then corrections, and within each the streams in order
+    // and each stream's chunks in order. The grouping is what makes the layout
+    // pay: plaintexts are like each other and compress together, while the
+    // correction records are near-random and would cut every match if they sat
+    // between them.
     for p in parts {
-        out.extend_from_slice(&p.plain);
+        for (plain, _) in &p.chunks {
+            out.extend_from_slice(plain);
+        }
     }
     for p in parts {
-        out.extend_from_slice(&p.corrections);
+        for (_, corr) in &p.chunks {
+            out.extend_from_slice(corr);
+        }
     }
     Ok(out)
 }
@@ -664,12 +723,16 @@ pub struct Decoded<'a> {
 }
 
 /// One stream as parsed back out of the transformed form: where its bytes
-/// belong, and the two blobs a deflate encoder needs to reproduce them.
+/// belong, and the passes a deflate encoder must replay to reproduce them.
+///
+/// `chunks` is always non-empty and must be replayed in order — each pass
+/// continues the previous one's predictor. The older framings describe exactly
+/// one pass, so they parse into a one-element list and the rebuild path does
+/// not have to know which framing it came from.
 pub struct Parsed<'a> {
     pub pieces: Vec<(usize, usize)>,
     pub kind: Kind,
-    pub plain: &'a [u8],
-    pub corrections: &'a [u8],
+    pub chunks: Vec<(&'a [u8], &'a [u8])>,
 }
 
 pub fn decode(buf: &[u8]) -> Result<Decoded<'_>> {
@@ -677,9 +740,10 @@ pub fn decode(buf: &[u8]) -> Result<Decoded<'_>> {
     let Some((magic, rest)) = inp.split_at_checked(4) else {
         bail!("truncated recompression payload");
     };
-    let v2 = match magic {
-        m if m == MAGIC => false,
-        m if m == MAGIC_V2 => true,
+    let ver = match magic {
+        m if m == MAGIC => Ver::V1,
+        m if m == MAGIC_V2 => Ver::V2,
+        m if m == MAGIC_V3 => Ver::V3,
         _ => bail!("not a recompression payload"),
     };
     inp = rest;
@@ -711,7 +775,7 @@ pub fn decode(buf: &[u8]) -> Result<Decoded<'_>> {
     for _ in 0..count {
         // The kind byte comes first in v2 so the rest of the record parses the
         // same either way.
-        let kind = if v2 {
+        let kind = if ver != Ver::V1 {
             let Some((&b, rest)) = inp.split_first() else {
                 bail!("truncated recompression header");
             };
@@ -744,9 +808,29 @@ pub fn decode(buf: &[u8]) -> Result<Decoded<'_>> {
             covered += len;
             pieces.push((off, len));
         }
-        let plain = get(&mut inp)? as usize;
-        let corr = get(&mut inp)? as usize;
-        meta.push((pieces, kind, plain, corr));
+        // V3 lists the passes; the older framings describe exactly one, which
+        // parses into a one-element list so nothing downstream branches.
+        let n_chunks = if ver == Ver::V3 {
+            let n = get(&mut inp)? as usize;
+            // A chunk record is two varints, so at least two bytes. Bound by
+            // that and grow as records parse: never size from a claimed count.
+            if n == 0 {
+                bail!("recompression stream with no chunks");
+            }
+            if n > inp.len() / 2 {
+                bail!("implausible chunk count");
+            }
+            n
+        } else {
+            1
+        };
+        let mut chunks = Vec::new();
+        for _ in 0..n_chunks {
+            let plain = get(&mut inp)? as usize;
+            let corr = get(&mut inp)? as usize;
+            chunks.push((plain, corr));
+        }
+        meta.push((pieces, kind, chunks));
     }
     if covered > original_len {
         bail!("recompression pieces overlap");
@@ -755,11 +839,13 @@ pub fn decode(buf: &[u8]) -> Result<Decoded<'_>> {
     let body = inp;
     let verbatim_len = original_len - covered;
     let mut need = verbatim_len;
-    for (_, _, plain, corr) in &meta {
-        need = need
-            .checked_add(*plain)
-            .and_then(|n| n.checked_add(*corr))
-            .ok_or_else(|| anyhow::anyhow!("recompression lengths overflow"))?;
+    for (_, _, chunks) in &meta {
+        for (plain, corr) in chunks {
+            need = need
+                .checked_add(*plain)
+                .and_then(|n| n.checked_add(*corr))
+                .ok_or_else(|| anyhow::anyhow!("recompression lengths overflow"))?;
+        }
     }
     if need != body.len() {
         bail!(
@@ -770,22 +856,33 @@ pub fn decode(buf: &[u8]) -> Result<Decoded<'_>> {
     let (verbatim, mut at) = body.split_at(verbatim_len);
     // Sized from what was PARSED, not from what the header claimed. By here
     // every record has been read and its lengths reconciled against the payload
-    // size, so `meta.len()` is a fact rather than an assertion.
-    let mut plains = Vec::with_capacity(meta.len());
-    for (_, _, plain, _) in &meta {
-        let (a, b) = at.split_at(*plain);
-        plains.push(a);
-        at = b;
+    // size, so these counts are facts rather than assertions.
+    //
+    // Two passes because the layout groups all plaintexts before all
+    // corrections: the plaintext slices are taken first, in stream-then-chunk
+    // order, and the correction slices follow in exactly the same order.
+    let mut plains: Vec<Vec<&[u8]>> = Vec::with_capacity(meta.len());
+    for (_, _, chunks) in &meta {
+        let mut per_stream = Vec::with_capacity(chunks.len());
+        for (plain, _) in chunks {
+            let (a, b) = at.split_at(*plain);
+            per_stream.push(a);
+            at = b;
+        }
+        plains.push(per_stream);
     }
-    let mut streams = Vec::with_capacity(plains.len());
-    for ((pieces, kind, _, corr), plain) in meta.into_iter().zip(plains) {
-        let (a, b) = at.split_at(corr);
-        at = b;
+    let mut streams = Vec::with_capacity(meta.len());
+    for ((pieces, kind, lens), plain) in meta.into_iter().zip(plains) {
+        let mut chunks = Vec::with_capacity(lens.len());
+        for ((_, corr), pl) in lens.iter().zip(plain) {
+            let (a, b) = at.split_at(*corr);
+            at = b;
+            chunks.push((pl, a));
+        }
         streams.push(Parsed {
             pieces,
             kind,
-            plain,
-            corrections: a,
+            chunks,
         });
     }
     Ok(Decoded {
@@ -851,15 +948,27 @@ mod tests {
     use super::*;
 
     fn framed(original: &[u8], parts: Vec<Piece>) -> Vec<u8> {
-        encode(original, &parts, false).expect("valid pieces")
+        encode(original, &parts, Ver::V1).expect("valid pieces")
     }
 
     fn piece(pieces: Vec<(usize, usize)>, plain: &[u8], corrections: &[u8]) -> Piece {
         Piece {
             pieces,
             kind: Kind::Deflate,
-            plain: plain.to_vec(),
-            corrections: corrections.to_vec(),
+            chunks: vec![(plain.to_vec(), corrections.to_vec())],
+        }
+    }
+
+    /// A stream modelled in several preflate passes. Only the v3 framing has
+    /// anywhere to record how many there were.
+    fn multi(pieces: Vec<(usize, usize)>, chunks: &[(&[u8], &[u8])]) -> Piece {
+        Piece {
+            pieces,
+            kind: Kind::Deflate,
+            chunks: chunks
+                .iter()
+                .map(|(p, c)| (p.to_vec(), c.to_vec()))
+                .collect(),
         }
     }
 
@@ -876,8 +985,9 @@ mod tests {
         let dec = decode(&enc).unwrap();
         assert_eq!(dec.original_len, 1000);
         assert_eq!(dec.streams.len(), 2);
-        assert_eq!(dec.streams[0].plain, b"plain-one");
-        assert_eq!(dec.streams[1].corrections, b"c2");
+        assert_eq!(dec.streams[0].chunks.len(), 1);
+        assert_eq!(dec.streams[0].chunks[0].0, b"plain-one");
+        assert_eq!(dec.streams[1].chunks[0].1, b"c2");
         // Pretend the codec rebuilt each stream exactly.
         let rebuilt = vec![original[10..110].to_vec(), {
             let mut v = original[300..350].to_vec();
@@ -885,6 +995,81 @@ mod tests {
             v
         }];
         assert_eq!(rebuild(&dec, &rebuilt).unwrap(), original);
+    }
+
+    /// The v3 framing, pinned without preflate in the loop: a stream may carry
+    /// several passes, they come back in order, and the older framings refuse
+    /// to carry one because they have nowhere to record how many there were.
+    #[test]
+    fn the_v3_framing_carries_several_passes_per_stream() {
+        let original: Vec<u8> = (0..1000u32).map(|i| (i % 251) as u8).collect();
+        let parts = vec![
+            multi(
+                vec![(10, 100)],
+                &[(b"p1", b"c1"), (b"p2", b"c2"), (b"p3", b"c3")],
+            ),
+            piece(vec![(300, 50)], b"solo", b"sc"),
+        ];
+        let enc = encode(&original, &parts, Ver::V3).expect("v3 accepts passes");
+        assert!(enc.starts_with(MAGIC_V3));
+        let dec = decode(&enc).unwrap();
+        assert_eq!(dec.streams.len(), 2);
+        assert_eq!(
+            dec.streams[0].chunks,
+            vec![
+                (&b"p1"[..], &b"c1"[..]),
+                (&b"p2"[..], &b"c2"[..]),
+                (&b"p3"[..], &b"c3"[..])
+            ],
+            "passes must come back in order, plaintext paired with its own record"
+        );
+        assert_eq!(dec.streams[1].chunks, vec![(&b"solo"[..], &b"sc"[..])]);
+
+        let rebuilt = vec![original[10..110].to_vec(), original[300..350].to_vec()];
+        assert_eq!(rebuild(&dec, &rebuilt).unwrap(), original);
+
+        // The older framings have no field for the count, so they must refuse
+        // rather than silently write a record that reads back as one pass.
+        for ver in [Ver::V1, Ver::V2] {
+            assert!(
+                encode(&original, &parts, ver).is_err(),
+                "{ver:?} must refuse a multi-pass stream"
+            );
+        }
+        // And a stream with no passes at all carries nothing.
+        let empty = Piece {
+            pieces: vec![(0, 10)],
+            kind: Kind::Deflate,
+            chunks: Vec::new(),
+        };
+        assert!(encode(&original, &[empty], Ver::V3).is_err());
+    }
+
+    /// A forged pass count must not be believed before it is affordable.
+    #[test]
+    fn a_forged_pass_count_is_refused() {
+        let original = vec![3u8; 200];
+        let enc = encode(
+            &original,
+            &[multi(vec![(0, 100)], &[(b"a", b"b")])],
+            Ver::V3,
+        )
+        .unwrap();
+        // The chunk count sits after the magic, the original length, the stream
+        // count, the kind byte, the piece count and the one piece. Rather than
+        // computing that offset, walk every byte and check that no single-byte
+        // change makes the decoder allocate its way out of the payload.
+        for i in 4..enc.len().min(64) {
+            let mut bad = enc.clone();
+            bad[i] = 0x7F;
+            // Whatever it does, it must not panic and must not return a body
+            // the header did not describe.
+            if let Ok(d) = decode(&bad) {
+                for st in &d.streams {
+                    assert!(!st.chunks.is_empty());
+                }
+            }
+        }
     }
 
     #[test]
@@ -900,7 +1085,7 @@ mod tests {
         // slicing out of range; it used to abort the process trying to
         // allocate 64 GiB.
         assert!(
-            encode(&original, &[piece(vec![(400, 200)], &[], &[])], false).is_err(),
+            encode(&original, &[piece(vec![(400, 200)], &[], &[])], Ver::V1).is_err(),
             "piece outside the original"
         );
         // And out-of-order pieces, which `rebuild` could not splice back.
@@ -908,7 +1093,7 @@ mod tests {
             encode(
                 &original,
                 &[piece(vec![(200, 50), (100, 50)], &[], &[])],
-                false
+                Ver::V1
             )
             .is_err(),
             "pieces out of order"

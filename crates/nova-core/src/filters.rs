@@ -76,6 +76,16 @@ pub enum Filter {
     /// that this id pins the wrapper and the DECODER, not the encoder, because
     /// what it stores is a standard FLAC stream.
     Wav,
+    /// Undo every recompressible stream in a container, deflate and JPEG alike,
+    /// with a deflate stream modelled in AS MANY PREFLATE PASSES AS IT TAKES.
+    ///
+    /// The successor to [`Filter::Container`], which had one blob per stream and
+    /// therefore had to skip any stream whose plaintext would not fit the coded
+    /// cap whole. `binutils-2.42.tar.gz` is 51,892,456 B of one deflate stream
+    /// carrying 319,897,600 B of plaintext: it fitted the solo unit, was refused
+    /// by the cap, and came out at 94.6% of itself. Modelled in passes up to the
+    /// budget it reaches −32.9%, and the whole stream would be −43.8%.
+    ContainerChunked,
     /// Separate an MPEG Layer III file's frame headers and side information
     /// from its spectral data, so the structured 8% stops being interleaved
     /// with the incompressible 92%.
@@ -109,6 +119,12 @@ const CONTAINER_V2: u8 = 37;
 /// Filter id for RIFF/WAVE PCM carried as FLAC. Unlike 34/35/37 this pins a
 /// decoder and a wrapper, not a library version: the payload is standard FLAC.
 const WAV_FLAC: u8 = 38;
+
+/// Filter id for chunked container recompression: preflate 0.7.x in as many
+/// passes as a stream needs, lepton 0.5.x for the JPEG ones. It pins both
+/// library versions exactly as 37 does; what it adds is the `NDf3` framing's
+/// per-stream pass list, which 37 has no room for.
+const CONTAINER_V3: u8 = 40;
 
 /// Filter id for the MPEG Layer III plane split. Pins nothing external — the
 /// transform is nova's own and the MPEG bytes pass through unchanged — but it
@@ -160,6 +176,7 @@ impl Filter {
             Filter::Container => CONTAINER_V2,
             Filter::Wav => WAV_FLAC,
             Filter::Mp3 => MP3_PLANES,
+            Filter::ContainerChunked => CONTAINER_V3,
         }
     }
 
@@ -174,6 +191,7 @@ impl Filter {
             CONTAINER_V2 => Ok(Filter::Container),
             WAV_FLAC => Ok(Filter::Wav),
             MP3_PLANES => Ok(Filter::Mp3),
+            CONTAINER_V3 => Ok(Filter::ContainerChunked),
             other => bail!("unknown filter id {other} - archive was made by a newer version"),
         }
     }
@@ -212,6 +230,10 @@ impl Filter {
                 *data = container_encode(data)?;
                 Ok(Applied::Rebuilt)
             }
+            Filter::ContainerChunked => {
+                *data = container_chunked_encode(data)?;
+                Ok(Applied::Rebuilt)
+            }
             Filter::Wav => {
                 *data = crate::wav::encode(data)?;
                 Ok(Applied::Rebuilt)
@@ -236,7 +258,9 @@ impl Filter {
             Filter::Deflate => *data = deflate_decode(data)?,
             Filter::Jpeg => *data = jpeg_decode(data)?,
             Filter::X86Split => *data = x86_split_decode(data)?,
-            Filter::Container => *data = deflate_decode(data)?,
+            // One decoder for all three framings: `deflate::decode` reads the
+            // magic and hands back a pass list either way.
+            Filter::Container | Filter::ContainerChunked => *data = deflate_decode(data)?,
             Filter::Wav => *data = crate::wav::decode(data)?,
             Filter::Mp3 => *data = crate::mp3::decode(data)?,
         }
@@ -252,6 +276,7 @@ impl Filter {
             | Filter::Jpeg
             | Filter::X86Split
             | Filter::Container
+            | Filter::ContainerChunked
             | Filter::Wav
             | Filter::Mp3 => true,
         }
@@ -314,24 +339,125 @@ fn jpeg_decode(data: &[u8]) -> Result<Vec<u8>> {
 /// the ones it can. The coded-size cap is enforced the same way: a stream whose
 /// growth would cross it is skipped, not the whole container's transform.
 fn deflate_encode(data: &[u8]) -> Result<Vec<u8>> {
-    container_encode_inner(data, false, crate::archive::MAX_CODED_CHUNK as usize)
+    container_encode_inner(
+        data,
+        crate::deflate::Ver::V1,
+        crate::archive::MAX_CODED_CHUNK as usize,
+    )
 }
 
 /// The v2 path: the same framing, but JPEG streams are transformed too.
 fn container_encode(data: &[u8]) -> Result<Vec<u8>> {
-    container_encode_inner(data, true, crate::archive::MAX_CODED_CHUNK as usize)
+    container_encode_inner(
+        data,
+        crate::deflate::Ver::V2,
+        crate::archive::MAX_CODED_CHUNK as usize,
+    )
+}
+
+/// The v3 path: as v2, but a deflate stream may be modelled in SEVERAL preflate
+/// passes, and a stream that runs out of budget contributes its prefix instead
+/// of nothing at all.
+fn container_chunked_encode(data: &[u8]) -> Result<Vec<u8>> {
+    container_encode_inner(
+        data,
+        crate::deflate::Ver::V3,
+        crate::archive::MAX_CODED_CHUNK as usize,
+    )
+}
+
+/// Plaintext one preflate pass may hold.
+///
+/// NOT MERELY A MEMORY KNOB, which is what it looked like. The parser stops at
+/// this limit wherever it happens to be, and if that is mid-block it fails with
+/// `PlainTextLimit` instead of ending the pass cleanly — so the value has to
+/// exceed the largest single deflate block's plaintext or the walk stops early.
+/// Measured on `binutils-2.42.tar.gz`: at 256 KiB and 1 MiB the walk dies after
+/// reaching 4.7% of the stream, at 4 MiB it reaches 12.5% of the same budget,
+/// and at 32 MiB one pass covers 14.8%. Bigger passes are strictly better here,
+/// bounded only by the peak plaintext a worker then holds.
+///
+/// It also has to be SET rather than defaulted: `PreflateConfig::default()`
+/// puts it at 128 MiB, below `MAX_CODED_CHUNK`, so it used to bite first — and
+/// silently, because the stream simply came back unmodelled.
+///
+/// When it does bite, the walk keeps the passes it already had and the stream
+/// contributes its prefix. That degradation is verified, not assumed: the
+/// collected prefix replays byte-for-byte even when the pass that followed it
+/// failed.
+const PREFLATE_PASS: usize = 32 * 1024 * 1024;
+
+/// The passes of one stream: each pass's plaintext and its correction record.
+type Passes = Vec<(Vec<u8>, Vec<u8>)>;
+
+/// One deflate stream, modelled in as many passes as the budget allows.
+///
+/// Returns the passes and how many COMPRESSED bytes they cover. That second
+/// number is the point: it may be less than the stream, and then the caller
+/// keeps only the prefix and lets the container store the tail verbatim. A
+/// 51.9 MB `.tar.gz` whose plaintext is 305 MiB cannot be modelled whole inside
+/// the coded cap, and used to be skipped entirely; measured, modelling as much
+/// as ~192 MiB of plaintext takes LZMA2 from 49,093,075 B to 32,928,672
+/// (−32.9%), against −43.8% for the whole stream.
+/// `pass` is a parameter for the same reason `cap` is one on
+/// `container_encode_inner`: a test can shrink it and exercise the multi-pass
+/// path on a few hundred kilobytes instead of the three hundred megabytes the
+/// real constant would need.
+fn preflate_chunks(raw: &[u8], budget: usize, pass: usize) -> Option<(Passes, usize)> {
+    let cfg = preflate_rs::PreflateConfig {
+        verify_compression: false,
+        plain_text_limit: pass,
+        ..Default::default()
+    };
+    let mut proc = preflate_rs::PreflateStreamProcessor::new(&cfg);
+    let (mut consumed, mut plain_total) = (0usize, 0usize);
+    let mut chunks: Passes = Vec::new();
+    // A failed pass ends the walk and keeps what came before it: the stream
+    // then contributes its prefix. That is not a fallback bolted on — it is the
+    // same path a budget exhaustion takes, and the prefix is byte-exact either
+    // way, which the tests below pin down.
+    while let Ok(r) = proc.decompress(&raw[consumed..]) {
+        // Without forward progress the next call would repeat this one forever.
+        if r.compressed_size == 0 {
+            break;
+        }
+        // `PlainText::text()` skips the retained dictionary, so the passes
+        // concatenate into the original plaintext with nothing duplicated.
+        let plain = proc.plain_text().text().to_vec();
+        // STOP BEFORE CROSSING THE BUDGET, not after. Stopping at `>= budget`
+        // overshoots by up to one pass, and the caller's cap check then threw
+        // away the WHOLE stream rather than the offending pass — which is
+        // exactly how a 51.9 MB tar.gz still came out untransformed after the
+        // walk itself was already working. A pass that would cross is dropped
+        // whole; the work is wasted, the correctness is not.
+        let cost = plain.len().saturating_add(r.corrections.len());
+        if plain_total.saturating_add(cost) > budget {
+            break;
+        }
+        plain_total += cost;
+        consumed += r.compressed_size;
+        chunks.push((plain, r.corrections));
+        if proc.is_done() {
+            break;
+        }
+        proc.shrink_to_dictionary();
+    }
+    if chunks.is_empty() || consumed == 0 {
+        return None;
+    }
+    Some((chunks, consumed))
 }
 
 /// `cap` is a parameter rather than reading `MAX_CODED_CHUNK` directly so a
 /// test can shrink it and exercise the per-stream skip on ordinary-sized data
 /// instead of needing hundreds of MiB to cross the real bound.
-fn container_encode_inner(data: &[u8], v2: bool, cap: usize) -> Result<Vec<u8>> {
-    use crate::deflate::{encode, find_streams, Kind, Piece};
+fn container_encode_inner(data: &[u8], ver: crate::deflate::Ver, cap: usize) -> Result<Vec<u8>> {
+    use crate::deflate::{encode, find_streams, trim, Kind, Piece, Ver};
     let mut streams = find_streams(data);
     // Id 34's framing has no room to say what a stream is, so it may only ever
     // carry deflate. Filtering here rather than in the scanner keeps the two
     // ids producing byte-identical output on containers that hold no JPEG.
-    if !v2 {
+    if ver == Ver::V1 {
         streams.retain(|s| s.kind == Kind::Deflate);
     }
     if streams.is_empty() {
@@ -372,7 +498,21 @@ fn container_encode_inner(data: &[u8], v2: bool, cap: usize) -> Result<Vec<u8>> 
         let raw = s.gather(data);
         // A stream either transforms or is left where it is. One refusal is a
         // lost opportunity for that stream, never an error for the container.
-        let (plain, corrections) = match s.kind {
+        let (chunks, covered) = match s.kind {
+            Kind::Deflate if ver == Ver::V3 => {
+                // What this stream may spend: whatever the cap has left, less
+                // the corrections it will also have to carry. The passes stop
+                // at the budget, so an oversized stream contributes its PREFIX
+                // rather than being skipped whole.
+                let budget = cap.saturating_sub(total);
+                if budget == 0 {
+                    continue;
+                }
+                match preflate_chunks(&raw, budget, PREFLATE_PASS) {
+                    Some(v) => v,
+                    None => continue,
+                }
+            }
             Kind::Deflate => {
                 let Ok((res, plain)) = preflate_rs::preflate_whole_deflate_stream(&raw, &cfg)
                 else {
@@ -381,33 +521,50 @@ fn container_encode_inner(data: &[u8], v2: bool, cap: usize) -> Result<Vec<u8>> 
                 if res.compressed_size != raw.len() {
                     continue;
                 }
-                (plain.text().to_vec(), res.corrections)
+                let n = raw.len();
+                (vec![(plain.text().to_vec(), res.corrections)], n)
             }
             Kind::Jpeg => match jpeg_encode(&raw) {
                 // Lepton output that is not smaller than the JPEG is not worth
                 // a record: the container would grow for nothing.
-                Ok(blob) if blob.len() < raw.len() => (blob, Vec::new()),
+                Ok(blob) if blob.len() < raw.len() => (vec![(blob, Vec::new())], raw.len()),
                 _ => continue,
             },
         };
-        let grown = total
-            .saturating_add(plain.len())
-            .saturating_add(corrections.len());
+        // The covered compressed bytes are REPLACED by the plaintext, not added
+        // to it — `encode` writes them nowhere — so they come back off the
+        // budget. `total` was seeded with the container's whole length, which
+        // includes them.
+        let grown = chunks
+            .iter()
+            .fold(total.saturating_sub(covered), |acc, (plain, corr)| {
+                acc.saturating_add(plain.len()).saturating_add(corr.len())
+            });
         if grown > cap {
             continue;
         }
+        // A partly modelled stream keeps only the prefix its passes actually
+        // reproduce; the compressed tail past that stays where it is and the
+        // container writes it out verbatim, so the rebuild is still exact.
+        let mut pieces = s.pieces.clone();
+        let whole: usize = pieces.iter().map(|p| p.1).sum();
+        if covered < whole {
+            trim(&mut pieces, 0, whole - covered);
+            if pieces.is_empty() {
+                continue;
+            }
+        }
         total = grown;
         parts.push(Piece {
-            pieces: s.pieces.clone(),
+            pieces,
             kind: s.kind,
-            plain,
-            corrections,
+            chunks,
         });
     }
     if parts.is_empty() {
         bail!("nothing in this unit could be modelled");
     }
-    encode(data, &parts, v2)
+    encode(data, &parts, ver)
 }
 
 /// Rebuild the container exactly as it was.
@@ -417,9 +574,36 @@ fn deflate_decode(data: &[u8]) -> Result<Vec<u8>> {
     let mut rebuilt = Vec::with_capacity(d.streams.len());
     for s in &d.streams {
         rebuilt.push(match s.kind {
-            Kind::Deflate => preflate_rs::recreate_whole_deflate_stream(s.plain, s.corrections)
-                .map_err(|e| anyhow::anyhow!("cannot rebuild a deflate stream: {e}"))?,
-            Kind::Jpeg => jpeg_decode(s.plain)?,
+            Kind::Deflate if s.chunks.len() > 1 => {
+                // Several passes: replay them in order through ONE processor,
+                // because each continues the previous one's predictor. The
+                // concatenation is the stream's compressed bytes.
+                let mut rec = preflate_rs::RecreateStreamProcessor::new();
+                let mut out = Vec::new();
+                for (plain, corrections) in &s.chunks {
+                    let (bytes, _) = rec
+                        .recompress(&mut std::io::Cursor::new(plain), corrections)
+                        .map_err(|e| anyhow::anyhow!("cannot rebuild a deflate stream: {e}"))?;
+                    out.extend_from_slice(&bytes);
+                }
+                out
+            }
+            Kind::Deflate => {
+                // Exactly one pass, which is what every id 34 and 37 payload
+                // ever written contains, and what most v3 streams contain too.
+                let (plain, corrections) = s.chunks[0];
+                preflate_rs::recreate_whole_deflate_stream(plain, corrections)
+                    .map_err(|e| anyhow::anyhow!("cannot rebuild a deflate stream: {e}"))?
+            }
+            // A JPEG is one lepton blob and never several: `container_encode_inner`
+            // only ever pushes a single chunk for it, and the decoder says so
+            // rather than silently reading the first of many.
+            Kind::Jpeg => {
+                if s.chunks.len() != 1 {
+                    bail!("a jpeg stream cannot have {} passes", s.chunks.len());
+                }
+                jpeg_decode(s.chunks[0].0)?
+            }
         });
     }
     crate::deflate::rebuild(&d, &rebuilt)
@@ -891,7 +1075,9 @@ mod tests {
         assert_eq!(Filter::Wav.id(), 38);
         assert_eq!(Filter::from_id(39).unwrap(), Filter::Mp3);
         assert_eq!(Filter::Mp3.id(), 39);
-        for id in 40..=255u8 {
+        assert_eq!(Filter::from_id(40).unwrap(), Filter::ContainerChunked);
+        assert_eq!(Filter::ContainerChunked.id(), 40);
+        for id in 41..=255u8 {
             assert!(Filter::from_id(id).is_err(), "id {id} must be rejected");
         }
     }
@@ -1230,7 +1416,7 @@ mod tests {
         // stream's 100,000-byte plain text on top of that.
         let cap = pdf.len() + 20_000;
 
-        let encoded = container_encode_inner(&pdf, false, cap)
+        let encoded = container_encode_inner(&pdf, crate::deflate::Ver::V1, cap)
             .expect("the four small streams must still transform");
         let decoded = crate::deflate::decode(&encoded).unwrap();
         assert_eq!(
@@ -1465,5 +1651,209 @@ mod x86_split_tests {
             Filter::X86Split.unapply(&mut work).unwrap();
         }
         assert_eq!(work, data);
+    }
+}
+
+#[cfg(test)]
+mod chunked_tests {
+    use super::*;
+
+    /// A deflate stream whose plaintext is long and highly compressible, so a
+    /// small pass size really does force several preflate passes.
+    fn big_gzip(plain_len: usize) -> (Vec<u8>, Vec<u8>) {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+        // Prose-shaped, and that matters. A tiny vocabulary makes deflate emit
+        // matches at very short distances, and preflate's predictor could not
+        // pick the chain back up across a pass boundary on such a stream —
+        // pass two failed on its first token. Real streams (a tar of source,
+        // the corpus this feature exists for) have varied match distances and
+        // walk to the end. See PREFLATE_PASS and the prefix test below.
+        let mut plain = Vec::with_capacity(plain_len);
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let next = |s: &mut u64| {
+            *s ^= *s << 13;
+            *s ^= *s >> 7;
+            *s ^= *s << 17;
+            *s
+        };
+        let vocab: Vec<String> = (0..4096)
+            .map(|_| {
+                let n = 3 + next(&mut seed) % 6;
+                (0..n)
+                    .map(|_| (b'a' + (next(&mut seed) % 26) as u8) as char)
+                    .collect()
+            })
+            .collect();
+        let mut col = 0usize;
+        while plain.len() < plain_len {
+            // Heavy head plus a long tail, so distances are varied rather than
+            // all short.
+            let shift = next(&mut seed).trailing_zeros().min(11) as usize;
+            let w = &vocab[(next(&mut seed) as usize) % (vocab.len() >> shift).max(1)];
+            plain.extend_from_slice(w.as_bytes());
+            col += w.len() + 1;
+            if col > 70 {
+                plain.push(b'\n');
+                col = 0;
+            } else {
+                plain.push(b' ');
+            }
+        }
+        plain.truncate(plain_len);
+        let mut e = GzEncoder::new(Vec::new(), Compression::default());
+        e.write_all(&plain).unwrap();
+        (e.finish().unwrap(), plain)
+    }
+
+    /// The whole point of id 40: a stream is modelled in as many passes as it
+    /// takes, and the passes replay into exactly the bytes that went in.
+    #[test]
+    fn a_stream_is_modelled_in_several_passes_and_replays_exactly() {
+        let (gz, plain) = big_gzip(4 << 20);
+        let streams = crate::deflate::find_streams(&gz);
+        let s = streams
+            .iter()
+            .find(|s| s.kind == crate::deflate::Kind::Deflate)
+            .expect("a deflate stream");
+        let raw = s.gather(&gz);
+
+        // One pass per MiB of plaintext, so 4 MiB needs several. The pass must
+        // still be large enough to hold a whole deflate block — see
+        // PREFLATE_PASS — which is why this is 1 MiB and not 64 KiB.
+        let (chunks, covered) =
+            preflate_chunks(&raw, usize::MAX, 1 << 20).expect("the stream must model");
+        assert!(
+            chunks.len() >= 2,
+            "expected several passes, got {}",
+            chunks.len()
+        );
+        assert_eq!(covered, raw.len(), "an unbounded budget must reach the end");
+
+        // The passes concatenate into the ORIGINAL plaintext, with nothing
+        // duplicated — `PlainText::text()` skips the retained dictionary, and
+        // if it did not this would be the assertion that caught it.
+        let joined: Vec<u8> = chunks.iter().flat_map(|(p, _)| p.clone()).collect();
+        assert_eq!(joined, plain, "the passes do not reconstruct the plaintext");
+
+        // And replaying them reproduces the compressed bytes exactly.
+        let mut rec = preflate_rs::RecreateStreamProcessor::new();
+        let mut back = Vec::new();
+        for (p, c) in &chunks {
+            let (bytes, _) = rec.recompress(&mut std::io::Cursor::new(p), c).unwrap();
+            back.extend_from_slice(&bytes);
+        }
+        assert_eq!(back, raw, "the replayed stream is not byte-identical");
+    }
+
+    /// A budget smaller than the stream yields a PREFIX rather than nothing.
+    /// Before id 40 this case produced no transform at all, which is how a
+    /// 51.9 MB tar.gz came out at 94.6% of itself.
+    #[test]
+    fn a_budget_too_small_still_models_the_prefix() {
+        let (gz, _) = big_gzip(4 << 20);
+        let streams = crate::deflate::find_streams(&gz);
+        let raw = streams
+            .iter()
+            .find(|s| s.kind == crate::deflate::Kind::Deflate)
+            .unwrap()
+            .gather(&gz);
+
+        const BUDGET: usize = 1 << 20;
+        let (chunks, covered) =
+            preflate_chunks(&raw, BUDGET, 1 << 20).expect("a prefix must still model");
+        assert!(covered > 0 && covered < raw.len(), "covered {covered}");
+        let spent: usize = chunks.iter().map(|(p, c)| p.len() + c.len()).sum();
+        // NEVER over the budget. Overshooting by one pass is what made the
+        // caller's cap check discard the entire stream instead of that pass,
+        // and it is why a 51.9 MB tar.gz still came out untransformed after
+        // the walk itself was already correct.
+        assert!(spent <= BUDGET, "budget {BUDGET} exceeded: {spent}");
+        // And close enough to it that the budget is used rather than wasted.
+        assert!(spent > BUDGET / 2, "budget barely used: {spent}");
+
+        let mut rec = preflate_rs::RecreateStreamProcessor::new();
+        let mut back = Vec::new();
+        for (p, c) in &chunks {
+            let (bytes, _) = rec.recompress(&mut std::io::Cursor::new(p), c).unwrap();
+            back.extend_from_slice(&bytes);
+        }
+        assert_eq!(back, raw[..covered], "the prefix is not byte-identical");
+    }
+
+    /// End to end through the real filter: a container holding such a stream
+    /// transforms and comes back byte for byte.
+    #[test]
+    fn the_chunked_filter_round_trips_a_container() {
+        let (gz, _) = big_gzip(4 << 20);
+        let mut data = gz.clone();
+        let enc = container_chunked_encode(&data).expect("must transform");
+        assert!(
+            enc.starts_with(b"NDf3"),
+            "the chunked path must write the v3 framing"
+        );
+        let mut back = enc.clone();
+        Filter::ContainerChunked.unapply(&mut back).unwrap();
+        assert_eq!(back, gz, "the container did not round-trip");
+
+        // And through `apply`, which is what the pipeline calls.
+        let applied = Filter::ContainerChunked.apply(&mut data).unwrap();
+        assert_eq!(applied, Applied::Rebuilt);
+        Filter::ContainerChunked.unapply(&mut data).unwrap();
+        assert_eq!(data, gz);
+    }
+}
+
+#[cfg(test)]
+mod legacy_framing_tests {
+    use super::*;
+
+    /// Ids 34 and 37 are no longer WRITTEN — the analyzer routes containers to
+    /// 40 — so nothing else would notice if their decode path rotted. Archives
+    /// carrying them exist, and an id is a promise.
+    ///
+    /// This encodes with each older framing deliberately and decodes it through
+    /// the shipped filter, so the promise is checked rather than assumed.
+    #[test]
+    fn the_older_container_framings_still_decode() {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        let plain: Vec<u8> = std::iter::repeat_n(
+            b"the quick brown fox jumps over the lazy dog, repeatedly. ".as_slice(),
+            4000,
+        )
+        .flatten()
+        .copied()
+        .collect();
+        let mut e = GzEncoder::new(Vec::new(), Compression::default());
+        e.write_all(&plain).unwrap();
+        let gz = e.finish().unwrap();
+
+        let cap = crate::archive::MAX_CODED_CHUNK as usize;
+        for (ver, filter, magic) in [
+            (crate::deflate::Ver::V1, Filter::Deflate, &b"NDf1"[..]),
+            (crate::deflate::Ver::V2, Filter::Container, &b"NDf2"[..]),
+            (crate::deflate::Ver::V3, Filter::ContainerChunked, &b"NDf3"[..]),
+        ] {
+            let enc = container_encode_inner(&gz, ver, cap)
+                .unwrap_or_else(|e| panic!("{ver:?} must transform this gzip: {e}"));
+            assert!(enc.starts_with(magic), "{ver:?} wrote the wrong magic");
+            let mut back = enc.clone();
+            filter
+                .unapply(&mut back)
+                .unwrap_or_else(|e| panic!("{filter:?} must decode {ver:?}: {e}"));
+            assert_eq!(back, gz, "{filter:?} did not rebuild the container");
+        }
+    }
+
+    /// The three ids must stay distinct and keep their numbers forever.
+    #[test]
+    fn the_container_ids_do_not_move() {
+        assert_eq!(Filter::Deflate.id(), 34);
+        assert_eq!(Filter::Container.id(), 37);
+        assert_eq!(Filter::ContainerChunked.id(), 40);
     }
 }

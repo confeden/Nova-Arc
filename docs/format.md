@@ -106,15 +106,28 @@ Filter ids:
 | `37` | mixed container: deflate **and** JPEG streams | changed |
 | `38` | RIFF/WAVE integer PCM carried as FLAC | changed |
 | `39` | MPEG Layer III split into header / side-info / spectral planes | changed |
+| `40` | mixed container, deflate streams modelled in SEVERAL preflate passes | changed |
 
-An id is a promise, not a slot to reuse: 34 still decodes every archive that
-used it, and 37 — which can say what each stream *is* — is what new archives
-get. Ids 34, 35 and 37 pin the library that wrote them, so upgrading it spends
+An id is a promise, not a slot to reuse: 34 and 37 still decode every archive
+that used them, and 40 — which can say how many passes a stream took — is what
+new archives get. 40 exists because 34 and 37 have one plaintext blob per
+stream, so a stream whose plaintext will not fit the coded cap whole had to be
+skipped entirely; 40 models as much of it as the budget reaches and lets the
+container store the compressed tail verbatim. Measured on the public deflate
+corpus, that is 74,865,900 B → **60,703,266 B**, because one 51.9 MB `.tar.gz`
+went from untransformed to mostly transformed.
+
+Ids 34, 35, 37 and 40 pin the library that wrote them, so upgrading it spends
 a new id. Ids 38 and 39 do not: 38 stores a standard FLAC stream plus a wrapper
 of this format's own, and 39 stores the MPEG bytes themselves, merely
 reordered. Both carry a version byte inside the payload (`NWv1`, `NM31`), so
 the layout can grow without spending an id, while the encoder may change freely
 because the decoder keeps reading everything ever written.
+
+A stream in the `40` framing carries a LIST of passes, each its own plaintext
+and correction record, and they must be replayed in order: every pass continues
+the previous one's predictor. Ids 34 and 37 describe exactly one pass and parse
+into a one-element list, so a decoder needs only the one code path.
 
 A length-changing filter records the coded length in `ChunkRec::filtered`;
 `unpacked` always means the ORIGINAL length, the one `hash` covers and `Extent`
@@ -144,6 +157,24 @@ FileEntry { path: str, size: u64, mtime: i64, extents: [Extent] }
 Extent    { unit: u32, off: u64, len: u64 }
 ChunkRec  { offset: u64, packed: u64, unpacked: u64, filtered: u64,
             codec: u8, param: u8, filter: u8, hash: bin16 }
+```
+
+The recompression payload's own framing, inside a chunk carrying filter 34, 37
+or 40:
+
+```
+magic     "NDf1" | "NDf2" | "NDf3"
+          varint original_len, varint stream_count
+per stream
+          u8 kind                         (NDf2 and NDf3 only; 0 deflate, 1 jpeg)
+          varint piece_count, then piece_count x (varint off, varint len)
+          NDf3:  varint pass_count, then pass_count x (varint plain_len, varint corr_len)
+          NDf1/NDf2: varint plain_len, varint corr_len   (exactly one pass)
+payload   the container's own bytes, then every plaintext, then every
+          correction record — streams in order, and each stream's passes in
+          order. Plaintexts are grouped because they compress together and the
+          correction records, being near-random, would cut every match if they
+          sat between them.
 ```
 
 `filtered` is what a length-changing filter (ids 34-39) produced and therefore
@@ -226,7 +257,7 @@ Phase 1 (analysis), per file and again per unit, from the head bytes:
 
 | content | filter | fast / normal | max |
 |---|---|---|---|
-| deflate container (zip, PNG, gzip, docx, PDF) | mixed container (37) | zstd | LZMA2 |
+| deflate container (zip, PNG, gzip, docx, PDF) | chunked container (40) | zstd | LZMA2 |
 | JPEG photograph | lepton (35) | zstd | LZMA2 |
 | RIFF/WAVE integer PCM | FLAC (38) | zstd | LZMA2 |
 | MPEG Layer III (.mp3) | plane split (39) | zstd | LZMA2 |
@@ -241,6 +272,13 @@ A zip is scanned through its central directory, and a **stored** entry (method
 0) is handed back to the same dispatcher as if it were a file on disk, up to
 three levels deep. That is where a zip keeps what deflate could not help:
 photographs, an epub's illustrations, an apk's assets.
+
+A deflate stream larger than the budget is no longer all-or-nothing: filter 40
+models as many passes as fit and the container stores the compressed tail
+verbatim, so an oversized member costs part of its gain instead of all of it.
+Each pass's plaintext limit must exceed the largest single deflate block, or
+the parser stops mid-block and the walk ends early — which is a smaller prefix,
+never a wrong rebuild.
 
 The first two rows need the WHOLE file: a zip's central directory is at its end
 and lepton reads one complete JPEG. Such a file is given a unit of its own,

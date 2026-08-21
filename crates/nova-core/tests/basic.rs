@@ -966,7 +966,7 @@ fn deflate_containers_are_recompressed_and_still_extract() {
     // container (deflate + JPEG); 34 is its deflate-only predecessor, which
     // still decodes but is no longer written.
     assert!(
-        a.manifest.chunks.iter().any(|c| c.filter == 37),
+        a.manifest.chunks.iter().any(|c| c.filter == 40),
         "no unit was recompressed: {:?}",
         a.manifest
             .chunks
@@ -975,7 +975,7 @@ fn deflate_containers_are_recompressed_and_still_extract() {
             .collect::<Vec<_>>()
     );
     // A recompressed unit records what the codec saw, which is not its length.
-    for c in a.manifest.chunks.iter().filter(|c| c.filter == 37) {
+    for c in a.manifest.chunks.iter().filter(|c| c.filter == 40) {
         assert_ne!(c.filtered, 0, "a length-changing filter must record it");
         assert_ne!(c.filtered, c.unpacked);
         assert_eq!(c.coded_len(), c.filtered);
@@ -1242,7 +1242,7 @@ fn a_zip_of_stored_jpegs_is_recompressed() {
         .manifest
         .chunks
         .iter()
-        .find(|c| c.filter == 37)
+        .find(|c| c.filter == 40)
         .expect("the container filter must reach a stored jpeg");
     assert!(
         c.packed * 10 < c.unpacked * 9,
@@ -1533,7 +1533,7 @@ fn pdf_flate_streams_are_recompressed_and_still_extract() {
         .manifest
         .chunks
         .iter()
-        .filter(|c| c.filter == 37)
+        .filter(|c| c.filter == 40)
         .collect();
     assert_eq!(recompressed.len(), 1, "exactly the real PDF");
     let c = recompressed[0];
