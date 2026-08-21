@@ -194,6 +194,11 @@ enum Seg {
 const KIND_RAW: u8 = 0;
 const KIND_RUN: u8 = 1;
 
+/// Bytes one segment record costs in the payload: a kind byte and a u32. This
+/// is the number that bounds how many records a buffer can honestly contain,
+/// and `decode` must use it rather than the buffer length itself.
+const SEG_RECORD: usize = 1 + 4;
+
 /// Do at least `MIN_CHAIN` frames start at `at`, each landing exactly where the
 /// previous one ends? Reaching the end of the buffer counts as chaining: the
 /// tail of a file is still a frame.
@@ -491,11 +496,19 @@ pub fn decode(data: &[u8]) -> Result<Vec<u8>> {
 
     let mut at = 5usize;
     let n_seg = take_u32(data, &mut at)?;
-    // A segment costs 5 bytes here and at least one byte of payload, so a count
-    // larger than the buffer is a forgery, not a big file.
-    ensure!(n_seg <= data.len(), "mp3: implausible segment count");
+    // NEVER SIZE A Vec FROM A COUNT A PAYLOAD CLAIMS. A segment record is one
+    // kind byte plus a u32, so the honest ceiling is how many WHOLE records the
+    // remaining bytes can hold — not `n_seg <= data.len()`, which is 5x looser
+    // than that and, at 16 bytes per `(u8, usize)`, turned a 256 MiB chunk into
+    // a 4 GiB `with_capacity`. Rust aborts on allocation failure instead of
+    // unwinding, and extraction runs one of these per lane, so that was a crash
+    // an archive could ask for. The table now grows as records parse.
+    ensure!(
+        n_seg <= (data.len() - at) / SEG_RECORD,
+        "mp3: implausible segment count"
+    );
 
-    let mut table: Vec<(u8, usize)> = Vec::with_capacity(n_seg);
+    let mut table: Vec<(u8, usize)> = Vec::new();
     for _ in 0..n_seg {
         ensure!(at < data.len(), "mp3: truncated segment table");
         let kind = data[at];
@@ -508,16 +521,22 @@ pub fn decode(data: &[u8]) -> Result<Vec<u8>> {
         table.push((kind, n));
     }
 
-    let raw_total: usize = table
-        .iter()
-        .filter(|(k, _)| *k == KIND_RAW)
-        .map(|(_, n)| *n)
-        .sum();
-    let frame_total: usize = table
-        .iter()
-        .filter(|(k, _)| *k == KIND_RUN)
-        .map(|(_, n)| *n)
-        .sum();
+    // Every plane length is a sum of payload-supplied counts, so the sums are
+    // checked rather than wrapped: release builds have overflow-checks off, and
+    // a wrap here would turn a bounds check below into a pass.
+    let sum_of = |want: u8| -> Result<usize> {
+        let mut acc = 0usize;
+        for (k, n) in &table {
+            if *k == want {
+                acc = acc
+                    .checked_add(*n)
+                    .ok_or_else(|| anyhow::anyhow!("mp3: segment lengths overflow"))?;
+            }
+        }
+        Ok(acc)
+    };
+    let raw_total = sum_of(KIND_RAW)?;
+    let frame_total = sum_of(KIND_RUN)?;
 
     // Plane bases, in the order `encode` wrote them. Only the first two can be
     // sized before the headers are read; the rest come from what they say.
@@ -794,6 +813,46 @@ mod tests {
         assert!(decode(&bad).is_err());
     }
 
+    /// A payload may not make the decoder allocate more than the payload.
+    ///
+    /// Found by review, and it was real: the guard was `n_seg <= data.len()`
+    /// while a record costs five bytes and a table entry sixteen, so a chunk at
+    /// the coded cap asked for 4 GiB. Rust ABORTS on allocation failure rather
+    /// than unwinding, and extraction runs one of these per lane, so an archive
+    /// could ask for a crash. The bound is now how many WHOLE records the
+    /// remaining bytes can hold.
+    #[test]
+    fn a_forged_segment_count_cannot_outgrow_its_payload() {
+        for len in [64usize, 1024, 64 * 1024] {
+            let mut bad = vec![0u8; len];
+            bad[0..4].copy_from_slice(MAGIC);
+            bad[4] = VERSION;
+            // Every count from "one more than can fit" upwards must be refused
+            // by the bound, not by running out of bytes mid-table.
+            let fits = (len - 9) / SEG_RECORD;
+            for claim in [fits as u32 + 1, u32::MAX / 2, u32::MAX] {
+                bad[5..9].copy_from_slice(&claim.to_le_bytes());
+                let err = decode(&bad).unwrap_err().to_string();
+                assert!(
+                    err.contains("implausible segment count"),
+                    "len {len} claim {claim} was rejected too late: {err}"
+                );
+            }
+            // And the largest count that DOES fit must get past the bound, so
+            // the check is a bound and not a blanket refusal. It may then
+            // succeed — a table of empty raw segments is a legal, if pointless,
+            // payload — so only the bound's own message is forbidden here.
+            bad[5..9].copy_from_slice(&(fits as u32).to_le_bytes());
+            if let Err(e) = decode(&bad) {
+                let err = e.to_string();
+                assert!(
+                    !err.contains("implausible segment count"),
+                    "len {len} refused a count that fits: {err}"
+                );
+            }
+        }
+    }
+
     /// The point of the transform, on data shaped like a real file: headers and
     /// side info are structured, spectral data is not. Separating them has to
     /// make the structured part compressible.
@@ -868,7 +927,10 @@ fn corpus() {
         let enc = match encode(&data) {
             Ok(v) => v,
             Err(e) => {
-                println!("{:<26} refused: {e}", p.file_name().unwrap().to_string_lossy());
+                println!(
+                    "{:<26} refused: {e}",
+                    p.file_name().unwrap().to_string_lossy()
+                );
                 continue;
             }
         };
@@ -935,7 +997,12 @@ fn corpus() {
         let n = data.len();
         println!(
             "{:<26} {n:>11} {:>6.2}% {:>6.2}% {plain:>11} {split:>11} {:>6.2}%",
-            p.file_name().unwrap().to_string_lossy().chars().take(26).collect::<String>(),
+            p.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .chars()
+                .take(26)
+                .collect::<String>(),
             hdr as f64 * 100.0 / n as f64,
             side as f64 * 100.0 / n as f64,
             (plain as f64 - split as f64) * 100.0 / plain as f64,

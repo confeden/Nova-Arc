@@ -10,10 +10,9 @@
   blake3-128 dedup+integrity, MessagePack+zstd manifest, 80-byte offset-bound
   footer, generation counter, resumable crash recovery, rw-open truncates the
   uncommitted tail, `compact` verifies then replaces atomically. `docs/format.md`.
-- Packing pipeline (`pipeline.rs`): reader hashes+dedups, worker pool
-  compresses, writer appends in submission order, byte-budget backpressure;
-  extract threads key off the archive's codecs. Global flags: `-j`,
-  `--memory`, `--eco`, `--full`; packing prints peak RAM.
+- Packing pipeline (`pipeline.rs`): reader hashes+dedups, workers compress,
+  writer appends in submission order, byte-budget backpressure; extract threads
+  key off the archive's codecs. Flags `-j`/`--memory`/`--eco`/`--full`.
 - CLI: create/add/extract/list/remove/rename/compact/info (+aliases); extract
   has `--force`/`--skip-existing` (default: refuse to clobber). `rename` moves
   an entry or folder by rewriting the manifest ONLY: 77 entries in 0.053 s.
@@ -22,7 +21,7 @@
   multi-select, context menu, double-click opens from a temp dir, Explorer
   drag&drop, throttled progress, level/memory in toolbar (DEFAULT max), argv[1].
 - `test/` = playground (gitignored), benches `test/*.sh`.
-- 124 tests green (129 with `--features rar`), clippy clean in both. Covered:
+- 125 tests green (130 with `--features rar`), clippy clean in both. Covered:
   roundtrip/append/dedup/replace/remove/rename/selective extract · crash
   recovery, torn manifest, embedded+forged footer, writer lock · overwrite
   policy, pre-1970 mtime, zip-slip · progress contract, decode lanes · every
@@ -48,21 +47,19 @@
   the reader took off disk, up to an in-flight budget ahead. Monotone, never
   above the total, equal to it exactly once — the single `Phase::Done` reading,
   others clamped to total-1 so "100%" structurally means finished. INVARIANT:
-  never hold the Reporter mutex while entering the pipeline, or the reader
-  sleeps in `Budget::acquire` holding it and stalls the writer. Throttling in
-  core, clocks in the GUI — do NOT add a timer thread to core.
+  never hold the Reporter mutex while entering the pipeline or the reader
+  sleeps in `Budget::acquire` holding it. Throttle in core, clock in the GUI.
 - Memory model: `budget ≈ 32 MiB base + workers × (tables + 8 MiB) + queued`;
   workers capped by budget, in-flight bytes by workers (table cost per tier
   in `Tier::worker_memory()`). Chunk hash = blake3(uncompressed)[..16]:
   dedup AND integrity; dead records stay as dedup sources until compact.
 - INTRA-FILE DECODE LANES. Threads the file count cannot use become lanes
   INSIDE each file (`lanes_per_worker = budget / workers`), so a one-file
-  archive stops using one thread while total concurrency, memory, ordering,
-  overwrite policy and mtime all stay put. enwik8 at normal 4.80 → **1.63 s**.
-  GROUP BY DISTINCT UNIT, not by extent: consecutive extents usually share a
-  unit and the sequential path got that free from `UnitCache`; per extent it
-  decoded the same unit once per lane, enwik8 4.8 → 8.2 s. Running out of
-  handles means fewer lanes, not an error.
+  archive stops using one thread while concurrency, memory, ordering, overwrite
+  policy and mtime all stay put. enwik8 at normal 4.80 → **1.63 s**. GROUP BY
+  DISTINCT UNIT, not by extent: consecutive extents usually share a unit and
+  the sequential path got that free from `UnitCache`; per extent it decoded the
+  same unit once per lane, enwik8 4.8 → 8.2 s. Fewer handles, fewer lanes.
 - PPMd7 order (10) and pool formula (32x chunk, cap 64 MiB) are FORMAT CONSTANTS
   — not stored per chunk, so changing them breaks old archives. Order 10 beat
   12/16: a pool-exhaustion restart costs more than depth gains.
@@ -78,12 +75,11 @@
 - BCJ always runs with start_offset 0, never the chunk's file position, or
   position-dependent output breaks dedup. Cost: one instruction per boundary.
 - Solid blocks: files < `Geometry::chunked_from` (256 KiB fast/normal, 1 MiB
-  MAX) are sorted by extension, concatenated into `Geometry::unit` streams
-  (4/16/32 MiB), compressed as ONE unit. Size is bounded ON PURPOSE: editing one
-  member rewrites one block. Cuts are content-defined per file with a hard flush
-  at 2x target, so realized blocks run LARGER than target, never smaller.
-- A content-defined cut may only fire at or above HALF the target: the low tail
-  is loss and it destabilised boundaries. MEASURED both ways.
+  MAX) sort by extension into `Geometry::unit` streams (4/16/32 MiB), one unit
+  each — bounded ON PURPOSE, so editing a member rewrites one block. Cuts are
+  content-defined per file with a hard flush at 2x target, so blocks run LARGER
+  than target, never smaller; a cut may fire only at or above HALF the target,
+  the low tail being loss that also destabilised boundaries. MEASURED both ways.
 - A unit's codec+filter come from a BYTE-MAJORITY VOTE of the per-file verdicts,
   never the head sample (`Packer::unit_plan`): one sub-4 KiB `.flac` ahead of
   `.go` made the head say "already compressed" and 8.36 MB was stored raw. Only
@@ -372,8 +368,13 @@
     that line knows the number reaching the manifest, and `verify_chunk`
     REFUSES a coded length above the cap — an unchecked one is an archive nova
     writes and cannot extract. Per-filter budgets do not substitute
-    (`deflate_encode` charged plaintexts, not container bytes). And never size
-    a Vec from a count a payload claims: grow as records parse.
+    (`deflate_encode` charged plaintexts, not container bytes).
+  · NEVER SIZE A Vec FROM A COUNT A PAYLOAD CLAIMS — grow as records parse, and
+    bound the count by the RECORD SIZE, not the buffer length. `n<=data.len()`
+    read as safe in `mp3::decode` and was 5x too loose (record 5 B, table entry
+    16), so a chunk at the 256 MiB cap asked for 4 GiB — and Rust ABORTS on
+    allocation failure while `verify_chunk` runs `unapply` BEFORE the blake3
+    gate, so the archive picks the crash. Found by review, not by tests.
 - TRAPS that would each have shipped a SILENT mis-decode; the next
   length-changing filter meets every one again. The store fallback must compare
   against the ORIGINAL length and reset the coded length, not just the filter
