@@ -20,15 +20,14 @@
   remove/compact, virtualized list with glyphs + unit badges, sortable columns,
   multi-select, context menu, double-click opens from a temp dir, Explorer
   drag&drop, throttled progress, level/memory in toolbar (DEFAULT max), argv[1].
-- `test/` = playground (gitignored), benches `test/*.sh`.
 - 138 tests green (143 with `--features rar`), clippy clean in both. Covered:
   roundtrip/append/dedup/replace/remove/rename/selective extract · crash
   recovery, torn manifest, embedded+forged footer, writer lock · overwrite
   policy, pre-1970 mtime, zip-slip · progress contract, decode lanes · every
   filter round-trip (deflate/JPEG/PDF/PCM/split .wav/MP3) · legacy fixtures.
-- Compression v2 DONE: codec+filter per class, solid blocks by extension,
-  LZMA2 + PPMd7 + bsc, BCJ x86 + delta (BCJ verified against liblzma).
-- Peak RAM tracks `--memory` on EXTRACT (256M→153 MiB, default→1.0 GiB).
+- Compression v2 DONE: codec+filter per class, solid blocks by extension, LZMA2
+  + PPMd7 + bsc, BCJ x86 + delta (BCJ verified against liblzma).
+- Peak RAM tracks `--memory` on EXTRACT only (256M→153 MiB); packing does not.
 
 ## Architecture & invariants
 
@@ -102,8 +101,8 @@
 - Precompressed magic does NOT mean store — it claims a FORMAT, not bytes;
   storing on it alone cost 1.12 MB on a 4.93 MiB corpus. A 1 MiB zstd-1 trial
   must save >= 1%: compressible deflate lands at −3.9..−25.6%, finished data at
-  +0.00..0.01%. Memory invariant: ops bounded by a few MAX_CHUNK buffers plus
-  the manifest — weak-PC extraction is a hard requirement.
+  +0.00..0.01%. EXTRACTION memory is bounded by a few MAX_CHUNK buffers plus the
+  manifest, and that is a hard requirement; packing is not (see filter 40).
 - Archive paths: relative, UTF-8, '/'-separated; `paths::sanitize` on extract
   rejects traversal/absolute/drive/ADS/reserved-device/trailing-dot names.
   EVERY writer (.nva and foreign alike) walks inputs through the one
@@ -225,6 +224,7 @@
 
 ## Recompression — DEFLATE, JPEG and PDF ARE LANDED (research 02, measured here)
 
+- `test/` = playground (gitignored), benches `test/*.sh`.
 - Corpora (public + SHA-pinned): `test/precomp-web`, `test/audio-pub`/`-pub-wav`,
   `test/mp3-pub`. Local: `test/incompress` (control), `test/photos`,
   `test/zipphoto`, `test/pdfs`, `test/firefox`. Probes: `test/probe-preflate`
@@ -232,41 +232,43 @@
   Photos are Commons unpinned and PDFs printed here; README says so PER CORPUS.
   · COMMONS THROTTLES BULK FETCHES HARD (429; six retries at 120 s were not
     enough for seven files). `fetch-audio.py` resumes; bulk wants archive.org.
-- MIN_STREAM = 64 B, MEASURED; 4096 cost 15 points. "A record cannot pay for
-  itself on 2 KB" is true per FILE, false inside a unit.
+- MIN_STREAM = 64 B, MEASURED; 4096 cost 15 points ("a record cannot pay for
+  itself on 2 KB" is true per FILE, false inside a unit).
 - REPRODUCIBLE DEFLATE CORPUS: `test/precomp-web`, 93,399,733 B in 29 files.
   nova max **60,703,266 (65.0%)** vs the best of the rest (zpaqfranz -m5
   86,761,587) — **−30.0%**, repeatable by anyone.
-  · The cap is charged PER STREAM (per unit, one oversized member made the
-    WHOLE unit bail and lost its neighbours' gain).
+  · The cap is charged PER STREAM: per unit, one oversized member made the
+    WHOLE unit bail and lost its neighbours' gain.
   · fast lands at 99.7% and that is CORRECT: PNG-filtered scanlines do not beat
     the original deflate under zstd-3.
 - CHUNKED CONTAINER SHIPPED as filter id 40 (`NDf3`): a deflate stream is
-  modelled in as many preflate passes as the budget allows, and the compressed
-  tail the budget never reached is stored verbatim, so an oversized stream costs
-  PART of its gain instead of all of it. precomp-web 74,865,900 → **60,703,266
-  (−18.9%)**, entirely because `binutils-2.42.tar.gz` (51.9 MB, 305 MiB of
-  plaintext) went from untransformed to two-thirds transformed. Extraction is
-  byte-exact on all 29, 544.9 MiB peak (353.3 at `--memory 256M`); PACK peak
-  went 719 MiB → 1.7 GiB, which is the real price.
-  · `PlainText::text()` skips the retained dictionary, so passes CONCATENATE
-    into the plaintext with nothing duplicated — that is what makes it possible.
+  modelled in as many preflate passes as the budget allows and the compressed
+  tail it never reached is stored verbatim, so an oversized stream costs PART of
+  its gain instead of all of it. precomp-web 74,865,900 → **60,703,266
+  (−18.9%)**, all from `binutils-2.42.tar.gz` (51.9 MB, 305 MiB of plaintext)
+  going from untransformed to two-thirds transformed. Extraction is
+  byte-exact on all 29, 544.9 MiB peak (353.3 at `--memory 256M`).
+  · THE PRICE IS PACK MEMORY AND `--memory` DOES NOT BOUND IT: corpus peak
+    719 MiB → 1.7 GiB, binutils alone 1.1 GiB whether the flag says 512M or 1G,
+    because a rebuilding filter's working set is charged to nothing. Extract
+    still honours the flag. Fix = give `apply` the budget.
+  · `PlainText::text()` skips the dictionary, so passes CONCATENATE into the
+    plaintext with nothing duplicated. That is what makes any of it possible.
   · THE PASS LIMIT IS CORRECTNESS, NOT MEMORY: the parser errors `PlainTextLimit`
     if the limit falls mid-block, so it must exceed the largest deflate block —
     256 KiB and 1 MiB die at 4.7% of binutils, 4 MiB reaches 12.5%, 32 MiB 14.8%.
   · STOP BEFORE THE BUDGET, NOT AFTER. Stopping at `>= budget` overshoots by one
     pass, and the cap check then discarded the WHOLE stream — the feature looked
     finished and was worth 7,767 B on the corpus until this was found.
-  · A pass may also just FAIL (prediction, on streams whose matches are all at
-    short distances). EVERY failure mode ends the walk and keeps the prefix,
-    byte-exact — verified, not assumed.
+  · A pass may also just FAIL to predict. EVERY failure mode ends the walk and
+    keeps the prefix, byte-exact — verified, not assumed.
 - STORED ZIP ENTRIES ARE SCANNED TOO — a zip does not deflate what deflate
   cannot help, so a photo backup STORES its JPEGs and skipping method-0 threw
   away the archive's best data. `zip` hands such an entry back to `dispatch`
   (depth 3); a bare JPEG only at depth > 0, at the top it is filter 35's.
-  · MEASURED on six camera photos zipped with Store: 17,326,548 →
-    **13,992,258** vs the best of the rest 16,854,983 — **−17.0%** where we
-    used to store it too. Only 27,781 B on the public corpus.
+  · MEASURED on six camera photos zipped with Store: 17,326,548 → **13,992,258**
+    vs the best of the rest 16,854,983 — **−17.0%**. Only 27,781 B on the
+    public corpus.
 - JPEG (lepton, id 35) SHIPPED. 6 camera JPEGs: best of the rest 16,844,561 ·
   **nova 13,990,872 (−16.9%)**.
   · The stored payload is the LEPTON FORM ITSELF: already entropy-coded, no
@@ -510,10 +512,9 @@
 
 - Not preserved: empty dirs, symlinks, NTFS attrs/ADS, ACLs, sub-second mtime —
   a restored tree is a DIFFERENT tree and nothing warns. (Long Windows paths ARE
-  fine: 341/398/683 chars pass create/list/extract.) Manifest in RAM; no trained
-  dictionaries; outer extraction is per FILE; `--eco`/`--full` not measured on
-  load. NO `nova test` verb, and extract dies on the first bad chunk instead of
-  skipping it — 7z/rar/zpaqfranz all have `t`.
+  fine: 341/398/683 chars pass.) Manifest in RAM; no trained dictionaries; outer
+  extraction is per FILE; `--eco`/`--full` not measured on load. NO `nova test`
+  verb, and extract dies on the first bad chunk instead of skipping it.
 - Progress granularity at max is bounded by the UNIT COUNT, not fixable in the
   reporter: ~6 units compress in PARALLEL, so between completions there is
   nothing finished to report (~38 s of a ~70 s pack). The UI answers with
