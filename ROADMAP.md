@@ -175,18 +175,16 @@
   file's own blake3): a size-accumulator rule cost 17 MiB for a one-line edit,
   because one file's length shifted every later boundary.
 - RECORD-WIDTH FILTER: the detector proposes from entropy, `pays_off` decides,
-  and BOTH of its terms are load-bearing. It judges on the WHOLE 1 MiB head — a
-  Firefox XML unit read as 4-byte records in its first 64 KiB and cost 176 KB
-  over the rest — and it TRIALS WITH BSC from normal up, zstd only at fast.
+  BOTH terms load-bearing. It judges on the WHOLE 1 MiB head (a Firefox XML unit
+  read as 4-byte records in its first 64 KiB cost 176 KB over the rest) and it
+  TRIALS WITH BSC from normal up, zstd only at fast.
   · Gating the detector on "already compresses" cost 27% on 16-bit stereo PCM,
     which lands at 82% unfiltered and so never met the filter. Gate removed:
-    decoded music 439,050,506 → **341,071,616 (−22.3%)**, which is 0.5% BELOW
-    7z -mx9's 342,942,386 where we had been 28% ABOVE it; source tree −0.19%,
-    every other corpus byte-identical.
+    music 439,050,506 → **341,071,616 (−22.3%)**, 0.5% BELOW 7z -mx9's
+    342,942,386 where we had been 28% ABOVE; everything else near-identical.
   · A ZSTD VERDICT CANNOT SPEAK FOR BSC and no threshold fixes it. 1 MiB heads,
     zstd margin / bsc margin: x-ray −25.7% / **+0.9%**, mr −12.4 / +1.6, sao
-    −0.7 / +5.6, .wav −20.5 / **−28.7** — x-ray's zstd margin is the LARGER one,
-    so no threshold picks right (by zstd the filter costs 0.77% on Silesia).
+    −0.7 / +5.6, .wav −20.5 / **−28.7** — x-ray's zstd margin is the LARGER one.
 - WHERE WE STAND (`test/bench-std.sh`, max tier; competitors predate bsc).
   · enwik8  nova **21,506,314** · zpaq -m5 19,625,056 · kanzi -l9 20,035,684 ·
     7z -mx9 24,799,487 · xz 24,831,656
@@ -217,42 +215,36 @@
     normal. libbsc is C++ and nova-core forbids unsafe, hence its own crate.
 - Cut floor + byte-majority verdict on test/corpus: fast −7.6%, normal −0.2%,
   max −4.0%. The fast win is the VOTE (the floor ALONE made fast 5.1 MB worse).
-  Edit cost at max is ~4.7 MiB and ~40 s — the edited file lives in a 30-60 MB
-  unit; cheap edits are a fast/normal property (0.73 / 3.30 MiB).
-  nova's LZMA2 is 0.24% BETTER than liblzma -9e on identical boundaries.
+  Edit cost at max ~4.7 MiB / ~40 s — cheap edits are a fast/normal property
+  (0.73 / 3.30 MiB). nova's LZMA2 is 0.24% BETTER than liblzma -9e.
 - MANIFEST CODEC: a manifest >= 128 KiB is offered to LZMA2 and the smaller
   wins (682,799 B raw: zstd 19 84,565 vs LZMA2 74,690). The codec is read off
   the BYTES — a zstd frame starts 28 B5 2F FD, a raw LZMA2 stream never can —
-  so there is no format field and every manifest ever written still decodes.
-  Diagnostics: `NOVA_UNIT_TRACE=<file>` logs one line per unit as it is built
-  (the cut reason exists only at pack time); `nova info --units` the rest.
+  so there is no format field. Diagnostics: `NOVA_UNIT_TRACE=<file>` logs a line
+  per unit as it is built (the cut reason exists only then); `info --units`.
 
 ## Recompression — DEFLATE, JPEG and PDF ARE LANDED (research 02, measured here)
 
-- Corpora: `test/precomp-web` + `test/audio-pub`/`-pub-wav` (public, SHA-pinned),
-  `test/incompress` (control, must stay stored), `test/photos`, `test/zipphoto`
-  (same photos, zipped Store), `test/pdfs`, `test/firefox`. Probes in
+- Corpora (public + SHA-pinned): `test/precomp-web`, `test/audio-pub`/`-pub-wav`,
+  `test/mp3-pub`. Local: `test/incompress` (control, must stay stored),
+  `test/photos`, `test/zipphoto`, `test/pdfs`, `test/firefox`. Probes in
   `test/probe-preflate` and `test/size-probe`. `/test/` is ignored EXCEPT the
-  recipe — manifests, fetch scripts, harnesses — a reproducibility claim nobody
-  can open is not one. Photos are Commons unpinned and PDFs printed here;
-  README says so PER CORPUS, do not regress it into "all public".
+  recipe — a reproducibility claim nobody can open is not one. Photos are
+  Commons unpinned and PDFs printed here; README says so PER CORPUS.
   · COMMONS THROTTLES BULK FETCHES HARD (429; six retries at 120 s were not
     enough for seven files). `fetch-audio.py` resumes; bulk wants archive.org.
-- MIN_STREAM = 64 bytes, MEASURED; 4096 cost 15 points. "A record cannot pay
-  for itself on 2 KB" is true per FILE, false inside a unit. `preflate-rs 0.7.6`
-  is byte-exact on every file of both corpora.
-- REPRODUCIBLE DEFLATE CORPUS, and it earns its keep: `test/precomp-web`,
-  93,399,733 B in 29 files (Python docs zip, GNU tar.gz, Maven jar, epub, apk,
-  the 24 Kodak PNGs). nova max **74,865,900 (80.2%)** against the best of the
-  rest — zpaqfranz -m5 86,761,587, 7z -mx9 86,991,164 — **−13.7%**, by anyone.
-  · A SECOND CEILING: 28 of 29 units transform; `binutils-2.42.tar.gz` FITS the
-    solo cap at 51,892,456 B yet is refused, expanding to 319,897,600 B past
-    `MAX_CODED_CHUNK` (256 MiB) — a bound that scales with how well the payload
-    compresses, so it bites hardest where recompression pays most. Now charged
-    PER STREAM (per unit, one oversized member made the WHOLE unit bail and
-    lost its neighbours' gain); binutils is a lone stream. See Plans 1.
-  · fast lands at 99.7% here and that is CORRECT: PNG-filtered photographic
-    scanlines do not beat the original deflate under zstd-3.
+- MIN_STREAM = 64 B, MEASURED; 4096 cost 15 points. "A record cannot pay for
+  itself on 2 KB" is true per FILE, false inside a unit.
+- REPRODUCIBLE DEFLATE CORPUS: `test/precomp-web`, 93,399,733 B in 29 files.
+  nova max **74,865,900 (80.2%)** vs the best of the rest (zpaqfranz -m5
+  86,761,587) — **−13.7%**, repeatable by anyone.
+  · 28 of 29 units transform; `binutils-2.42.tar.gz` FITS the solo cap at
+    51,892,456 B yet is refused, expanding to 319,897,600 B past the caps — a
+    bound that scales with how well the payload compresses, so it bites hardest
+    where recompression pays most. The cap is now charged PER STREAM (per unit,
+    one oversized member made the WHOLE unit bail). See Plans 1.
+  · fast lands at 99.7% here and that is CORRECT: PNG-filtered scanlines do not
+    beat the original deflate under zstd-3.
 - STORED ZIP ENTRIES ARE SCANNED TOO — a zip does not deflate what deflate
   cannot help, so a photo backup STORES its JPEGs and skipping method-0 threw
   away the archive's best data. `zip` hands such an entry back to `dispatch`
@@ -510,11 +502,12 @@
 
 ## Open issues
 
-- Not preserved: empty dirs, symlinks, NTFS attrs/ADS, ACLs. Manifest in RAM;
-  long Windows paths untested. Solid-block members are read whole into RAM at
-  pack time. No trained dictionaries; a container past the solo cap is
-  recompressed only if audio (Plans 1). Outer extraction is per FILE;
-  `--eco`/`--full`/EcoQoS built, not measured on load.
+- Not preserved: empty dirs, symlinks, NTFS attrs/ADS, ACLs, sub-second mtime —
+  a restored tree is a DIFFERENT tree and nothing warns. (Long Windows paths ARE
+  fine: 341/398/683 chars pass create/list/extract.) Manifest in RAM; no trained
+  dictionaries; outer extraction is per FILE; `--eco`/`--full` not measured on
+  load. NO `nova test` verb, and extract dies on the first bad chunk instead of
+  skipping it — 7z/rar/zpaqfranz all have `t`.
 - Progress granularity at max is bounded by the UNIT COUNT, not fixable in the
   reporter: ~6 units compress in PARALLEL, so between completions there is
   nothing finished to report (~38 s of a ~70 s pack). The UI answers with
@@ -527,24 +520,31 @@ NOVA/NOVAEND1, extension `.nva`, binary `nova`, GUI `nova-prism`. Standing
 direction (owner): beat 7-Zip where it has NOTHING, not out-tune LZMA.
 Remaining, in measured order of value:
 
-1. FIXED the multi-stream half (per-stream cap, above). The single-stream
-   half is UNSOLVED: WAV-style splitting does not generalise — preflate-rs
-   only returns reconstruction parameters for its FIRST chunk, so one lone
-   stream (`binutils-2.42.tar.gz`) cannot be cut. Left: a format change.
+1. THE BIGGEST MEASURED WIN LEFT, and its recorded blocker was FALSE. "preflate
+   only returns parameters for its FIRST chunk, so one lone stream cannot be
+   cut" is wrong: `PreflateStreamProcessor::{decompress,shrink_to_dictionary}`
+   and `RecreateStreamProcessor::recompress` are public in 0.7.6 and upstream's
+   own `verify_decompress_partial_gzip_deflate_body_roundtrip` does a two-call
+   decompress + recompress byte-exactly. NO format change needed — an
+   `add_deflate_split` on the model of `add_wav_split`. Worth 21,880,873 B on
+   `binutils-2.42.tar.gz` alone (precomp-web 80.2% → ~56.7%). A SECOND CAP also
+   hides here: `container_encode_inner` takes `PreflateConfig::default()`, whose
+   `plain_text_limit` is 128 MiB, so it bites BEFORE MAX_CODED_CHUNK and bails
+   with a silent `continue`. DESIGN FIRST, do not discover: chunk k needs 0..k-1
+   (32 KiB dictionary), which collides with dedup, decode lanes and the
+   pack-time `unapply`; and -j 1 == -j 8 must be tested on the new path.
 2. MP3: filter 39 is in, packMP3 is NOT the plan (own code, pure Rust, no LGPL
    question). NEXT IS **1b, NOT 2**, and the measurement says so: transpose the
    side info PER FIELD instead of per byte column (up to ~1.6%, and it is the
    same parse stage 2 needs). Only then the Huffman layer.
-3. CORRECTED (research 14): the 51%-of-paq8px executable headroom is
-   ALREADY SHIPPED at the filter level — BCJ2 (id 36) is research 04 §5's
-   full recommendation, dispack explicitly rejected there. What remains
-   needs a CM codec: research 14 §10's lpaq/TPAQ tier, 41.5-43 MiB on
-   Silesia (today ~49.3), 2x slower, 1-3 GiB/worker. Owner call first.
+3. CORRECTED (research 14): the 51%-of-paq8px executable headroom is ALREADY
+   SHIPPED at the filter level — BCJ2 (id 36) is research 04 §5's full
+   recommendation. What remains needs a CM codec (research 14 §10's lpaq/TPAQ,
+   2x slower, 1-3 GiB/worker), which the speed and memory budgets disqualify.
 4. DONE: zip+7z+rar READ, zip WRITE, folder tree, RU, `.nva` association +
    icon + EN/RU installer (Gotchas). `create x.zip` is deflate-only on purpose
-   (interop; ratio is `.nva`'s job) and lands 0.9% above `7z -tzip -mx9` at
-   max — miniz_oxide's deflate, not a bug. LEFT: Explorer THUMBNAILS, a COM
-   handler (research 06/07); later GPU (08), encryption, ports.
+   and lands 0.9% above `7z -tzip -mx9` — miniz_oxide, not a bug. LEFT:
+   Explorer thumbnails (COM, research 06/07); later GPU, encryption, ports.
 
 NOT on this list, deliberately: bigger units for solidity on executables, and
 BCJ2-style per-site probability. PRICED and rejected — see Recompression.
