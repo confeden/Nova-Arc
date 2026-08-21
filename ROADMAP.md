@@ -206,11 +206,11 @@
   DECODE is data-dependent: Silesia 1.8 s vs kanzi -l9's 50.5 s; enwik8 4.6 s.
 - kanzi -l7: Silesia 47,308,780 B in 6.15 s, the fast tier's bar. Its default
   `-j` is HALF the cores, so bench-std gave it 4 threads against our 8.
-  · enwik8 block sweep: 8 MiB 23,593,148 · 32 21,983,674 · 128 20,803,016 — MILD
-    on text. Source tree is the OPPOSITE: bsc -b32 13,474,736 vs our 9,292,017.
   · SHIPPED as codec id 4 (`crates/nova-bsc`, libbsc 3.3.12, Apache-2.0), a
     fourth MAX candidate: enwik8 22,466,101 → **21,506,314 (−4.3%)**, Silesia
     43,674,657 → **43,036,408 (−1.5%)**, source tree UNCHANGED. Encode +8%.
+    Block size is MILD on text (32→128 MiB is −5.4%) and decisive on a file
+    tree, which is why the tournament, not a global setting, picks it.
   · Wiring: `bsc_qlfc_init_model` memcpy's the global model per call, so workers
     are safe after one `bsc_init`. `bwt.cpp`/`st.cpp` include their CUDA headers
     UNCONDITIONALLY — vendor both. Windows needs `advapi32`; C and C++ need
@@ -231,8 +231,7 @@
   max −4.0%. The fast win is the VOTE (the floor ALONE made fast 5.1 MB worse).
   Edit cost at max is ~4.7 MiB and ~40 s — the edited file lives in a 30-60 MB
   unit; cheap edits are a fast/normal property (0.73 / 3.30 MiB).
-- nova's LZMA2 is 0.24% BETTER than liblzma -9e on identical boundaries; a max
-  run over test/corpus realizes 6 units averaging 41.42 MiB.
+  nova's LZMA2 is 0.24% BETTER than liblzma -9e on identical boundaries.
 - MANIFEST CODEC: a manifest >= 128 KiB is offered to LZMA2 and the smaller
   wins (682,799 B raw: zstd 19 84,565 vs LZMA2 74,690). The codec is read off
   the BYTES — a zstd frame starts 28 B5 2F FD, a raw LZMA2 stream never can —
@@ -357,11 +356,9 @@
   the length the CODEC produced; `unpacked` keeps its one meaning forever, the
   ORIGINAL length that `hash` covers and `Extent` indexes. `lzma2_dict_size` and
   `ppmd7_mem_size` must derive from the CODED length on both sides or every
-  existing archive stops decoding. `Filter::apply` returns `Applied::{InPlace,
-  Rebuilt}` because the store fallback must undo the first and NOT the second.
-  Ids 34/35/37 pin library versions; an upgrade spends a NEW id. A recompressible
-  file gets a unit of ITS OWN (>= 64 KiB, <= 2x unit): the scanners each need
-  one whole container.
+  existing archive stops decoding. Ids 34/35/37 pin library versions; an upgrade
+  spends a NEW id. A recompressible file gets a unit of ITS OWN (>= 64 KiB,
+  <= 2x unit): the scanners each need one whole container.
 - SAFETY, enforced not intended: the packer round-trips every rebuilt unit and
   falls back on any mismatch; a filter that refuses is a fallback; the
   transformed form may not exceed `MAX_CODED_CHUNK` (256 MiB), charged as pieces
@@ -372,16 +369,15 @@
     an archive nova writes and cannot extract. Per-filter budgets do not
     substitute (`deflate_encode` charged plaintexts, not container bytes). And
     never size a Vec from a count a payload claims: grow as records parse.
-- TRAPS that would each have shipped a SILENT mis-decode. Recorded because the
-  next length-changing filter meets every one again: the store fallback must
-  compare against the ORIGINAL length and reset the coded length, not just the
-  filter byte · an in-place filter MUST be unapplied on that fallback and a
-  rebuilt one MUST NOT, which is why `Applied` exists · widening the delta range
-  to reach a new id makes it decode as `Delta(id-1)` · the deflate class cannot
-  be decided from the head, a zip's central directory is at the END · PPMd7's
-  pool must match EXACTLY and saturates at both ends, so a length bug passes on
-  big units and fails only in a band, while LZMA2 with a narrow window fails as
-  intermittent corruption.
+- TRAPS that would each have shipped a SILENT mis-decode; the next
+  length-changing filter meets every one again. The store fallback must compare
+  against the ORIGINAL length and reset the coded length, not just the filter
+  byte · an in-place filter MUST be unapplied on that fallback, a rebuilt one
+  MUST NOT (hence `Applied`) · widening the delta range for a new id makes it
+  decode as `Delta(id-1)` · the deflate class cannot be decided from the head,
+  a zip's central directory is at the END · PPMd7's pool must match EXACTLY and
+  saturates at both ends, so a length bug passes on big units and fails only in
+  a band, while LZMA2 with a narrow window fails as intermittent corruption.
 - COMPAT FIXTURES: `tests/fixtures/legacy-{max,normal,ppmd}.nva` are real
   pre-recompression archives, extracted in full by one test — any change to the
   derived LZMA2 window or PPMd7 pool is caught there and NOWHERE else. Their
@@ -472,16 +468,20 @@
 - BENCHMARK SET is plural, not just 7-Zip: 7z -mx9, xz -9e, brotli -q11, kanzi
   -l7/-l9, zpaqfranz -m4/-m5, binaries in `D:/Programs/compressors` (WinRAR
   too — the only thing that can make a .rar fixture). Corpora must be STANDARD
-  so our sizes sit beside published ones; improvised ones only for the
-  recompression differentiator. Harness: `test/bench-std.sh`.
+  so our sizes sit beside published ones. STANDING RULE (owner): prefer data
+  anyone can fetch by link, for benches AND development, so a published number
+  is checkable off this machine. A private corpus is a last resort and must be
+  labelled as one. Harness: `test/bench-std.sh`.
+- Industry adoption (installers using the max tier as "PRISM"): plan and
+  blockers in `docs/research/17-installer-integration.md`. Not scheduled.
 - Speed budget: not much slower than 7z -mx9. This DISQUALIFIES cmix, paq8px,
   nncp and every LLM compressor by construction, not by taste. They stay as a
   CEILING reference — how much redundancy is left — never as a target.
 - SCALING is an owner requirement at BOTH ends: work well on ONE core, use 8+
   efficiently — and threads must not cost ratio. Most archivers cut data into
   smaller blocks and pay per thread; nova's unit size comes from the geometry,
-  so output must be BYTE-IDENTICAL at -j 1 and -j 8. `test/scaling.sh`. (kanzi
-  numbers here are the C++ build, flanglet/kanzi-cpp, not Go/Java.)
+  so output must be BYTE-IDENTICAL at -j 1 and -j 8 (`test/scaling.sh`; kanzi
+  numbers are the C++ build, flanglet/kanzi-cpp, not Go/Java).
 - SCALING (Silesia, `test/scaling.sh`, 1→8 threads, before bsc): nova 170.20 →
   45.85 s = **x3.71**, BYTE-IDENTICAL at every count · kanzi -l9 x3.90, identical
   · 7z -mx9 x1.79 and its output GROWS 1,407 B past one thread · xz x1.04. THE
@@ -490,9 +490,9 @@
   list has it taking 4 Firefox units and 5 PDF ones.
 - MEMORY LOCALITY is an owner direction and the same question as scaling: a
   max-tier worker's LZMA2 table (~370 MB) or PPMd7 pool (256 MB) is 10-20x an
-  8-core desktop's L3, so max packing is memory-bandwidth-bound BY CONSTRUCTION.
-  The scaling curve is the diagnostic; prefer cache-sized structures where ratio
-  allows; stop whole-buffer copies (`compress_job` clones the unit to verify).
+  8-core L3, so max packing is memory-bandwidth-bound BY CONSTRUCTION. The
+  scaling curve is the diagnostic; prefer cache-sized structures where ratio
+  allows; stop whole-buffer copies (`compress_job` clones a unit to verify).
 - Chat with owner in Russian; code, docs/ and CLI output in English. EXCEPTIONS,
   both owner-set: README.md and CHANGELOG.md are RUSSIAN. GUI ships RU too.
 - CHANGELOG.md: `# История изменений`, `## [X.Y.Z]` newest first, flat bullets
