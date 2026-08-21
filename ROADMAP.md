@@ -9,6 +9,8 @@ than out-tuning LZMA. Pre-1.0; format may still change.
 |---|---|---|---|
 | S1 | Container: append-only log, dedup, crash recovery, compact | ok | 138 tests, clippy clean |
 | S2 | Compression v2: 4-codec per-unit tournament, filters, solid blocks | ok | `test/bench-std.sh` |
+| S11 | Multi-core wall clock vs the field (D12's metric) | **broken on general data** | kanzi -l9 is smaller AND 2.4-6x faster; `test/mt-bench.sh` |
+| S12 | Extraction wall clock | ok | Silesia 1.9 s, enwik8 3.0 s — 5-80x the CM field, level with 7-Zip |
 | S3 | Recompression filters 34-40 (deflate/JPEG/PDF/WAV/MP3/chunked) | ok | corpora below, all byte-exact |
 | S4 | Foreign formats: zip+7z+rar read, zip write | ok | `basic.rs` round-trips |
 | S5 | GUI (Tauri 2), RU, folder tree, drag&drop, `.nva` association | ok | run and used |
@@ -120,12 +122,13 @@ Paths are repo-relative. `file:line` where the file is over ~800 lines.
 - **D3** `.gitignore` is NOT tracked; rules live in `.git/info/exclude`.
 - **D4** Speed budget: not much slower than `7z -mx9`. Disqualifies cmix/paq8px/nncp BY CONSTRUCTION; they stay a ceiling reference. Together with the memory budget it also closes the whole mid-weight CM class — N21, not just those three names.
 - **D5** Benchmark set is plural (7z, xz, brotli, kanzi, zpaqfranz) on STANDARD corpora; prefer data anyone can fetch by link. A private corpus must be labelled one.
-- **D6** Scaling matters at both ends: work on ONE core, use 8+, and threads must not cost ratio (I8).
+- **D6** Scaling matters at both ends, but not equally — see D12. Threads must never cost ratio (I8).
 - **D7** Chat with the owner in Russian; code, `docs/` and CLI output in English. README.md and CHANGELOG.md are RUSSIAN; the GUI ships RU.
 - **D8** CHANGELOG: `## [X.Y.Z]` newest first, flat bullets, NO DATES.
 - **D9** The differentiator, in order: recompress what is already compressed → per-file method choice → editing without repack.
 - **D10** Installers call the max tier **`nova`**; PRISM dropped (NSA-programme collision, live Prism/Prisma marks).
-- **D11** No LICENSE yet — the owner will choose one before the first release. It already costs real ratio: every LGPL recompressor is off the table while it is open (N20).
+- **D11** No LICENSE yet — the owner will choose one before the first release.
+- **D12** MULTI-CORE IS THE BENCHMARK, single-core is not. This is a modern archiver: on a machine with cores we should be AHEAD of the competition on wall clock, and that is what to measure and optimise. One core is a weak-machine sanity check where being SLOWER is acceptable — it must work well, not win. Supersedes the old framing that read "the weakness is one core"; a candidate is no longer disqualified for costing encode CPU if that CPU parallelises, and a candidate that only saves single-core time is worth much less than it looked. It already costs real ratio: every LGPL recompressor is off the table while it is open (N20).
 - Full reasoning: `kb/decisions.md`.
 
 ## Now
@@ -144,6 +147,7 @@ independence — price it before building (P1).
 ## Next
 | ID | Task | Why / blocked on |
 |---|---|---|
+| P12 | **Cut tournament wall clock: pick entrants from the unit's class** | S11. Measured by a probe at +33 B over 630 MB for −27% tournament CPU, which under D12 is −27% wall clock. Does not close the kanzi gap alone (enwik8 83.4 s → ~61 s against its 14.0 s) but it is the cheapest move and it costs no ratio. Verify the +33 B claim in the real packer first — N24 is the warning about probes that do not survive it |
 | P11 | **Split tar members before unit formation** | MEASURED −8.6% on Silesia's mozilla, −1.1% on samba, −2.75% on Silesia overall; gap to zpaqfranz +7.95% → +4.98%. A tarball switches off BOTH differentiators — per-file method AND nested recompression — and the win comes from the second: eleven jar/deflate units became visible. Compounds with filter 40, which now recovers a 305 MiB tar and hands it over whole. `kb/compression.md#p11` |
 | P1 | Decide whether deflate passes may span units | worth ~7.3 MB more on binutils; costs unit independence, which random access and decode lanes rest on |
 | P2 | `nova test` + extract that skips a bad chunk instead of dying | S9; every competitor has it and `compact` already has the machinery |
