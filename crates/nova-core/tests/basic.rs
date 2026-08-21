@@ -1264,7 +1264,11 @@ fn crc32(data: &[u8]) -> u32 {
     for (i, e) in table.iter_mut().enumerate() {
         let mut c = i as u32;
         for _ in 0..8 {
-            c = if c & 1 != 0 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
+            c = if c & 1 != 0 {
+                0xEDB8_8320 ^ (c >> 1)
+            } else {
+                c >> 1
+            };
         }
         *e = c;
     }
@@ -1301,8 +1305,16 @@ fn a_wav_past_the_solo_cap_is_split_and_round_trips() {
             seed ^= seed >> 7;
             seed ^= seed << 17;
             let d = (seed >> 48) as i16 % 28;
-            v.extend_from_slice(&(((t * 0.0107).sin() * 10500.0) as i16).wrapping_add(d).to_le_bytes());
-            v.extend_from_slice(&(((t * 0.0089).cos() * 9800.0) as i16).wrapping_sub(d).to_le_bytes());
+            v.extend_from_slice(
+                &(((t * 0.0107).sin() * 10500.0) as i16)
+                    .wrapping_add(d)
+                    .to_le_bytes(),
+            );
+            v.extend_from_slice(
+                &(((t * 0.0089).cos() * 9800.0) as i16)
+                    .wrapping_sub(d)
+                    .to_le_bytes(),
+            );
         }
         v
     };
@@ -1327,8 +1339,15 @@ fn a_wav_past_the_solo_cap_is_split_and_round_trips() {
 
     // The fast tier's unit is 4 MiB, so this spans several of them, and the
     // trailing bytes have to survive on the last piece.
-    let long = wav_of(&pcm(3_000_000, 0x51ED_2701_A3B4_C5D6), 1, b"loose bytes past the chunks");
-    assert!(long.len() > 8 * 1024 * 1024, "must exceed the fast tier's cap");
+    let long = wav_of(
+        &pcm(3_000_000, 0x51ED_2701_A3B4_C5D6),
+        1,
+        b"loose bytes past the chunks",
+    );
+    assert!(
+        long.len() > 8 * 1024 * 1024,
+        "must exceed the fast tier's cap"
+    );
     fs::write(src.join("long.wav"), &long).unwrap();
     // Same size, IEEE float: the split must refuse it.
     let float = wav_of(&pcm(3_000_000, 0x1122_3344_5566_7788), 3, b"");
@@ -1338,7 +1357,12 @@ fn a_wav_past_the_solo_cap_is_split_and_round_trips() {
     let mut a = Archive::create(&arc).unwrap();
     a.add_paths(std::slice::from_ref(&src), &PackOptions::new(Tier::Fast))
         .unwrap();
-    let coded: Vec<_> = a.manifest.chunks.iter().filter(|c| c.filter == 38).collect();
+    let coded: Vec<_> = a
+        .manifest
+        .chunks
+        .iter()
+        .filter(|c| c.filter == 38)
+        .collect();
     assert!(
         coded.len() >= 2,
         "the long file must be cut into several transformed pieces, got {}",
@@ -1351,12 +1375,17 @@ fn a_wav_past_the_solo_cap_is_split_and_round_trips() {
         "every byte of the .wav must be inside a transformed piece"
     );
     assert!(
-        coded.iter().all(|c| c.filtered > 0 && c.filtered < c.unpacked),
+        coded
+            .iter()
+            .all(|c| c.filtered > 0 && c.filtered < c.unpacked),
         "flac must shrink each piece"
     );
     // No unit may exceed what a reader accepts, whatever path produced it.
     assert!(
-        a.manifest.chunks.iter().all(|c| c.unpacked <= 64 * 1024 * 1024),
+        a.manifest
+            .chunks
+            .iter()
+            .all(|c| c.unpacked <= 64 * 1024 * 1024),
         "a unit above MAX_STORED_CHUNK cannot be extracted"
     );
     drop(a);
@@ -1517,4 +1546,99 @@ fn pdf_flate_streams_are_recompressed_and_still_extract() {
     let out = tmp.path().join("out");
     a.extract(&out, None, Overwrite::Fail).unwrap();
     assert_same_tree(&src, &out.join("docs"));
+}
+
+/// An MP3 goes through the plane split and comes back byte for byte.
+///
+/// The shape of a real file matters more than the audio here: an ID3v2 tag in
+/// front, a frame chain with VBR and padding, an ID3v1 trailer behind. Every
+/// one of those is a different arm of the parser, and the last two are what a
+/// filter that "just parses frames" gets wrong — everything nova does not
+/// recognise has to survive verbatim, in place.
+///
+/// The second file is the control: `.mp3` in the name, no frames in the bytes.
+/// It must be refused without damaging anything, because a refusal is a
+/// fallback and not an error.
+#[test]
+fn mp3_audio_is_plane_split_and_still_extracts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("music");
+    fs::create_dir_all(&src).unwrap();
+
+    // ID3v2.4 with one real frame, then 512 bytes of tag body.
+    let mut mp3 = b"ID3\x04\x00\x00\x00\x00\x04\x00".to_vec();
+    mp3.extend_from_slice(b"TIT2\x00\x00\x00\x08\x00\x00");
+    mp3.extend_from_slice(&[0u8; 502]);
+
+    // 1200 frames of joint-stereo 44.1 kHz, walking the bitrate and toggling
+    // the padding bit the way a VBR encoder does. Side info drifts slowly and
+    // spectral data is noise — the split is what separates them.
+    let mut seed = 0x51ED_270B_9DBC_D1F1u64;
+    let mut spectral = 0usize;
+    for i in 0..1200usize {
+        let bitrate_idx = (9 + (i / 97) % 5) as u8;
+        let pad = i % 3 == 0;
+        mp3.extend_from_slice(&[0xFF, 0xFB, (bitrate_idx << 4) | (u8::from(pad) << 1), 0x40]);
+        // 144 * kbps * 1000 / 44100 + pad, for the five indices used above.
+        let kbps = [128u32, 160, 192, 224, 256][(bitrate_idx - 9) as usize];
+        let len = (144 * kbps * 1000 / 44100) as usize + usize::from(pad);
+        for c in 0..32usize {
+            mp3.push(((i / 8) as u8).wrapping_add(c as u8));
+        }
+        for _ in 0..len - 4 - 32 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            mp3.push((seed >> 56) as u8);
+            spectral += 1;
+        }
+    }
+    mp3.extend_from_slice(b"TAG");
+    mp3.extend_from_slice(&[0x20u8; 125]);
+    fs::write(src.join("track.mp3"), &mp3).unwrap();
+
+    // Named .mp3, but there is not a frame in it.
+    let fake = rnd(300_000, 0x1234_5678);
+    fs::write(src.join("notreally.mp3"), &fake).unwrap();
+
+    let arc = tmp.path().join("a.nva");
+    let mut a = Archive::create(&arc).unwrap();
+    let stats = a
+        .add_paths(std::slice::from_ref(&src), &PackOptions::new(Tier::Max))
+        .unwrap();
+    let coded: Vec<_> = a
+        .manifest
+        .chunks
+        .iter()
+        .filter(|c| c.filter == 39)
+        .collect();
+    assert_eq!(coded.len(), 1, "exactly the file that has frames");
+    let c = coded[0];
+    assert_eq!(c.unpacked, mp3.len() as u64);
+    // A permutation, so the coded length is the original plus a segment table.
+    assert!(
+        c.filtered >= c.unpacked && c.filtered < c.unpacked + 1024,
+        "{} is not the original {} plus a small table",
+        c.filtered,
+        c.unpacked
+    );
+    // The spectral plane is noise and cannot shrink, so it is a floor nothing
+    // can go below. Everything else — 4 header bytes and 32 side-info bytes per
+    // frame, plus the tags — is structure, and the whole point of the split is
+    // that a codec can then see it. Interleaved it costs its full size; in a
+    // plane it must nearly vanish, so a quarter of it is a generous bar that
+    // an unfiltered pack (which lands at ~100% of the file) cannot clear.
+    let structure = c.unpacked - spectral as u64;
+    assert!(
+        c.packed < spectral as u64 + structure / 4,
+        "{} left too much of the {structure} structural bytes above the {spectral}-byte floor",
+        c.packed
+    );
+    assert!(stats.bytes_stored < stats.bytes_in);
+    drop(a);
+
+    let a = Archive::open_ro(&arc).unwrap();
+    let out = tmp.path().join("out");
+    a.extract(&out, None, Overwrite::Fail).unwrap();
+    assert_same_tree(&src, &out.join("music"));
 }

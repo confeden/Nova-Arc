@@ -92,13 +92,16 @@ Filter ids:
 | `36` | x86 branch targets split into their own stream | changed |
 | `37` | mixed container: deflate **and** JPEG streams | changed |
 | `38` | RIFF/WAVE integer PCM carried as FLAC | changed |
+| `39` | MPEG Layer III split into header / side-info / spectral planes | changed |
 
 An id is a promise, not a slot to reuse: 34 still decodes every archive that
 used it, and 37 — which can say what each stream *is* — is what new archives
 get. Ids 34, 35 and 37 pin the library that wrote them, so upgrading it spends
-a new id. Id 38 does not: what it stores is a standard FLAC stream plus a
-wrapper of this format's own, so the encoder may change while the decoder keeps
-reading everything ever written.
+a new id. Ids 38 and 39 do not: 38 stores a standard FLAC stream plus a wrapper
+of this format's own, and 39 stores the MPEG bytes themselves, merely
+reordered. Both carry a version byte inside the payload (`NWv1`, `NM31`), so
+the layout can grow without spending an id, while the encoder may change freely
+because the decoder keeps reading everything ever written.
 
 A length-changing filter records the coded length in `ChunkRec::filtered`;
 `unpacked` always means the ORIGINAL length, the one `hash` covers and `Extent`
@@ -202,7 +205,8 @@ Phase 1 (analysis), per file and again per unit, from the head bytes:
 | deflate container (zip, PNG, gzip, docx, PDF) | mixed container (37) | zstd | LZMA2 |
 | JPEG photograph | lepton (35) | zstd | LZMA2 |
 | RIFF/WAVE integer PCM | FLAC (38) | zstd | LZMA2 |
-| already compressed (MP3, video, 7z…) | — | store | store |
+| MPEG Layer III (.mp3) | plane split (39) | zstd | LZMA2 |
+| already compressed (video, 7z…) | — | store | store |
 | executable (PE/ELF/Mach-O) | BCJ x86 / x86 split at max | zstd | LZMA2 |
 | text / source | — | zstd | PPMd7 |
 | other, compressible | — | zstd | LZMA2 |
@@ -227,6 +231,11 @@ the `data` chunk; the pieces in between are bare PCM. Their format therefore
 cannot be re-read from the bytes and travels with the packer's plan — but it is
 written into every record, so nothing about decoding changes.
 
+An `.mp3` needs no such treatment at all: every MPEG frame carries its own
+length in its own header, so any contiguous stretch of a file can be split into
+planes on its own. It takes the ordinary chunking path at any size, and a piece
+that begins mid-frame simply starts with a raw segment.
+
 The record width is not declared anywhere, so it is inferred: the width that
 minimises the order-0 entropy of the differenced stream, then **verified** by
 compressing a sample with and without the filter and kept only if it wins by
@@ -248,9 +257,10 @@ Measured: PPMd7 is ~25% smaller than zstd-19 on prose; LZMA2 beats PPMd7 by
 gains 11-17% on database and catalogue data and 24% on 16-bit stereo PCM;
 FLAC takes another 19% off that PCM.
 
-Later milestones: MP3 recompression, and a dictionary for units created by
-`add` after the archive exists (measured at -21% to -31% there, and a net loss
-anywhere else).
+Later milestones: re-coding an MP3's spectral data rather than only moving it
+(filter 39 separates the planes; the Huffman layer is untouched), and a
+dictionary for units created by `add` after the archive exists (measured at
+-21% to -31% there, and a net loss anywhere else).
 
 ## Limits
 

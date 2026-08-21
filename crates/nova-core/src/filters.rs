@@ -76,6 +76,14 @@ pub enum Filter {
     /// that this id pins the wrapper and the DECODER, not the encoder, because
     /// what it stores is a standard FLAC stream.
     Wav,
+    /// Separate an MPEG Layer III file's frame headers and side information
+    /// from its spectral data, so the structured 8% stops being interleaved
+    /// with the incompressible 92%.
+    ///
+    /// The one audio format nobody recompresses. See `crate::mp3` — the id pins
+    /// the plane layout, not any library, because the MPEG bitstream itself is
+    /// copied through byte for byte.
+    Mp3,
     /// Undo EVERY recompressible stream in a container, deflate and JPEG alike.
     ///
     /// The successor to [`Filter::Deflate`], which only ever saw deflate. A PDF
@@ -101,6 +109,12 @@ const CONTAINER_V2: u8 = 37;
 /// Filter id for RIFF/WAVE PCM carried as FLAC. Unlike 34/35/37 this pins a
 /// decoder and a wrapper, not a library version: the payload is standard FLAC.
 const WAV_FLAC: u8 = 38;
+
+/// Filter id for the MPEG Layer III plane split. Pins nothing external — the
+/// transform is nova's own and the MPEG bytes pass through unchanged — but it
+/// does pin `crate::mp3`'s plane layout, which is why the payload carries its
+/// own `NM31` version byte as well.
+const MP3_PLANES: u8 = 39;
 
 /// Filter id for deflate recompression with preflate 0.7.x records.
 ///
@@ -145,6 +159,7 @@ impl Filter {
             Filter::X86Split => X86_SPLIT,
             Filter::Container => CONTAINER_V2,
             Filter::Wav => WAV_FLAC,
+            Filter::Mp3 => MP3_PLANES,
         }
     }
 
@@ -158,6 +173,7 @@ impl Filter {
             X86_SPLIT => Ok(Filter::X86Split),
             CONTAINER_V2 => Ok(Filter::Container),
             WAV_FLAC => Ok(Filter::Wav),
+            MP3_PLANES => Ok(Filter::Mp3),
             other => bail!("unknown filter id {other} - archive was made by a newer version"),
         }
     }
@@ -200,6 +216,10 @@ impl Filter {
                 *data = crate::wav::encode(data)?;
                 Ok(Applied::Rebuilt)
             }
+            Filter::Mp3 => {
+                *data = crate::mp3::encode(data)?;
+                Ok(Applied::Rebuilt)
+            }
         }
     }
 
@@ -218,6 +238,7 @@ impl Filter {
             Filter::X86Split => *data = x86_split_decode(data)?,
             Filter::Container => *data = deflate_decode(data)?,
             Filter::Wav => *data = crate::wav::decode(data)?,
+            Filter::Mp3 => *data = crate::mp3::decode(data)?,
         }
         Ok(())
     }
@@ -227,9 +248,12 @@ impl Filter {
     pub fn changes_length(self) -> bool {
         match self {
             Filter::None | Filter::BcjX86 | Filter::Delta(_) => false,
-            Filter::Deflate | Filter::Jpeg | Filter::X86Split | Filter::Container | Filter::Wav => {
-                true
-            }
+            Filter::Deflate
+            | Filter::Jpeg
+            | Filter::X86Split
+            | Filter::Container
+            | Filter::Wav
+            | Filter::Mp3 => true,
         }
     }
 }
@@ -865,7 +889,9 @@ mod tests {
         assert_eq!(Filter::Container.id(), 37);
         assert_eq!(Filter::from_id(38).unwrap(), Filter::Wav);
         assert_eq!(Filter::Wav.id(), 38);
-        for id in 39..=255u8 {
+        assert_eq!(Filter::from_id(39).unwrap(), Filter::Mp3);
+        assert_eq!(Filter::Mp3.id(), 39);
+        for id in 40..=255u8 {
             assert!(Filter::from_id(id).is_err(), "id {id} must be rejected");
         }
     }

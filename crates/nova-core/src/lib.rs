@@ -24,6 +24,7 @@ pub mod foreign_7z;
 pub mod foreign_rar;
 pub mod foreign_zip;
 pub mod manifest;
+pub mod mp3;
 mod pack;
 pub mod paths;
 pub mod pipeline;

@@ -85,7 +85,12 @@ impl Tier {
         // codec sees the unit, the record-width filter or FLAC has already run
         // and what is left is an entropy-coded stream. Measured on 518 MB of
         // PCM: LZMA2 and bsc split the units between them, PPMd7 took none.
-        if self == Tier::Max && matches!(kind, Some(Class::Precompressed) | Some(Class::Wav)) {
+        if self == Tier::Max
+            && matches!(
+                kind,
+                Some(Class::Precompressed) | Some(Class::Wav) | Some(Class::Mp3)
+            )
+        {
             return vec![(first, 0), (Codec::Bsc, 0)];
         }
         // The normal tier gets a two-horse race rather than a single pick.
@@ -196,6 +201,10 @@ pub enum Class {
     /// RIFF/WAVE integer PCM: the opposite case, data that is not compressed at
     /// all and that a waveform model beats every general codec on.
     Wav,
+    /// MPEG Layer III. Entropy-coded like `Jpeg`, but only in part: the frame
+    /// headers and side info are structure, and separating them from the
+    /// spectral data is what `Filter::Mp3` does.
+    Mp3,
     Generic,
 }
 
@@ -267,6 +276,17 @@ pub fn plan(head: &[u8], tier: Tier) -> Plan {
             kind: Class::Wav,
         };
     }
+    // MP3 is the in-between case: mostly entropy-coded, but with a 4-byte
+    // header and 9-32 bytes of side info per frame that are pure structure.
+    // Routed by magic for the same reason as the three above — the transform
+    // wants whole frames, so the decision precedes chunking.
+    if crate::mp3::is_mp3(head) {
+        return Plan {
+            codec: general_codec(tier),
+            filter: Filter::Mp3,
+            kind: Class::Mp3,
+        };
+    }
     match classify(head) {
         // The magic says "already entropy-coded", and for JPEG, MP4 or zstd
         // that is the end of it. But it is a claim about the *format*, not
@@ -336,6 +356,12 @@ pub fn plan(head: &[u8], tier: Tier) -> Plan {
             codec: general_codec(tier),
             filter: Filter::Wav,
             kind: Class::Wav,
+        },
+        // Likewise: matched by `is_mp3` before the classifier runs.
+        Class::Mp3 => Plan {
+            codec: general_codec(tier),
+            filter: Filter::Mp3,
+            kind: Class::Mp3,
         },
         Class::Generic => plan_generic(head, tier),
     }
@@ -635,8 +661,9 @@ mod tests {
     /// cost 1.12 MB on a 4.93 MiB corpus of zips and PNGs.
     #[test]
     fn precompressed_magic_does_not_excuse_compressible_bytes() {
-        // An mp3, so the test stays about the magic-versus-bytes rule rather
-        // than about the JPEG path.
+        // An ID3 header with no frames behind it: still `Class::Precompressed`
+        // (a real MP3 goes to `Class::Mp3` instead), so the test stays about
+        // the magic-versus-bytes rule rather than about the JPEG path.
         let mut mp3 = b"ID3   ".to_vec();
         mp3.extend(std::iter::repeat_n(0x5Au8, 200_000));
         let p = plan(&mp3, Tier::Max);
@@ -644,11 +671,32 @@ mod tests {
         assert_eq!(p.kind, Class::Precompressed);
     }
 
+    /// An ID3 header followed by noise is not an MP3: there is no frame chain
+    /// behind it and no first frame id inside it. A false positive would give a
+    /// 200 KB blob a unit of its own for no gain.
     #[test]
-    fn a_real_mp3_is_stored_verbatim() {
+    fn id3_shaped_noise_is_stored_verbatim() {
         let mut mp3 = b"ID3   ".to_vec();
         mp3.extend(noise(200_000));
         assert_eq!(plan(&mp3, Tier::Max), Plan::STORE);
+    }
+
+    /// A real frame chain does earn the transform, at every tier.
+    #[test]
+    fn an_mp3_frame_chain_gets_the_plane_filter() {
+        let mut mp3 = Vec::new();
+        for i in 0..64u8 {
+            // 128 kbit/s, 44.1 kHz, joint stereo, no CRC: a 417-byte frame.
+            let mut f = vec![0xFF, 0xFB, 0x90, 0x40];
+            f.extend(std::iter::repeat_n(i, 413));
+            mp3.extend_from_slice(&f);
+        }
+        for tier in [Tier::Fast, Tier::Normal, Tier::Max] {
+            let p = plan(&mp3, tier);
+            assert_eq!(p.filter, Filter::Mp3, "{tier:?}");
+            assert_eq!(p.kind, Class::Mp3, "{tier:?}");
+            assert_ne!(p.codec, Codec::Store, "{tier:?}");
+        }
     }
 
     #[test]
