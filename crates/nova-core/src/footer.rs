@@ -18,6 +18,12 @@ pub const FOOTER_MAGIC: &[u8; 8] = b"NOVAEND1";
 pub const FOOTER_LEN: u64 = 80;
 pub const VERSION: (u8, u8) = (0, 3);
 
+/// The oldest layout this build still reads. Every id in the format is
+/// permanent, so this has stayed at the first release and should keep staying
+/// there; it exists so that the day something DOES have to break, the break is
+/// a clear refusal rather than a silent misread.
+pub const MIN_READABLE: (u8, u8) = (0, 0);
+
 #[derive(Debug, Clone)]
 pub struct Footer {
     pub generation: u64,
@@ -101,6 +107,25 @@ pub fn check_header(file: &mut File) -> Result<()> {
             b[5],
             VERSION.0,
             VERSION.1
+        );
+    }
+    // The other direction, and it is the one a pre-1.0 promise needs. Every id
+    // in this format is permanent (I5, I6) so old archives keep decoding, and
+    // that is the intent — but "keeps decoding" has to be a decision, not an
+    // accident. If a release ever does break an old layout, raising
+    // `MIN_READABLE` makes this build REFUSE those archives by name instead of
+    // decoding them into something that passes a length check and fails a hash,
+    // or worse, passes both. Owner's rule for the beta: an archive is
+    // guaranteed to open in the build that wrote it, and nothing more is
+    // promised.
+    if b[4] < MIN_READABLE.0 || (b[4] == MIN_READABLE.0 && b[5] < MIN_READABLE.1) {
+        bail!(
+            "archive format version {}.{} is older than this build reads ({}.{}); \
+             open it with the version that wrote it",
+            b[4],
+            b[5],
+            MIN_READABLE.0,
+            MIN_READABLE.1
         );
     }
     Ok(())

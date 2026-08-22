@@ -251,7 +251,8 @@ fn crash_recovery_ignores_trailing_garbage() {
 
     // read-only open must still see the committed state
     let a = Archive::open_ro(&fx.arc).unwrap();
-    assert_eq!(a.manifest.files.len(), 4);
+    // Folders are entries too now, so count what this test is about.
+    assert_eq!(a.manifest.files.iter().filter(|f| !f.dir).count(), 4);
     drop(a);
 
     // read-write open truncates the garbage and can keep appending
@@ -668,7 +669,7 @@ fn compact_keeps_shared_units_consistent() {
     assert!(after < before);
 
     let a = Archive::open_ro(&arc).unwrap();
-    assert_eq!(a.manifest.files.len(), 40);
+    assert_eq!(a.manifest.files.iter().filter(|f| !f.dir).count(), 40);
     let out = tmp.path().join("out");
     let xs = a.extract(&out, None, Overwrite::Fail).unwrap();
     assert_eq!(xs.files, 40);
@@ -853,8 +854,9 @@ fn rename_moves_entries_without_touching_data() {
         .map(|f| (f.path.clone(), f.size))
         .collect();
 
-    // Move a whole folder, then rename one file.
-    assert_eq!(a.rename("photos/2019", "photos/archive/2019").unwrap(), 2);
+    // Move a whole folder, then rename one file. The folder itself is an
+    // entry as well, so moving it moves three things, not two.
+    assert_eq!(a.rename("photos/2019", "photos/archive/2019").unwrap(), 3);
     assert_eq!(a.rename("photos/note.txt", "photos/readme.txt").unwrap(), 1);
     // Not one new unit: no data was re-read or re-compressed.
     assert_eq!(a.manifest.chunks.len(), units_before);
@@ -1704,4 +1706,175 @@ fn a_damaged_manifest_does_not_let_a_write_destroy_the_archive() {
     // And the bytes are all still there, so a recovery tool has something to
     // work with even though nova itself will not write to it.
     assert_eq!(fs::read(&fx.arc).unwrap(), bytes);
+}
+
+/// `test` says OK on a healthy archive, and it counts everything the files
+/// actually reference — a check that passes because it checked nothing would be
+/// worse than no check at all.
+#[test]
+fn test_verifies_a_healthy_archive() {
+    let fx = fixture();
+    let opts = PackOptions::new(Tier::Normal);
+    let mut a = Archive::create(&fx.arc).unwrap();
+    a.add_paths(std::slice::from_ref(&fx.src), &opts).unwrap();
+    drop(a);
+
+    let a = Archive::open_ro(&fx.arc).unwrap();
+    let s = a.test(&opts, None).unwrap();
+    assert!(s.bad.is_empty(), "healthy archive reported damage: {:?}", s.bad);
+    assert_eq!(s.chunks_ok, s.chunks);
+    assert!(s.chunks > 0, "nothing was checked");
+    assert!(s.damaged.is_empty());
+    // The fixture is 3 MiB of noise plus 210 KB of text; a check that only
+    // looked at the manifest would not be able to report that.
+    assert!(
+        s.bytes_ok >= 3 << 20,
+        "only {} bytes were read back",
+        s.bytes_ok
+    );
+}
+
+/// And it FAILS on a flipped byte, naming the files that byte took with it.
+/// This is the whole reason the verb exists, so it is worth pinning: a
+/// checksum that is computed but never compared passes every test but this one.
+#[test]
+fn test_finds_a_flipped_byte_and_names_the_files() {
+    let fx = fixture();
+    let opts = PackOptions::new(Tier::Normal);
+    let mut a = Archive::create(&fx.arc).unwrap();
+    a.add_paths(std::slice::from_ref(&fx.src), &opts).unwrap();
+    drop(a);
+
+    // Somewhere in the payload, past the header and well before the manifest.
+    let mut bytes = fs::read(&fx.arc).unwrap();
+    let at = bytes.len() / 3;
+    bytes[at] ^= 0xFF;
+    fs::write(&fx.arc, &bytes).unwrap();
+
+    let a = Archive::open_ro(&fx.arc).unwrap();
+    let s = a.test(&opts, None).unwrap();
+    assert!(!s.bad.is_empty(), "a flipped payload byte went unnoticed");
+    assert!(
+        !s.damaged.is_empty(),
+        "a bad block was found but no file was blamed for it"
+    );
+    // The rest of the archive is still readable, and saying so is the point of
+    // not stopping at the first failure.
+    assert!(
+        s.chunks_ok + s.bad.len() == s.chunks,
+        "{} ok + {} bad != {} chunks",
+        s.chunks_ok,
+        s.bad.len(),
+        s.chunks
+    );
+}
+
+/// An extracted tree must BE the tree that was packed, not merely contain the
+/// same bytes: empty folders, read-only files and sub-second timestamps are
+/// part of what someone stored, and losing them silently is the failure this
+/// pins down. Symlinks, ADS and ACLs are still not preserved — that is stated
+/// in the docs rather than tested here.
+#[test]
+fn metadata_survives_the_round_trip() {
+    let fx = fixture();
+    let empty = fx.src.join("docs/empty-folder");
+    fs::create_dir_all(&empty).unwrap();
+    let ro = fx.src.join("docs/readonly.txt");
+    fs::write(&ro, b"do not touch").unwrap();
+
+    // A timestamp with a fraction: NTFS keeps 100 ns, and every archiver that
+    // rounds to the second changes every file it touches.
+    let stamp = filetime::FileTime::from_unix_time(1_700_000_000, 123_456_700);
+    filetime::set_file_mtime(&ro, stamp).unwrap();
+    let mut perms = fs::metadata(&ro).unwrap().permissions();
+    perms.set_readonly(true);
+    fs::set_permissions(&ro, perms).unwrap();
+
+    let opts = PackOptions::new(Tier::Normal);
+    let mut a = Archive::create(&fx.arc).unwrap();
+    let add = a.add_paths(std::slice::from_ref(&fx.src), &opts).unwrap();
+    assert!(add.dirs >= 3, "folders were not stored: {}", add.dirs);
+    drop(a);
+
+    let out = fx.root.join("out");
+    let a = Archive::open_ro(&fx.arc).unwrap();
+    let xs = a.extract(&out, None, Overwrite::Fail).unwrap();
+    assert!(xs.dirs >= 3, "folders were not created: {}", xs.dirs);
+
+    let back_empty = out.join("src/docs/empty-folder");
+    assert!(
+        back_empty.is_dir(),
+        "an empty folder did not come back: {}",
+        back_empty.display()
+    );
+
+    let back_ro = out.join("src/docs/readonly.txt");
+    let meta = fs::metadata(&back_ro).unwrap();
+    assert!(meta.permissions().readonly(), "read-only was not restored");
+    let got = filetime::FileTime::from_last_modification_time(&meta);
+    assert_eq!(got.unix_seconds(), stamp.unix_seconds(), "seconds differ");
+    assert_eq!(
+        got.nanoseconds(),
+        stamp.nanoseconds(),
+        "the sub-second part was rounded away"
+    );
+
+    // Leave nothing read-only behind, or the temp directory cannot be removed.
+    for p in [&ro, &back_ro] {
+        let mut perms = fs::metadata(p).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+        fs::set_permissions(p, perms).unwrap();
+    }
+}
+
+/// A damaged archive must still give up everything it CAN. Stopping at the
+/// first bad block is the difference between losing three files and losing all
+/// of them, and a truncated file left on disk is worse than none at all —
+/// nothing later would ever tell the user it was short.
+#[test]
+fn extraction_recovers_what_it_can_from_a_damaged_archive() {
+    let fx = fixture();
+    let opts = PackOptions::new(Tier::Normal);
+    let mut a = Archive::create(&fx.arc).unwrap();
+    a.add_paths(std::slice::from_ref(&fx.src), &opts).unwrap();
+    drop(a);
+
+    let a = Archive::open_ro(&fx.arc).unwrap();
+    let stored_files = a.manifest.files.iter().filter(|f| !f.dir).count();
+    drop(a);
+
+    let mut bytes = fs::read(&fx.arc).unwrap();
+    let at = bytes.len() / 3;
+    bytes[at] ^= 0xFF;
+    fs::write(&fx.arc, &bytes).unwrap();
+
+    let out = fx.root.join("out");
+    let a = Archive::open_ro(&fx.arc).unwrap();
+    let xs = a.extract(&out, None, Overwrite::Fail).unwrap();
+
+    assert!(!xs.failed.is_empty(), "the damage went unreported");
+    assert!(
+        xs.files > 0,
+        "one bad block took the whole extraction with it"
+    );
+    // Nothing half-written is left behind for the files that failed.
+    for (path, _) in &xs.failed {
+        let target = out.join(path);
+        assert!(
+            !target.exists(),
+            "a partial file was left at {}",
+            target.display()
+        );
+    }
+    // Every file is accounted for: recovered or named as lost, never silently
+    // missing.
+    assert_eq!(
+        xs.files + xs.failed.len(),
+        stored_files,
+        "{} recovered + {} lost != {} stored",
+        xs.files,
+        xs.failed.len(),
+        stored_files
+    );
 }

@@ -125,12 +125,15 @@ fn lzma2_dict_size(unpacked_len: usize) -> u32 {
 /// | 12..    | 6 | bt4, nice_len 64 — normal *and max*|
 ///
 /// The mapping tops out at 6 because presets 7..=9 differ from it *only* in
-/// dictionary size, which the 4 MiB chunk cap erases. The one knob left is the
-/// `xz -e` trick of raising `nice_len` to 273; it is deliberately not used.
-/// Measured, it wins 0.1-1.4% on real files (source trees, executables,
-/// documentation) but the deeper search it implies makes LZMA's non-optimal
-/// parser pick worse paths on record-structured data with noisy fields, where
-/// it cost 18%. `xz -9` and 7-Zip's `-mx9` both stay at nice_len 64 too.
+/// dictionary size, which the chunk cap erases. The one knob left is the
+/// `xz -e` trick of raising `nice_len` to 273, and the max tier DOES take it
+/// (below) — an earlier version of this comment said it did not, which stopped
+/// being true and stayed here.
+///
+/// Priced on 28 real units: dropping to 64, which is where `xz -9` and
+/// `7z -mx9` both sit, would save 19% of LZMA2's encode time and cost 0.48% of
+/// its output. The average understates it — on Silesia's `nci` the deep search
+/// is worth 19.9% — so it stays. See `kb/compression.md`.
 fn lzma2_options(level: i32, unpacked_len: usize) -> Lzma2Options {
     let level = level.clamp(1, 22);
     let mut opts = Lzma2Options::with_preset(match level {
@@ -151,10 +154,49 @@ fn lzma2_options(level: i32, unpacked_len: usize) -> Lzma2Options {
     opts
 }
 
+/// Units at or above this get the match finder's helper thread.
+///
+/// It is a SIZE threshold and not a load decision on purpose. The helper can
+/// shift which of several equal-length matches gets picked, so it moves the
+/// output by a few hundred bytes in either direction — harmless in itself, but
+/// only if the choice depends on the unit alone: an archive that came out
+/// differently because the machine happened to be busy would break I8
+/// (`-j 1` == `-j 8`). MEASURED: 1.34-1.42x on 24-62 MB units, and across the
+/// six corpora it costs at most 753 bytes in 43 MB.
+const LZMA2_MT_FROM: usize = 16 * 1024 * 1024;
+
+/// How far the match finder searches down a hash chain. 0 means the SDK's own
+/// figure, which at `nice_len` 273 comes out at 152.
+const LZMA2_MATCH_CYCLES: u32 = 0;
+
+/// THE ENCODER IS C, THE DECODER IS RUST, and that split is deliberate.
+///
+/// 7-Zip's own LZMA SDK is the same algorithm with a better optimal parser and
+/// a hand-tuned match finder: measured on real 24-62 MB units at identical
+/// settings it is 0.11-0.23% SMALLER and 1.31-1.35x faster than `lzma-rust2`,
+/// and its threaded match finder is 1.4x on top of that. Smaller and faster at
+/// once is rare enough to be worth an FFI crate, and it costs nothing on the
+/// read path — what it writes is an ordinary LZMA2 stream, so
+/// `lzma2_decompress` below is unchanged, still pure Rust and still the thing
+/// that has to keep working in ten years.
+///
+/// The fallback is not decoration. If the C encoder ever refuses a buffer, the
+/// Rust one produces a perfectly good stream in the same format; an archiver
+/// that fails to pack because a codec had an opinion would be worse than one
+/// that packs a few tenths of a percent larger.
 fn lzma2_compress(level: i32, data: &[u8]) -> Result<Vec<u8>> {
-    let mut w = Lzma2Writer::new(Vec::new(), lzma2_options(level, data.len()));
-    w.write_all(data)?;
-    Ok(w.finish()?)
+    let opts = lzma2_options(level, data.len());
+    let dict = opts.lzma_options.dict_size;
+    let nice_len = opts.lzma_options.nice_len;
+    let threads = if data.len() >= LZMA2_MT_FROM { 2 } else { 1 };
+    match nova_lzma::compress(data, dict, nice_len, threads, LZMA2_MATCH_CYCLES) {
+        Ok(out) => Ok(out),
+        Err(_) => {
+            let mut w = Lzma2Writer::new(Vec::new(), opts);
+            w.write_all(data)?;
+            Ok(w.finish()?)
+        }
+    }
 }
 
 fn lzma2_decompress(data: &[u8], unpacked_len: usize) -> Result<Vec<u8>> {

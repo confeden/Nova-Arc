@@ -32,7 +32,7 @@ pub mod wav;
 
 pub use analyze::{Plan, Tier};
 pub use archive::{
-    AddStats, Archive, ExtractStats, InfoStats, Overwrite, Phase, Progress, UnitInfo,
+    AddStats, Archive, ExtractStats, InfoStats, Overwrite, Phase, Progress, TestStats, UnitInfo,
 };
 pub use codec::Codec;
 pub use filters::Filter;

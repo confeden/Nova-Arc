@@ -87,6 +87,11 @@ pub struct Found {
 /// What [`walk_inputs`] found, plus what it refused.
 pub struct Walk {
     pub files: Vec<Found>,
+    /// Directories, in the order they were met. Every directory is listed, not
+    /// only the empty ones: a non-empty one is implied by its files, but its
+    /// own attributes and timestamp are not, and those are exactly what a
+    /// restored tree was losing.
+    pub dirs: Vec<Found>,
     pub symlinks_skipped: usize,
 }
 
@@ -102,6 +107,7 @@ pub struct Walk {
 pub fn walk_inputs(inputs: &[PathBuf], mut on_found: impl FnMut(u64)) -> Result<Walk> {
     let mut w = Walk {
         files: Vec::new(),
+        dirs: Vec::new(),
         symlinks_skipped: 0,
     };
     for input in inputs {
@@ -133,9 +139,6 @@ pub fn walk_inputs(inputs: &[PathBuf], mut on_found: impl FnMut(u64)) -> Result<
                     w.symlinks_skipped += 1;
                     continue;
                 }
-                if !entry.file_type().is_file() {
-                    continue;
-                }
                 let inner = entry
                     .path()
                     .strip_prefix(input)
@@ -145,11 +148,19 @@ pub fn walk_inputs(inputs: &[PathBuf], mut on_found: impl FnMut(u64)) -> Result<
                     relp.push(n);
                 }
                 relp.push(inner);
-                w.files.push(Found {
+                let found = Found {
                     disk: entry.path().to_path_buf(),
                     rel: normalize_rel(&relp)?,
                     size: entry.metadata().map(|m| m.len()).unwrap_or(0),
-                });
+                };
+                if entry.file_type().is_dir() {
+                    w.dirs.push(found);
+                    continue;
+                }
+                if !entry.file_type().is_file() {
+                    continue;
+                }
+                w.files.push(found);
                 on_found(w.files.len() as u64);
             }
         }

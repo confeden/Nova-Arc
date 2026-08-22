@@ -1,9 +1,16 @@
 # NOVA format — v0.3 draft
 
 Status: prototype, subject to change until v1.0. This document describes what
-the code in `crates/nova-core` actually implements. Pre-1.0 the reader rejects
-any archive with a higher **minor** version, since the format may still change
-incompatibly.
+the code in `crates/nova-core` actually implements.
+
+Pre-1.0 the reader rejects any archive with a higher **minor** version, since
+the format may still change incompatibly. It also has a floor, `MIN_READABLE`,
+which sits at 0.0 and rejects anything below it — nothing today, because every
+id in this format is permanent and old archives keep decoding. It is there so
+that if a release ever does have to break an old layout, the break is a refusal
+by name rather than a decode that returns the right number of wrong bytes. The
+promise for a pre-1.0 build is therefore exact: an archive always opens in the
+build that wrote it, and nothing further is guaranteed.
 
 ## Design goals
 
@@ -153,7 +160,8 @@ a raw LZMA2 stream cannot, so every manifest ever written still decodes.
 ```
 Manifest  { generation: u64, files: [FileEntry], chunks: [ChunkRec], geometry: Geometry? }
 Geometry  { chunk_min: u32, chunk_avg: u32, chunk_max: u32, unit: u64, chunked_from: u64 }
-FileEntry { path: str, size: u64, mtime: i64, extents: [Extent] }
+FileEntry { path: str, size: u64, mtime: i64, extents: [Extent],
+            mtime_nanos: u32?, attrs: u32?, dir: bool? }
 Extent    { unit: u32, off: u64, len: u64 }
 ChunkRec  { offset: u64, packed: u64, unpacked: u64, filtered: u64,
             codec: u8, param: u8, filter: u8, hash: bin16 }
@@ -196,6 +204,20 @@ at a different tier deduplicates nothing: measured, re-adding an untouched
 `path` is relative, UTF-8, `/`-separated. `mtime` is Unix seconds and may be
 negative (pre-1970); `0` means unknown. `hash` is a MessagePack `bin` of 16
 bytes. Fields that are empty or zero are omitted entirely.
+
+`mtime_nanos` is the sub-second part of the modification time, in nanoseconds,
+always positive: for a negative `mtime` it is the fraction on the other side of
+the second. `attrs` holds Windows file attributes masked to
+`READONLY|HIDDEN|SYSTEM|NOT_CONTENT_INDEXED` (0x1|0x2|0x4|0x2000);
+`FILE_ATTRIBUTE_ARCHIVE` is deliberately not carried, since almost every file
+has it. `dir` marks an entry that is a DIRECTORY: it has `size` 0 and no
+extents, and it exists so that an empty folder — and any folder's own
+timestamp and attributes — survive a round trip. A reader that ignores all
+three still reconstructs every byte of every file.
+
+The manifest is MessagePack with NAMED fields, so a reader must key on names
+and ignore what it does not recognise; that is what lets fields be added
+without invalidating archives already written.
 
 `chunks` may contain units not referenced by any file (dead after a
 replace/remove); they remain valid dedup sources until `compact`.

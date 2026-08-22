@@ -3,11 +3,13 @@ name = "nova-core"
 version.workspace = true
 edition.workspace = true
 repository.workspace = true
+license.workspace = true
 description = "Core library for the NOVA archive format (Nova Prism)"
 
 [dependencies]
 nova-platform = { path = "../nova-platform" }
 nova-bsc = { path = "../nova-bsc" }
+nova-lzma = { path = "../nova-lzma" }
 anyhow.workspace = true
 blake3.workspace = true
 crossbeam-channel.workspace = true

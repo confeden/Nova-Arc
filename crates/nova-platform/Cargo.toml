@@ -3,6 +3,7 @@ name = "nova-platform"
 version.workspace = true
 edition.workspace = true
 repository.workspace = true
+license.workspace = true
 description = "OS resource policy for Nova Prism: priorities, I/O hints, memory budget"
 
 [target.'cfg(windows)'.dependencies]

@@ -1,0 +1,8 @@
+# The C runtime is linked STATICALLY.
+#
+# Without this, nova.exe imports vcruntime140.dll and a Windows that never had
+# a Visual C++ Redistributable installed refuses to start it at all — which is
+# the difference between "try this beta" and "it does not open". We carry C and
+# C++ (libbsc, the LZMA SDK), so the dependency is real and not Rust's own.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

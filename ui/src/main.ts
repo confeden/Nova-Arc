@@ -9,6 +9,9 @@ type Entry = {
   stored: number;
   mtime: number;
   solid: boolean;
+  /** A stored folder rather than a file: shown in the tree, never in the
+   *  table, and not counted as a file anywhere. */
+  dir: boolean;
 };
 
 type ArchiveInfo = {
@@ -59,17 +62,19 @@ const DEMO: ArchiveInfo = {
   reclaimable: 4_200_000,
   total_size: 21_233_664,
   entries: [
-    { path: "проект/src/main.rs", size: 18_233, stored: 3_120, mtime: 1_755_400_000, solid: true },
-    { path: "проект/очень/длинный/путь/который/должен/обрезаться/а/не/ломать/таблицу/файл.txt", size: 2_048, stored: 512, mtime: 1_755_300_000, solid: true },
-    { path: "фото/DSC_0001.jpg", size: 6_200_000, stored: 6_190_000, mtime: 1_700_000_000, solid: false },
-    { path: "bin/tool.exe", size: 15_013_383, stored: 2_400_000, mtime: 0, solid: false },
+    { path: "проект/src/main.rs", size: 18_233, stored: 3_120, mtime: 1_755_400_000, solid: true, dir: false },
+    { path: "проект/очень/длинный/путь/который/должен/обрезаться/а/не/ломать/таблицу/файл.txt", size: 2_048, stored: 512, mtime: 1_755_300_000, solid: true, dir: false },
+    { path: "фото/DSC_0001.jpg", size: 6_200_000, stored: 6_190_000, mtime: 1_700_000_000, solid: false, dir: false },
+    { path: "bin/tool.exe", size: 15_013_383, stored: 2_400_000, mtime: 0, solid: false, dir: false },
+    { path: "проект/пустая-папка", size: 0, stored: 0, mtime: 1_755_400_000, solid: false, dir: true },
   ],
 };
 
 async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
   if (IN_APP) return tauriInvoke<T>(cmd, args);
   if (cmd === "machine_info") return { cores: 8, memory_total: null, budget: 5 << 30 } as T;
-  if (cmd === "open_archive" || cmd === "startup_archive") return DEMO as T;
+  if (cmd === "open_archive") return DEMO as T;
+  if (cmd === "startup_task") return { verb: "open", paths: [DEMO.path] } as T;
   return null as T;
 }
 
@@ -175,7 +180,7 @@ function icon(path: string): string {
 function setBusy(busy: boolean, text?: string) {
   state.busy = busy;
   document.body.classList.toggle("busy", busy);
-  for (const id of ["btn-open", "btn-new", "btn-extract", "btn-add", "btn-remove", "btn-compact"]) {
+  for (const id of ["btn-open", "btn-new", "btn-extract", "btn-add", "btn-test", "btn-remove", "btn-compact"]) {
     const b = $<HTMLButtonElement>(id);
     if (busy) b.disabled = true;
   }
@@ -286,6 +291,7 @@ function refreshButtons() {
   const hasSel = state.selected.size > 0;
   $<HTMLButtonElement>("btn-extract").disabled = !has;
   $<HTMLButtonElement>("btn-add").disabled = !has;
+  $<HTMLButtonElement>("btn-test").disabled = !has;
   $<HTMLButtonElement>("btn-compact").disabled = !has;
   $<HTMLButtonElement>("btn-remove").disabled = !has || !hasSel;
   $<HTMLButtonElement>("btn-open").disabled = false;
@@ -308,8 +314,8 @@ function renderSummary(info: ArchiveInfo) {
 }
 
 /** A folder in the archive. Archive paths are always '/'-separated, so the
- *  tree is derived from the entry list rather than stored: the format has no
- *  directory entries at all. */
+ *  tree is derived from the entry list — plus the folders the archive stores
+ *  in their own right, which is the only way an EMPTY one can be shown. */
 type Folder = {
   name: string;
   path: string;
@@ -320,19 +326,27 @@ type Folder = {
 };
 
 function buildTree(entries: Entry[]): Folder {
-  const root: Folder = { name: "", path: "", kids: new Map(), files: entries.length };
+  const root: Folder = {
+    name: "",
+    path: "",
+    kids: new Map(),
+    files: entries.filter((e) => !e.dir).length,
+  };
   for (const e of entries) {
     const parts = e.path.split("/");
     let at = root;
-    // The last part is the file itself and never becomes a folder.
-    for (let i = 0; i < parts.length - 1; i++) {
+    // For a file the last part is the file itself and never becomes a folder;
+    // for a stored folder every part is one, which is what puts an empty
+    // folder on the tree.
+    const upto = e.dir ? parts.length : parts.length - 1;
+    for (let i = 0; i < upto; i++) {
       const name = parts[i];
       let kid = at.kids.get(name);
       if (!kid) {
         kid = { name, path: at.path ? `${at.path}/${name}` : name, kids: new Map(), files: 0 };
         at.kids.set(name, kid);
       }
-      kid.files++;
+      if (!e.dir) kid.files++;
       at = kid;
     }
   }
@@ -372,8 +386,10 @@ function renderTree() {
 
 function visibleEntries(): Entry[] {
   const q = state.filter.trim().toLowerCase();
+  // Folders live in the tree, not in the table: a row with no size, no method
+  // and nothing to open would only be in the way.
   return state.entries.filter(
-    (e) => inFolder(e.path, state.folder) && (!q || e.path.toLowerCase().includes(q)),
+    (e) => !e.dir && inFolder(e.path, state.folder) && (!q || e.path.toLowerCase().includes(q)),
   );
 }
 
@@ -527,12 +543,81 @@ function selectedPaths(): string[] {
   return [...state.selected];
 }
 
+/** What Explorer asked for. `verb` is "open" for a double-clicked archive. */
+type StartupTask = { verb: string; paths: string[] };
+
+/** Run the shell's request.
+ *
+ *  Every branch shows the window and its progress rather than working
+ *  invisibly: an archiver that silently churns for two minutes after a menu
+ *  click is indistinguishable from one that did nothing. */
+async function runStartupTask(task: StartupTask) {
+  const first = task.paths[0];
+  if (!first) return;
+  const o = packOpts();
+  switch (task.verb) {
+    case "compress": {
+      // Named after the first item and put beside it: that is what every
+      // archiver does, and it makes the result findable without a dialog.
+      const target = stripExt(first) + ".nva";
+      state.archive = target;
+      setBusy(true, "Упаковка…");
+      await invoke("create_archive", {
+        archive: target,
+        inputs: task.paths,
+        level: o.level,
+        threads: null,
+        memoryMib: o.memoryMib,
+      });
+      return;
+    }
+    case "test":
+      await loadArchive(first);
+      setBusy(true, "Проверка…");
+      await invoke("test_archive", { archive: first });
+      return;
+    case "extract-here":
+    case "extract-into": {
+      await loadArchive(first);
+      const dest = task.verb === "extract-here" ? parentOf(first) : stripExt(first);
+      setBusy(true, "Распаковка…");
+      await invoke("extract_archive", {
+        archive: first,
+        dest,
+        paths: [],
+        overwrite: "skip",
+        threads: null,
+        memoryMib: o.memoryMib,
+      });
+      return;
+    }
+    default:
+      await loadArchive(first);
+  }
+}
+
+/** A path without its extension. */
+function stripExt(path: string): string {
+  const cut = path.lastIndexOf(".");
+  const sep = Math.max(path.lastIndexOf("\\"), path.lastIndexOf("/"));
+  return cut > sep ? path.slice(0, cut) : path;
+}
+
+function parentOf(path: string): string {
+  const sep = Math.max(path.lastIndexOf("\\"), path.lastIndexOf("/"));
+  return sep > 0 ? path.slice(0, sep) : path;
+}
+
 // --- wiring ---------------------------------------------------------------
 
 $("btn-open").addEventListener("click", () => void pickArchiveToOpen());
 $("btn-new").addEventListener("click", () => void createArchive());
 $("btn-add").addEventListener("click", () => void addToArchive());
 $("btn-extract").addEventListener("click", () => void extract(selectedPaths()));
+$("btn-test").addEventListener("click", async () => {
+  setBusy(true, "Проверка…");
+  await invoke("test_archive", { archive: state.archive });
+});
 $("btn-compact").addEventListener("click", async () => {
   setBusy(true, "Уплотнение…");
   await invoke("compact_archive", { archive: state.archive });
@@ -698,12 +783,13 @@ void (async () => {
   const m = await invoke<{ cores: number; memory_total: number | null; budget: number }>("machine_info");
   el.machine.textContent = `${m.cores} потоков · бюджет памяти ${human(m.budget)}`;
   refreshButtons();
-  // Opened with a path argument (double-click a .nva, or the shell
-  // association)? Pull it now that listeners and state are ready.
+  // Started from the shell? That is either a double-clicked archive or one of
+  // the context-menu verbs; both arrive the same way, and both are pulled now
+  // that listeners and state are ready rather than pushed at us earlier.
   try {
-    const startup = IN_APP ? await invoke<string | null>("startup_archive") : DEMO.path;
-    if (startup) await loadArchive(startup);
+    const task = await invoke<StartupTask | null>("startup_task");
+    if (task) await runStartupTask(task);
   } catch (e) {
-    setStatus(`Не удалось открыть переданный архив: ${e}`, true);
+    setStatus(`Не удалось выполнить команду из проводника: ${e}`, true);
   }
 })();

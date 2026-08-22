@@ -26,6 +26,10 @@ struct Entry {
     stored: u64,
     mtime: i64,
     solid: bool,
+    /// A stored folder, not a file. It is sent so that an EMPTY folder still
+    /// appears in the tree — the tree is otherwise derived from file paths,
+    /// which by definition cannot show a folder with nothing in it.
+    dir: bool,
 }
 
 #[derive(Serialize, Clone)]
@@ -231,10 +235,12 @@ fn open_archive(path: String) -> Result<ArchiveInfo, String> {
             size: f.size,
             stored: a.stored_size(f),
             mtime: f.mtime,
+            dir: f.dir,
             // A file that shares its compression unit with other files, or
             // spans several, is worth flagging: extracting it decompresses
             // more than the file itself.
-            solid: f.extents.len() != 1
+            solid: !f.dir
+                && f.extents.len() != 1
                 || a.manifest
                     .chunks
                     .get(f.extents[0].unit as usize)
@@ -352,6 +358,24 @@ fn extract_archive(
                 ));
             }
             details.extend(stats.warnings.iter().cloned());
+            // Damage is listed after what WAS recovered: with a rotting backup
+            // the first thing anyone needs is how much of it survived.
+            if !stats.failed.is_empty() {
+                details.push(format!(
+                    "НЕ УДАЛОСЬ восстановить файлов: {}. Остальное распаковано.",
+                    stats.failed.len()
+                ));
+                details.extend(
+                    stats
+                        .failed
+                        .iter()
+                        .take(50)
+                        .map(|(path, why)| format!("  {path}: {why}")),
+                );
+                if stats.failed.len() > 50 {
+                    details.push(format!("  … и ещё {}", stats.failed.len() - 50));
+                }
+            }
             Ok(details)
         })();
         guard.disarm();
@@ -405,6 +429,53 @@ fn compact_archive(app: AppHandle, archive: String) {
     });
 }
 
+/// Read every stored byte back and check it against its checksum.
+///
+/// The answer a user wants is "is my archive still good", and before this the
+/// only way to get it was to extract everything somewhere and look. It writes
+/// nothing, so it is safe to run on anything, including an archive that is
+/// already known to be damaged.
+#[tauri::command]
+fn test_archive(app: AppHandle, archive: String) {
+    std::thread::spawn(move || {
+        let mut guard = DoneGuard::new(app.clone(), "test");
+        let result = (|| -> anyhow::Result<Vec<String>> {
+            let a = Archive::open_ro(Path::new(&archive))?;
+            let opts = PackOptions::new(Tier::Normal);
+            let app_for_progress = app.clone();
+            let s = a.test(
+                &opts,
+                Some(&move |p: Progress| emit_progress(&app_for_progress, "test", p)),
+            )?;
+            if s.bad.is_empty() {
+                return Ok(vec![format!(
+                    "Проверено {} блок(ов), {} — всё совпадает с контрольными суммами.",
+                    s.chunks,
+                    human(s.bytes_ok)
+                )]);
+            }
+            // A damaged archive is not an error in the command: the command did
+            // exactly what it was asked. The list is the result.
+            let mut out = vec![format!(
+                "ПОВРЕЖДЁН: {} из {} блок(ов) не прошли проверку. Затронуто файлов: {}.",
+                s.bad.len(),
+                s.chunks,
+                s.damaged.len()
+            )];
+            out.extend(s.damaged.iter().take(50).map(|p| format!("  {p}")));
+            if s.damaged.len() > 50 {
+                out.push(format!("  … и ещё {}", s.damaged.len() - 50));
+            }
+            out.push(String::from(
+                "Остальные файлы читаются — их можно распаковать как обычно.",
+            ));
+            Ok(out)
+        })();
+        guard.disarm();
+        finish(&app, "test", result);
+    });
+}
+
 #[tauri::command]
 fn remove_entries(app: AppHandle, archive: String, paths: Vec<String>) {
     std::thread::spawn(move || {
@@ -424,25 +495,68 @@ fn remove_entries(app: AppHandle, archive: String, paths: Vec<String>) {
     });
 }
 
-/// Archive path passed on the command line, if any.
-struct StartupArchive(Option<String>);
+/// What the command line asked for, if anything.
+///
+/// Explorer's context menu is the only caller that passes a verb; a bare path
+/// is what a double-click sends, and that stays the default.
+#[derive(Serialize, Clone, Default)]
+struct StartupTask {
+    /// "open" | "compress" | "test" | "extract-here" | "extract-into"
+    verb: String,
+    paths: Vec<String>,
+}
+
+struct Startup(Option<StartupTask>);
 
 /// Pick the archive out of the command line.
 ///
 /// A single quoted path is the normal case, but callers routinely forget the
 /// quotes and a path like `D:\Nova Prism\a.nva` then arrives as two arguments,
 /// so the whole tail is tried as one path before giving up.
-fn archive_from_args(args: Vec<String>) -> Option<String> {
-    let is_archive = |s: &str| s.to_lowercase().ends_with(".nva") && Path::new(s).is_file();
-    if let Some(hit) = args.iter().find(|a| is_archive(a)) {
-        return Some(hit.clone());
+fn task_from_args(args: Vec<String>) -> Option<StartupTask> {
+    let verb = match args.first().map(String::as_str) {
+        Some("--compress") => "compress",
+        Some("--test") => "test",
+        Some("--extract-here") => "extract-here",
+        Some("--extract-into") => "extract-into",
+        _ => "open",
+    };
+    let rest: Vec<String> = if verb == "open" {
+        args
+    } else {
+        args.into_iter().skip(1).collect()
+    };
+    let existing: Vec<String> = rest
+        .iter()
+        .filter(|a| Path::new(a.as_str()).exists())
+        .cloned()
+        .collect();
+    let paths = if existing.is_empty() {
+        let joined = rest.join(" ");
+        if Path::new(&joined).exists() {
+            vec![joined]
+        } else {
+            Vec::new()
+        }
+    } else {
+        existing
+    };
+    if paths.is_empty() {
+        return None;
     }
-    let joined = args.join(" ");
-    is_archive(&joined).then_some(joined)
+    // A bare path that is not an archive is nothing to open, and guessing that
+    // it must have meant "compress" would be a surprise, not a convenience.
+    if verb == "open" && !paths[0].to_lowercase().ends_with(".nva") {
+        return None;
+    }
+    Some(StartupTask {
+        verb: verb.to_string(),
+        paths,
+    })
 }
 
 #[tauri::command]
-fn startup_archive(startup: State<'_, StartupArchive>) -> Option<String> {
+fn startup_task(startup: State<'_, Startup>) -> Option<StartupTask> {
     startup.0.clone()
 }
 
@@ -469,22 +583,23 @@ fn main() {
     // association) opens that archive on startup. The frontend pulls it once
     // it is ready, rather than us pushing an event that could arrive before
     // its listeners exist.
-    let open_arg = archive_from_args(std::env::args().skip(1).collect());
+    let startup = task_from_args(std::env::args().skip(1).collect());
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .manage(temps)
-        .manage(StartupArchive(open_arg))
+        .manage(Startup(startup))
         .invoke_handler(tauri::generate_handler![
             open_archive,
             create_archive,
             extract_archive,
             open_entry,
             compact_archive,
+            test_archive,
             remove_entries,
             machine_info,
-            startup_archive,
+            startup_task,
         ])
         .build(tauri::generate_context!())
         .expect("failed to start Nova Prism")
@@ -495,4 +610,76 @@ fn main() {
                 }
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::task_from_args;
+
+    fn args(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// A path that is not there is not a task. Explorer never sends one, but a
+    /// stale shortcut does, and opening a window that immediately errors is
+    /// worse than not opening one.
+    #[test]
+    fn nothing_to_do_without_an_existing_path() {
+        assert!(task_from_args(args(&[])).is_none());
+        assert!(task_from_args(args(&["D:/nope/missing.nva"])).is_none());
+        assert!(task_from_args(args(&["--test", "D:/nope/missing.nva"])).is_none());
+    }
+
+    /// The verb comes first and the rest is the path list. Checked against a
+    /// file that really exists, because that is the rule the parser applies.
+    #[test]
+    fn a_verb_is_taken_from_the_front() {
+        let me = std::env::current_exe().expect("this test has a path");
+        let me = me.to_string_lossy().to_string();
+        for (verb, expect) in [
+            ("--compress", "compress"),
+            ("--test", "test"),
+            ("--extract-here", "extract-here"),
+            ("--extract-into", "extract-into"),
+        ] {
+            let t = task_from_args(args(&[verb, &me])).expect("a real path");
+            assert_eq!(t.verb, expect);
+            assert_eq!(t.paths, vec![me.clone()]);
+        }
+    }
+
+    /// A bare path is "open", and only for an archive: a double-clicked .txt
+    /// must not be guessed into meaning anything.
+    #[test]
+    fn a_bare_path_opens_only_an_archive() {
+        let me = std::env::current_exe().expect("this test has a path");
+        assert!(task_from_args(args(&[&me.to_string_lossy()])).is_none());
+
+        let dir = std::env::temp_dir().join("nova-startup-test");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let arc = dir.join("sample.nva");
+        std::fs::write(&arc, b"not really an archive, only a name").expect("write");
+        let t = task_from_args(args(&[&arc.to_string_lossy()])).expect("an .nva path");
+        assert_eq!(t.verb, "open");
+        let _ = std::fs::remove_file(&arc);
+    }
+
+    /// Several selected files arrive as several arguments and stay a list —
+    /// compressing them into one archive is the whole point of selecting them.
+    #[test]
+    fn several_paths_stay_several() {
+        let dir = std::env::temp_dir().join("nova-startup-multi");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let (a, b) = (dir.join("a.txt"), dir.join("b.txt"));
+        std::fs::write(&a, b"a").expect("write");
+        std::fs::write(&b, b"b").expect("write");
+        let t = task_from_args(args(&[
+            "--compress",
+            &a.to_string_lossy(),
+            &b.to_string_lossy(),
+        ]))
+        .expect("two real paths");
+        assert_eq!(t.paths.len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

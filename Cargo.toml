@@ -1,11 +1,13 @@
 [workspace]
 resolver = "2"
-members = ["crates/nova-core", "crates/nova-cli", "crates/nova-platform", "crates/nova-gui", "crates/nova-bsc"]
+members = ["crates/nova-core", "crates/nova-cli", "crates/nova-platform", "crates/nova-gui", "crates/nova-bsc", "crates/nova-lzma"]
 
 [workspace.package]
-version = "0.8.0"
+version = "0.9.0"
 edition = "2021"
 repository = "https://github.com/confeden/Nova-Prism"
+authors = ["Brent"]
+license = "GPL-3.0-only"
 
 [workspace.dependencies]
 anyhow = "1"

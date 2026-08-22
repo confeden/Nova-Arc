@@ -10,7 +10,8 @@ use nova_platform::PriorityMode;
 #[command(
     name = "nova",
     version,
-    about = "Nova Prism - the NOVA archive format (v0 prototype)"
+    author = "Brent - t.me/nova_txt",
+    about = "Nova Prism - the NOVA archive format (v0, beta)"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -118,6 +119,9 @@ enum Cmd {
         from: String,
         to: String,
     },
+    /// Verify every stored byte against its checksum. Writes nothing
+    #[command(visible_alias = "t")]
+    Test { archive: PathBuf },
     /// Rewrite the archive dropping dead data
     Compact { archive: PathBuf },
     /// Show archive statistics
@@ -341,6 +345,7 @@ fn main() -> Result<()> {
             skip_existing,
         } => {
             let t = Instant::now();
+            let mut damaged = false;
             let sel = if paths.is_empty() {
                 None
             } else {
@@ -359,6 +364,13 @@ fn main() -> Result<()> {
                 rar_extract(&archive, &output, sel, policy)?
             } else {
                 let a = Archive::open_ro(&archive)?;
+                // The same trap `list` fell into (G1): a damaged archive opens
+                // at its last readable generation, which can be EMPTY, and
+                // "Extracted 0 file(s)" then reads as "there was nothing in it"
+                // instead of "this archive lost its index". Say it first, and
+                // do not exit 0 on it.
+                warn_if_damaged(&a);
+                damaged = a.damage.is_some();
                 a.extract_with(&output, sel, policy, &pack(Level::Normal))?
             };
             println!(
@@ -373,6 +385,30 @@ fn main() -> Result<()> {
             report_peak();
             for w in &s.warnings {
                 eprintln!("warning: {w}");
+            }
+            // Damage is reported after the count of what WAS recovered, because
+            // that is the number someone with a rotting backup needs first.
+            if !s.failed.is_empty() {
+                eprintln!(
+                    "
+{} file(s) could not be recovered:",
+                    s.failed.len()
+                );
+                for (path, why) in s.failed.iter().take(20) {
+                    eprintln!("  {path}: {why}");
+                }
+                if s.failed.len() > 20 {
+                    eprintln!("  ... and {} more", s.failed.len() - 20);
+                }
+                eprintln!("Run 'nova test' for the full picture.");
+                std::process::exit(2);
+            }
+            if damaged {
+                eprintln!(
+                    "
+The archive is damaged: what came out is its last readable generation, which may hold less than it once did."
+                );
+                std::process::exit(2);
             }
         }
         Cmd::List { archive } => {
@@ -395,18 +431,27 @@ fn main() -> Result<()> {
                 warn_if_damaged(&a);
                 let mut total = 0u64;
                 let mut stored = 0u64;
+                let mut dirs = 0usize;
                 println!("{:>12}  {:>12}  Path", "Size", "Stored");
                 for f in &a.manifest.files {
+                    // A folder is listed because an empty one is part of what
+                    // was stored and would otherwise be invisible here.
+                    if f.dir {
+                        dirs += 1;
+                        println!("{:>12}  {:>12}  {}/", "<DIR>", "-", f.path);
+                        continue;
+                    }
                     let st = a.stored_size(f);
                     println!("{:>12}  {:>12}  {}", human(f.size), human(st), f.path);
                     total += f.size;
                     stored += st;
                 }
                 println!(
-                    "{:>12}  {:>12}  {} file(s)",
+                    "{:>12}  {:>12}  {} file(s), {} folder(s)",
                     human(total),
                     human(stored),
-                    a.manifest.files.len()
+                    a.manifest.files.len() - dirs,
+                    dirs
                 );
             }
         }
@@ -429,6 +474,43 @@ fn main() -> Result<()> {
                 t.elapsed().as_secs_f64()
             );
         }
+        Cmd::Test { archive } => {
+            let a = Archive::open_ro(&archive)?;
+            warn_if_damaged(&a);
+            let t = Instant::now();
+            let s = a.test(&pack(Level::Normal), None)?;
+            println!(
+                "Checked {} of {} block(s), {} in {:.1?}",
+                s.chunks_ok,
+                s.chunks,
+                human(s.bytes_ok),
+                t.elapsed()
+            );
+            if s.bad.is_empty() {
+                println!("OK - every stored byte matches its checksum.");
+            } else {
+                // The count first, then the detail: someone staring at a
+                // half-readable backup needs the shape of the damage before
+                // the reasons for it.
+                eprintln!("\nDAMAGED - {} block(s) failed:", s.bad.len());
+                for (idx, why) in s.bad.iter().take(10) {
+                    eprintln!("  block {idx}: {why}");
+                }
+                if s.bad.len() > 10 {
+                    eprintln!("  ... and {} more", s.bad.len() - 10);
+                }
+                eprintln!("\n{} file(s) affected:", s.damaged.len());
+                for p in s.damaged.iter().take(20) {
+                    eprintln!("  {p}");
+                }
+                if s.damaged.len() > 20 {
+                    eprintln!("  ... and {} more", s.damaged.len() - 20);
+                }
+                // A distinct code, because "the archive is damaged" and "the
+                // command could not run" are different things to a script.
+                std::process::exit(2);
+            }
+        }
         Cmd::Compact { archive } => {
             let a = Archive::open_rw(&archive)?;
             let (before, after) = a.compact()?;
@@ -440,6 +522,7 @@ fn main() -> Result<()> {
             let i = a.info();
             println!("Generation:   {}", i.generation);
             println!("Files:        {}", i.files);
+            println!("Folders:      {}", i.dirs);
             println!("Chunks:       {}", i.chunks);
             println!("Archive size: {}", human(i.file_len));
             println!("Live data:    {}", human(i.live_bytes));

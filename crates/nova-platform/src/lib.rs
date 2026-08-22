@@ -66,8 +66,8 @@ mod imp {
 
     use windows_sys::Win32::Storage::FileSystem::{
         FileIoPriorityHintInfo, IoPriorityHintLow, LockFileEx, ReplaceFileW,
-        SetFileInformationByHandle, FILE_IO_PRIORITY_HINT_INFO, LOCKFILE_EXCLUSIVE_LOCK,
-        LOCKFILE_FAIL_IMMEDIATELY, REPLACEFILE_IGNORE_ACL_ERRORS,
+        SetFileAttributesW, SetFileInformationByHandle, FILE_IO_PRIORITY_HINT_INFO,
+        LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, REPLACEFILE_IGNORE_ACL_ERRORS,
         REPLACEFILE_IGNORE_MERGE_ERRORS,
     };
     use windows_sys::Win32::System::IO::OVERLAPPED;
@@ -236,6 +236,21 @@ mod imp {
             available: m.ullAvailPhys,
         })
     }
+
+    pub fn set_file_attributes(path: &std::path::Path, attrs: u32) -> std::io::Result<()> {
+        let wide: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        // SAFETY: a NUL-terminated UTF-16 path that outlives the call, and a
+        // plain attribute bitmask. The call cannot write anywhere.
+        let ok = unsafe { SetFileAttributesW(wide.as_ptr(), attrs) };
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
 }
 
 #[cfg(not(windows))]
@@ -317,6 +332,10 @@ mod imp {
     pub fn peak_memory() -> Option<u64> {
         None
     }
+
+    pub fn set_file_attributes(_path: &std::path::Path, _attrs: u32) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Apply the process-wide CPU/memory policy. Advisory: failures are ignored.
@@ -349,4 +368,37 @@ pub fn try_lock_exclusive(file: &File) -> std::io::Result<bool> {
 /// packing really does stay inside its budget.
 pub fn peak_memory() -> Option<u64> {
     imp::peak_memory()
+}
+
+/// File attributes worth carrying into an archive and back out.
+///
+/// Deliberately NOT the whole bitmask. `FILE_ATTRIBUTE_ARCHIVE` is set on
+/// nearly every file Windows creates, so keeping it would make every entry in
+/// every manifest carry an attribute field, for a bit that says only "this has
+/// changed since the last backup" — about a backup that is not ours. What is
+/// left is what a user can see and set: read-only, hidden, system, and "do not
+/// index".
+pub const KEPT_ATTRIBUTES: u32 = 0x1 | 0x2 | 0x4 | 0x2000;
+
+/// The kept attributes of a file, read from metadata already in hand.
+///
+/// Zero on every platform but Windows, and zero for an ordinary file there,
+/// which is what keeps this out of the manifest in the common case.
+pub fn file_attributes(meta: &std::fs::Metadata) -> u32 {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        meta.file_attributes() & KEPT_ATTRIBUTES
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = meta;
+        0
+    }
+}
+
+/// Put those attributes back. MUST run after the file's contents are written:
+/// setting read-only first makes the write that follows fail.
+pub fn set_file_attributes(path: &std::path::Path, attrs: u32) -> std::io::Result<()> {
+    imp::set_file_attributes(path, attrs & KEPT_ATTRIBUTES)
 }

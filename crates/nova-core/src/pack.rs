@@ -206,6 +206,9 @@ impl Packer {
             path: rel,
             size: meta.len(),
             mtime: mtime_of(&meta),
+            mtime_nanos: mtime_nanos_of(&meta),
+            attrs: nova_platform::file_attributes(&meta),
+            dir: false,
             extents: Vec::new(),
         });
 
@@ -554,7 +557,7 @@ impl Packer {
                 let cands = self.tier.candidates(codec, kind);
                 let local = match self.wav_piece {
                     Some(p) => sub.submit_wav(buf, key, cands, p)?,
-                    None => sub.submit_filtered(buf, key, cands, filter)?,
+                    None => sub.submit_filtered(buf, key, cands, filter, kind)?,
                 };
                 let idx = self
                     .base
@@ -643,6 +646,30 @@ impl Packer {
                 self.by_ci.insert(ck, rel.to_string());
             }
         }
+    }
+}
+
+/// The sub-second part of the modification time, in nanoseconds.
+///
+/// Split from the seconds rather than stored as one number, because the
+/// seconds field is signed and predates this: an archive written before the
+/// nanoseconds existed decodes with a zero here and restores exactly as it did.
+pub(crate) fn mtime_nanos_of(meta: &std::fs::Metadata) -> u32 {
+    match meta.modified() {
+        Ok(t) => match t.duration_since(std::time::UNIX_EPOCH) {
+            Ok(d) => d.subsec_nanos(),
+            // Before 1970 the seconds are counted backwards, so the fraction
+            // is what is left over on the other side of the second.
+            Err(e) => {
+                let n = e.duration().subsec_nanos();
+                if n == 0 {
+                    0
+                } else {
+                    1_000_000_000 - n
+                }
+            }
+        },
+        Err(_) => 0,
     }
 }
 

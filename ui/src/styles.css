@@ -453,3 +453,13 @@ body.busy {
   scrollbar-color: #3a424c var(--bg);
   scrollbar-width: thin;
 }
+
+/* Author line in the status bar: present, never in the way. */
+.status .author {
+  margin-left: auto;
+  color: var(--dim, #8b949e);
+  text-decoration: none;
+}
+.status .author:hover {
+  color: var(--fg, #e6edf3);
+}

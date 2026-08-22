@@ -3,6 +3,7 @@ name = "nova-bsc"
 version.workspace = true
 edition.workspace = true
 repository.workspace = true
+license.workspace = true
 description = "libbsc (BWT + QLFC) behind a safe Rust API for Nova Prism"
 
 # This crate exists for one reason: nova-core is `#![forbid(unsafe_code)]` and

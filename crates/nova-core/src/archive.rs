@@ -390,6 +390,10 @@ impl<'a> Reporter<'a> {
 #[derive(Debug, Default)]
 pub struct AddStats {
     pub files: usize,
+    /// Directory entries recorded. Counted apart from files because a caller
+    /// that says "5751 files" should not start saying 7300 the day folders
+    /// began to be stored.
+    pub dirs: usize,
     pub bytes_in: u64,
     pub bytes_stored: u64,
     pub bytes_deduped: u64,
@@ -400,15 +404,44 @@ pub struct AddStats {
 #[derive(Debug, Default)]
 pub struct ExtractStats {
     pub files: usize,
+    /// Directories created, including the empty ones that used to disappear.
+    pub dirs: usize,
+    /// Files that could not be recovered, with the reason, sorted by path.
+    ///
+    /// Extraction does NOT stop at the first one. A damaged archive is exactly
+    /// when the rest of the files matter most, and an archiver that refuses the
+    /// whole tree because one block rotted is worse than useless — it is the
+    /// difference between losing three files and losing nine thousand.
+    pub failed: Vec<(String, String)>,
     pub bytes: u64,
     pub skipped_existing: usize,
     pub warnings: Vec<String>,
 }
 
+/// What `Archive::test` found. A pass is `bad.is_empty()`, and nothing else.
+#[derive(Debug, Default)]
+pub struct TestStats {
+    /// Live chunks, meaning the ones some file still references.
+    pub chunks: usize,
+    pub chunks_ok: usize,
+    /// Original bytes behind the chunks that verified.
+    pub bytes_ok: u64,
+    /// `(chunk index, what went wrong)`, in index order so two runs read the
+    /// same however the workers were scheduled.
+    pub bad: Vec<(u32, String)>,
+    /// Paths that touch at least one bad chunk, in manifest order. These are
+    /// the files that cannot be recovered; everything else in the archive can.
+    pub damaged: Vec<String>,
+}
+
 #[derive(Debug)]
 pub struct InfoStats {
     pub generation: u64,
+    /// Files only. Directories are entries too but they are not files, and a
+    /// count that quietly grew the day folders started being stored would be
+    /// the kind of number nobody can reconcile with anything.
     pub files: usize,
+    pub dirs: usize,
     pub chunks: usize,
     pub file_len: u64,
     pub live_bytes: u64,
@@ -628,6 +661,26 @@ so unchanged data still deduplicates",
         // 100% with nothing to explain it.
         let walk = paths::walk_inputs(inputs, |n| reporter.scanned(n))?;
         stats.symlinks_skipped += walk.symlinks_skipped;
+        // Directories are entries too, carrying no bytes. Without them an empty
+        // folder simply vanishes and a folder's own attributes and timestamp go
+        // with it — a restored tree that LOOKS right and is not.
+        let dirs: Vec<FileEntry> = walk
+            .dirs
+            .iter()
+            .filter_map(|d| {
+                let meta = std::fs::metadata(&d.disk).ok()?;
+                Some(FileEntry {
+                    path: d.rel.clone(),
+                    size: 0,
+                    mtime: pack::mtime_of(&meta),
+                    mtime_nanos: pack::mtime_nanos_of(&meta),
+                    attrs: nova_platform::file_attributes(&meta),
+                    dir: true,
+                    extents: Vec::new(),
+                })
+            })
+            .collect();
+        stats.dirs += dirs.len();
         let mut work: Vec<(PathBuf, String, u64)> = walk
             .files
             .into_iter()
@@ -698,7 +751,9 @@ so unchanged data still deduplicates",
             .enumerate()
             .map(|(i, f)| (f.path.clone(), i))
             .collect();
-        for entry in packer.into_files() {
+        // Directory entries first, so a file that shares a path with one (which
+        // only a hostile archive can arrange) is the version that survives.
+        for entry in dirs.into_iter().chain(packer.into_files()) {
             match by_path.get(&entry.path) {
                 Some(&i) => self.manifest.files[i] = entry,
                 None => {
@@ -806,6 +861,23 @@ so unchanged data still deduplicates",
             }
         }
 
+        // Directories are entries with no bytes. They come out of the work
+        // list because the file path below writes files, and they are created
+        // FIRST so an empty one exists even though nothing will ever be written
+        // into it. Their timestamps go on at the very end, because writing a
+        // file into a directory moves that directory's clock.
+        let (dir_entries, files): (Vec<_>, Vec<_>) =
+            work.into_iter().partition(|(e, _)| e.dir);
+        let work = files;
+        for (_, target) in &dir_entries {
+            if let Err(e) = std::fs::create_dir_all(target) {
+                stats
+                    .warnings
+                    .push(format!("cannot create {}: {e}", target.display()));
+            }
+        }
+        stats.dirs = dir_entries.len();
+
         // Fail fast, before writing anything: a refused extraction should not
         // leave half a tree behind.
         if overwrite == Overwrite::Fail {
@@ -840,7 +912,10 @@ so unchanged data still deduplicates",
         reporter.totals(work.len() as u64, work.iter().map(|(e, _)| e.size).sum());
         reporter.phase(Phase::Work);
         let counters = Mutex::new((0usize, 0u64, 0usize)); // files, bytes, skipped
+        // Only a failure that makes further work impossible — not being able to
+        // open the archive at all. Everything else is per file.
         let failure: Mutex<Option<anyhow::Error>> = Mutex::new(None);
+        let failed: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
         let stop = AtomicBool::new(false);
         let next = AtomicUsize::new(0);
 
@@ -910,13 +985,17 @@ so unchanged data still deduplicates",
                                 local.2 += 1;
                                 reporter.extracted(1, entry.size);
                             }
+                            // One file lost, not the extraction. The partial
+                            // file goes with it: a short file that looks whole
+                            // is worse than no file, because nothing later will
+                            // ever tell the user it was truncated.
                             Err(e) => {
-                                stop.store(true, Ordering::Relaxed);
-                                let mut slot = failure.lock().expect("mutex");
-                                if slot.is_none() {
-                                    *slot = Some(e);
-                                }
-                                break;
+                                let _ = std::fs::remove_file(target);
+                                failed
+                                    .lock()
+                                    .expect("mutex")
+                                    .push((entry.path.clone(), format!("{e:#}")));
+                                reporter.extracted(1, entry.size);
                             }
                         }
                     }
@@ -931,6 +1010,19 @@ so unchanged data still deduplicates",
         if let Some(e) = failure.into_inner().expect("mutex") {
             return Err(e);
         }
+        // Sorted, so two runs of the same damaged archive read the same however
+        // the workers happened to be scheduled.
+        let mut lost = failed.into_inner().expect("mutex");
+        lost.sort_by(|a, b| a.0.cmp(&b.0));
+        stats.failed = lost;
+        // Deepest first: a directory's clock is moved by everything written
+        // inside it, so it can only be set once nothing else will be.
+        let mut dirs_last: Vec<&(&FileEntry, PathBuf)> = dir_entries.iter().collect();
+        dirs_last.sort_by_key(|(e, _)| std::cmp::Reverse(e.path.matches('/').count()));
+        for (entry, target) in dirs_last {
+            restore_metadata(entry, target);
+        }
+
         reporter.finish();
         let c = counters.into_inner().expect("mutex");
         stats.files = c.0;
@@ -1080,8 +1172,144 @@ so unchanged data still deduplicates",
         total
     }
 
+    /// Read every chunk a file can still reach, decode it and check it against
+    /// the hash in the manifest. Writes nothing, anywhere.
+    ///
+    /// This is the question a user actually has — "is what I stored still
+    /// there" — and until now the only way to answer it was to extract the
+    /// whole archive somewhere and look. Every competitor has the verb.
+    ///
+    /// Three things it does deliberately:
+    ///
+    /// - It DOES NOT STOP at the first bad chunk. The point is the extent of
+    ///   the damage, not its existence; stopping early would tell someone with
+    ///   a half-readable backup nothing about which half.
+    /// - It reports FILES, not chunk numbers. "Chunk 417 failed" is not
+    ///   actionable; "these three files cannot be recovered, the other 9,000
+    ///   can" is.
+    /// - It tests only LIVE chunks — the ones a file references. Dead bytes are
+    ///   what `compact` exists to drop, and failing over data nobody can
+    ///   extract would be a false alarm.
+    ///
+    /// The hash covers the ORIGINAL bytes, before any filter (I4), so a pass
+    /// also proves every recompression filter round-tripped exactly.
+    pub fn test(&self, opts: &PackOptions, progress: Option<ProgressFn>) -> Result<TestStats> {
+        let reporter = Reporter::new(progress);
+        reporter.phase(Phase::Scan);
+        let file_len = self.file.metadata()?.len();
+
+        let mut live: Vec<u32> = self
+            .manifest
+            .files
+            .iter()
+            .flat_map(|f| f.extents.iter().map(|e| e.unit))
+            .collect();
+        live.sort_unstable();
+        live.dedup();
+
+        let mut stats = TestStats {
+            chunks: live.len(),
+            ..Default::default()
+        };
+        // Same sizing as extraction, and for the same reason: this IS the
+        // decode path, so what makes extraction CPU-bound makes a test
+        // CPU-bound, and a bsc chunk needs the large per-worker allowance.
+        let slow = live
+            .iter()
+            .any(|&i| matches!(self.chunk_at(i).map(|c| c.codec), Some(2..=4)));
+        let hungry = live
+            .iter()
+            .any(|&i| self.chunk_at(i).map(|c| c.codec) == Some(4));
+        let workers = opts
+            .extract_workers(slow, hungry)
+            .min(live.len().max(1))
+            .max(1);
+        let total_bytes: u64 = live
+            .iter()
+            .filter_map(|&i| self.chunk_at(i))
+            .map(|c| c.unpacked)
+            .sum();
+        reporter.totals(live.len() as u64, total_bytes);
+        reporter.phase(Phase::Work);
+
+        let next = AtomicUsize::new(0);
+        let done = Mutex::new((0usize, 0u64, Vec::<(u32, String)>::new()));
+        let opened: Mutex<Option<anyhow::Error>> = Mutex::new(None);
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                scope.spawn(|| {
+                    // A private handle per worker: cloned handles share a file
+                    // position on Windows, which would corrupt concurrent reads.
+                    let reader = match File::open(&self.path) {
+                        Ok(f) => f,
+                        Err(e) => {
+                            *opened.lock().expect("mutex") = Some(anyhow::Error::new(e));
+                            return;
+                        }
+                    };
+                    nova_platform::lower_io_priority(&reader);
+                    let mut reader = &reader;
+                    loop {
+                        let n = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(&idx) = live.get(n) else { break };
+                        let Some(rec) = self.chunk_at(idx) else {
+                            let mut d = done.lock().expect("mutex");
+                            d.2.push((idx, "manifest refers to a chunk that is not there".into()));
+                            continue;
+                        };
+                        // A read error is a verdict about this chunk, not a
+                        // reason to abandon the archive: a bad sector under one
+                        // unit says nothing about the rest of the file.
+                        let verdict = read_packed(&mut reader, rec, file_len)
+                            .and_then(|packed| verify_chunk(rec, &packed));
+                        let mut d = done.lock().expect("mutex");
+                        match verdict {
+                            Ok(data) => {
+                                d.0 += 1;
+                                d.1 += data.len() as u64;
+                            }
+                            Err(e) => d.2.push((idx, format!("{e:#}"))),
+                        }
+                        let (ok, bytes) = (d.0, d.1);
+                        drop(d);
+                        // A verified chunk is finished work, the same way an
+                        // extracted file is: `extracted` is the counter that
+                        // carries that meaning.
+                        reporter.extracted(ok as u64, bytes);
+                    }
+                });
+            }
+        });
+        if let Some(e) = opened.lock().expect("mutex").take() {
+            return Err(e);
+        }
+
+        let (ok, bytes, mut bad) = done.into_inner().expect("mutex");
+        bad.sort_by_key(|(i, _)| *i);
+        stats.chunks_ok = ok;
+        stats.bytes_ok = bytes;
+        let broken: HashSet<u32> = bad.iter().map(|(i, _)| *i).collect();
+        stats.bad = bad;
+        if !broken.is_empty() {
+            for f in &self.manifest.files {
+                if f.extents.iter().any(|e| broken.contains(&e.unit)) {
+                    stats.damaged.push(f.path.clone());
+                }
+            }
+        }
+        reporter.finish();
+        Ok(stats)
+    }
+
+    /// The chunk record an extent points at, or `None` if the manifest points
+    /// past the end of its own table.
+    fn chunk_at(&self, index: u32) -> Option<&ChunkRec> {
+        self.manifest.chunks.get(index as usize)
+    }
+
     pub fn info(&self) -> InfoStats {
         let file_len = self.file.metadata().map(|m| m.len()).unwrap_or(0);
+        let dirs = self.manifest.files.iter().filter(|f| f.dir).count();
         let mut live: HashSet<u32> = HashSet::new();
         for f in &self.manifest.files {
             live.extend(f.extents.iter().map(|e| e.unit));
@@ -1110,7 +1338,8 @@ so unchanged data still deduplicates",
 
         InfoStats {
             generation: self.manifest.generation,
-            files: self.manifest.files.len(),
+            files: self.manifest.files.len() - dirs,
+            dirs,
             chunks: self.manifest.chunks.len(),
             file_len,
             live_bytes,
@@ -1438,11 +1667,28 @@ fn extract_one(
         bail!("size mismatch extracting {}", entry.path);
     }
     drop(out);
-    if entry.mtime != 0 {
-        let _ =
-            filetime::set_file_mtime(target, filetime::FileTime::from_unix_time(entry.mtime, 0));
-    }
+    restore_metadata(entry, target);
     Ok(Some(written))
+}
+
+/// Put a timestamp and attributes back on something just written.
+///
+/// ORDER IS LOAD-BEARING: read-only goes on last. Setting it before the
+/// contents are written makes the write fail, and setting it before the
+/// timestamp makes the timestamp fail — Windows refuses to touch either on a
+/// read-only file. Both are advisory: a tree that came back with the right
+/// bytes and the wrong clock is still worth having, so a failure here is not
+/// allowed to fail the extraction.
+fn restore_metadata(entry: &FileEntry, target: &Path) {
+    if entry.mtime != 0 || entry.mtime_nanos != 0 {
+        let _ = filetime::set_file_mtime(
+            target,
+            filetime::FileTime::from_unix_time(entry.mtime, entry.mtime_nanos),
+        );
+    }
+    if entry.attrs != 0 {
+        let _ = nova_platform::set_file_attributes(target, entry.attrs);
+    }
 }
 
 /// Grouping key for units: the extension, lowercased. Sorting files by it puts
@@ -1519,12 +1765,17 @@ fn verify_chunk(rec: &ChunkRec, packed: &[u8]) -> Result<Vec<u8>> {
     if coded > MAX_CODED_CHUNK {
         bail!("corrupt manifest: implausible coded chunk size");
     }
+    // The codec's own words for a broken stream are things like "dist
+    // overflow", which mean nothing to whoever is looking at a damaged backup;
+    // the reason is kept, but it arrives behind a sentence that says what
+    // happened.
     let mut data = codec::decompress(
         Codec::from_id(rec.codec)?,
         packed,
         coded as usize,
         rec.param,
-    )?;
+    )
+    .context("block did not decode - the archive is damaged here")?;
     // Undo the pre-compression transform before checking the hash: the hash
     // was taken over the original bytes, so it also proves the filter round
     // -tripped exactly.

@@ -1,0 +1,29 @@
+[package]
+name = "nova-lzma"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+description = "7-Zip's own LZMA2 encoder behind a safe Rust API for Nova Prism"
+
+# This crate exists for one reason: nova-core is `#![forbid(unsafe_code)]` and
+# the LZMA SDK is C. All of the FFI lives here, the way libbsc's lives in
+# nova-bsc and every OS call lives in nova-platform.
+#
+# The C sources are VENDORED rather than pulled from a wrapper crate, for two
+# reasons: nova has no licence yet (D11) so the provenance of every file has to
+# be checkable here (`vendor/NOTICE.md`), and the one wrapper on crates.io does
+# not link the threaded match finder at all.
+#
+# ENCODER ONLY. The decoder stays `lzma-rust2`, pure Rust and no unsafe, so the
+# read path — the one an archive is judged on years later — keeps its safety
+# properties. That split is possible because what the SDK writes is an ORDINARY
+# LZMA2 stream: `nova-core`'s existing reader decodes it byte for byte, which
+# `test/probe-preflate --bin sdklzma` checks on real units and the round-trip
+# tests check on every build.
+
+[dependencies]
+anyhow.workspace = true
+
+[build-dependencies]
+cc = "1"

@@ -3,6 +3,7 @@ name = "nova-cli"
 version.workspace = true
 edition.workspace = true
 repository.workspace = true
+license.workspace = true
 description = "Command-line interface for the NOVA archive format (Nova Prism)"
 
 [[bin]]

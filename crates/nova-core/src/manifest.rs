@@ -62,6 +62,30 @@ pub struct FileEntry {
     /// inside a shared unit; a large file is a run of extents across units.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extents: Vec<Extent>,
+    /// Sub-second part of `mtime`, in nanoseconds.
+    ///
+    /// NTFS keeps time to 100 ns and every other archiver rounds it away; a
+    /// restored tree with every timestamp truncated to the second is a
+    /// different tree, and build systems notice. Separate from `mtime` rather
+    /// than folded into it so that archives written before this field decode
+    /// unchanged.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub mtime_nanos: u32,
+    /// Windows attributes worth restoring: read-only, hidden, system,
+    /// not-indexed. Zero on every other platform and on an ordinary Windows
+    /// file, which is what keeps it out of the manifest almost always —
+    /// `FILE_ATTRIBUTE_ARCHIVE` is deliberately not among them.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub attrs: u32,
+    /// A DIRECTORY, not a file. It carries no bytes; it exists so that an
+    /// empty folder survives the round trip and so a folder's own attributes
+    /// and timestamp do.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub dir: bool,
+}
+
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
 }
 
 /// A byte range of one compression unit.

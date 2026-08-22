@@ -18,7 +18,7 @@
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{Seek, SeekFrom, Write};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex};
 
 use anyhow::{anyhow, bail, Result};
@@ -156,6 +156,10 @@ struct Job {
     /// Codecs to try, with their per-codec parameter. More than one means the
     /// max tier's tournament: compress with each, keep the smallest.
     candidates: Vec<(Codec, u8)>,
+    /// What the analyzer said this unit is. Carried for diagnostics only —
+    /// the entrant list was already chosen from it — so that a trace can
+    /// answer "which codec wins on which kind of data" from a real pack.
+    kind: Option<crate::analyze::Class>,
     /// Reversible transform to apply before compressing (0 = none).
     filter: u8,
     /// Set when this unit is one piece of a .wav that was too large to be
@@ -180,6 +184,104 @@ struct Done {
     filtered: u64,
     hash: [u8; 16],
     charge: u64,
+}
+
+/// Idle worker slots, which a job may borrow to run its own entrants side by
+/// side instead of one after another.
+///
+/// The max tier makes FEW units — enwik8 is 2, a source tree 5 — so on eight
+/// cores most of the machine is idle while one worker runs a unit's entrants in
+/// sequence. Borrowing turns that sequence into a parallel one at no cost in
+/// bytes: which entrant wins is decided by size and by position in the field,
+/// never by which finished first.
+///
+/// The cap is the worker count, and that is the whole point of counting rather
+/// than just spawning: `Tier::worker_memory` budgets ONE codec's tables per
+/// worker, so as long as concurrent codec runs never exceed the worker count,
+/// the memory model is exactly the one that was already measured. A job that
+/// finds nothing free simply runs its entrants in sequence.
+struct Slots {
+    workers: usize,
+    /// Units submitted and not yet finished — waiting in the channel and
+    /// running in a worker count THE SAME. Two counters would leave a window
+    /// between a worker taking a job and marking itself busy, in which that
+    /// job's own slot looks free and can be lent away.
+    outstanding: AtomicUsize,
+    /// Slots lent out to jobs running entrants in parallel.
+    lent: AtomicUsize,
+    /// Set once the reader has submitted its last unit.
+    sealed: AtomicBool,
+}
+
+impl Slots {
+    fn new(workers: usize) -> Self {
+        Slots {
+            workers,
+            outstanding: AtomicUsize::new(0),
+            lent: AtomicUsize::new(0),
+            sealed: AtomicBool::new(false),
+        }
+    }
+
+    fn submitted(&self) {
+        self.outstanding.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn finished(&self) {
+        // Saturating, not wrapping: an unbalanced count would go to usize::MAX
+        // and quietly switch lending off for the rest of the run.
+        let _ = self
+            .outstanding
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                Some(n.saturating_sub(1))
+            });
+    }
+
+    /// No more units are coming, so an idle worker will stay idle.
+    fn seal(&self) {
+        self.sealed.store(true, Ordering::Release);
+    }
+
+    /// Take up to `want` idle slots; returns how many were granted.
+    ///
+    /// NOTHING IS LENT WHILE THE READER IS STILL PRODUCING, and that is not
+    /// caution, it is measured: an idle worker mid-run is usually a worker
+    /// between jobs, so lending its slot oversubscribes the machine a moment
+    /// later. Doing it on the free count alone cost 6-8% of wall clock on the
+    /// corpora with many units (Silesia 29.1 → 31.0 s, Firefox 45.0 → 48.2)
+    /// while helping the few-unit ones. Once the reader is done the count is
+    /// honest — nothing new can arrive — and the tail is exactly where units
+    /// run out before cores do.
+    fn borrow(&self, want: usize) -> usize {
+        if want == 0 || !self.sealed.load(Ordering::Acquire) {
+            return 0;
+        }
+        let mut lent = self.lent.load(Ordering::Acquire);
+        loop {
+            let free = self
+                .workers
+                .saturating_sub(self.outstanding.load(Ordering::Acquire) + lent);
+            let take = want.min(free);
+            if take == 0 {
+                return 0;
+            }
+            match self.lent.compare_exchange_weak(
+                lent,
+                lent + take,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return take,
+                Err(seen) => lent = seen,
+            }
+        }
+    }
+
+    fn give_back(&self, n: usize) {
+        if n > 0 {
+            self.lent.fetch_sub(n, Ordering::AcqRel);
+        }
+    }
 }
 
 /// How often the governor re-reads how much memory the machine has left.
@@ -346,12 +448,14 @@ where
     // The governor lives as long as the packing run and is asked to stop
     // through this flag, so it cannot outlive the borrowed budget.
     let running = AtomicBool::new(true);
+    let slots = Slots::new(workers);
 
     std::thread::scope(|scope| -> Result<PackOutput> {
         for _ in 0..workers {
             let job_rx: Receiver<Job> = job_rx.clone();
             let done_tx: Sender<Result<Done>> = done_tx.clone();
-            scope.spawn(move || worker_loop(job_rx, done_tx, level));
+            let slots = &slots;
+            scope.spawn(move || worker_loop(job_rx, done_tx, level, slots));
         }
         drop(job_rx);
         drop(done_tx);
@@ -374,12 +478,15 @@ where
         let mut submitter = Submitter {
             tx: Some(job_tx),
             budget: &budget,
+            slots: &slots,
             next_seq: 0,
         };
         let produced = produce(&mut submitter);
         // Closing the job channel drains the workers, which closes the done
-        // channel, which lets the writer finish.
+        // channel, which lets the writer finish. From here an idle worker is
+        // idle for good, so the jobs still running may take its slot.
         submitter.tx = None;
+        slots.seal();
         if produced.is_err() {
             budget.abort();
         }
@@ -396,6 +503,7 @@ where
 pub struct Submitter<'a> {
     tx: Option<Sender<Job>>,
     budget: &'a Budget,
+    slots: &'a Slots,
     next_seq: u64,
 }
 
@@ -409,7 +517,7 @@ impl Submitter<'_> {
 
     /// Hand a chunk to the pipeline; returns its index within this run.
     pub fn submit(&mut self, data: Vec<u8>, hash: [u8; 16], codec: Codec) -> Result<u32> {
-        self.submit_filtered(data, hash, vec![(codec, 0)], 0)
+        self.submit_filtered(data, hash, vec![(codec, 0)], 0, None)
     }
 
     /// As [`Self::submit`], but with a reversible filter (see
@@ -420,8 +528,9 @@ impl Submitter<'_> {
         hash: [u8; 16],
         candidates: Vec<(Codec, u8)>,
         filter: u8,
+        kind: Option<crate::analyze::Class>,
     ) -> Result<u32> {
-        self.submit_job(data, hash, candidates, filter, None)
+        self.submit_job(data, hash, candidates, filter, None, kind)
     }
 
     /// As [`Self::submit_filtered`], for one piece of a split .wav.
@@ -438,6 +547,7 @@ impl Submitter<'_> {
             candidates,
             crate::filters::Filter::Wav.id(),
             Some(piece),
+            Some(crate::analyze::Class::Wav),
         )
     }
 
@@ -448,6 +558,7 @@ impl Submitter<'_> {
         candidates: Vec<(Codec, u8)>,
         filter: u8,
         wav: Option<crate::wav::Piece>,
+        kind: Option<crate::analyze::Class>,
     ) -> Result<u32> {
         // Input plus a worst-case output buffer of the same size.
         let charge = data.len() as u64 * 2;
@@ -460,12 +571,14 @@ impl Submitter<'_> {
             data,
             hash,
             candidates,
+            kind,
             filter,
             wav,
             charge,
         };
         match self.tx.as_ref().expect("submitter closed").send(job) {
             Ok(()) => {
+                self.slots.submitted();
                 self.next_seq += 1;
                 u32::try_from(seq).map_err(|_| anyhow!("too many chunks in one operation"))
             }
@@ -477,7 +590,7 @@ impl Submitter<'_> {
     }
 }
 
-fn worker_loop(rx: Receiver<Job>, tx: Sender<Result<Done>>, level: i32) {
+fn worker_loop(rx: Receiver<Job>, tx: Sender<Result<Done>>, level: i32, slots: &Slots) {
     // One compressor per worker: allocating a zstd context per chunk would
     // dominate the cost for small chunks.
     let mut comp = zstd::bulk::Compressor::new(level).ok();
@@ -489,23 +602,280 @@ fn worker_loop(rx: Receiver<Job>, tx: Sender<Result<Done>>, level: i32) {
         ));
     }
     while let Ok(job) = rx.recv() {
-        let out = compress_job(comp.as_mut(), job, level);
+        // The job stops counting only when it is done, so the slot this
+        // worker is using can never be lent to another job's entrants.
+        let out = compress_job(comp.as_mut(), job, level, slots);
+        slots.finished();
         if tx.send(out).is_err() {
             break; // writer is gone
         }
     }
 }
 
+/// One entrant's result on one unit, for `NOVA_TOURNEY_TRACE`.
+struct TraceCandidate {
+    seq: u64,
+    kind: Option<crate::analyze::Class>,
+    filter: u8,
+    /// Original length, before any filter — what the ratio should be read against.
+    unpacked: u64,
+    /// What the codec was actually handed, which a rebuilding filter changes.
+    fed: u64,
+    codec: Codec,
+    param: u8,
+    coded: u64,
+    elapsed: std::time::Duration,
+}
+
+/// Where the tournament trace goes, opened once. `None` — the normal case —
+/// when `NOVA_TOURNEY_TRACE` is unset or the file cannot be created.
+static TOURNEY_TRACE: std::sync::OnceLock<Option<Mutex<File>>> = std::sync::OnceLock::new();
+
+/// Record what one entrant produced and what it cost.
+///
+/// The tournament is the max tier's dominant cost: every unit is compressed
+/// once per entrant and all but one result is thrown away. Whether an entrant
+/// earns that CPU is a question about real units — a per-file probe answers a
+/// different one and has been wrong before — so the answer has to come out of
+/// an ordinary pack. Diagnostics only: the rows change nothing that is written,
+/// and nothing is opened unless the variable is set.
+fn trace_candidate(c: TraceCandidate) {
+    let sink = TOURNEY_TRACE.get_or_init(|| {
+        let path = std::env::var_os("NOVA_TOURNEY_TRACE")?;
+        let mut f = File::create(path).ok()?;
+        writeln!(
+            f,
+            "seq\tkind\tfilter\tunpacked\tfed\tcodec\tparam\tcoded\tms"
+        )
+        .ok()?;
+        Some(Mutex::new(f))
+    });
+    let Some(sink) = sink.as_ref() else { return };
+    let kind = match c.kind {
+        Some(k) => format!("{k:?}"),
+        None => "-".to_string(),
+    };
+    let Ok(mut f) = sink.lock() else { return };
+    let _ = writeln!(
+        f,
+        "{}\t{}\t{}\t{}\t{}\t{:?}\t{}\t{}\t{:.1}",
+        c.seq,
+        kind,
+        c.filter,
+        c.unpacked,
+        c.fed,
+        c.codec,
+        c.param,
+        c.coded,
+        c.elapsed.as_secs_f64() * 1000.0
+    );
+}
+
+/// Units below this run the whole field: the tournament on a few megabytes
+/// costs about a second, which is less than a qualifier could save, and a
+/// sample of something this small says little.
+const QUALIFY_FROM: usize = 4 * 1024 * 1024;
+
+/// The qualifier judges from this fraction of the unit — measured against 1/8
+/// and 1/32 on the same units: 1/16 ranks as well as 1/8 (the widest window a
+/// true winner needed is 10.4% against 10.1%) for half the cost, while 1/32
+/// starts to blur (11.7%) and saves nothing more.
+const QUALIFY_FRACTION: usize = 16;
+
+/// ...taken as this many runs spread across it, never as one prefix. A unit is
+/// often thousands of files and its first eighth can be one file type: at equal
+/// cost the prefix shape needed a 20% window to lose nothing where the spread
+/// shape needed 15%, and it mis-ranked twice as many units at every window
+/// below that.
+const QUALIFY_SLICES: usize = 8;
+
+/// How far behind the sample's best an entrant may be and still run.
+///
+/// One window for the whole field is the wrong shape, because a sample does not
+/// under-state every entrant equally. MEASURED over the 36 units of at least
+/// 4 MiB in `test/tourney` (enwik8, Silesia, a source tree, an installed
+/// Firefox, PDFs, the deflate corpus): going from the sample to the whole unit
+/// gains LZMA2 14.7% on average and PPMd7 10.5%, and on a source tree — where
+/// the win is cross-file duplication that only a full-size dictionary reaches —
+/// LZMA2 gains 7 to 16 POINTS more than bsc. A window that ignores that prunes
+/// LZMA2 on exactly the data it wins.
+///
+/// So LZMA2's window is wide. Of the eleven units whose sample winner is not
+/// their real winner, the widest gap a true winner had to survive was 10.1%,
+/// and 15% leaves half again as much headroom. PPMd7's is narrow because its
+/// bias runs the other way — the sample FLATTERS it — and bsc has none at all:
+/// it is 6% of the tournament's CPU and wins 41% of the units, so it always
+/// runs and four of those eleven cases stop being risks.
+const QUALIFY_WINDOW_LZMA: u64 = 15;
+const QUALIFY_WINDOW_PPMD: u64 = 2;
+
+/// Split `items` into lanes — one per idle worker slot this job can borrow,
+/// plus the worker's own — run `f` over each lane and return the lanes'
+/// results in order.
+///
+/// `f` is handed a slice and the index its first element has in `items`, so a
+/// lane can fold as it goes instead of handing back everything it produced.
+/// That matters: a tournament that keeps all four coded buffers alive at once
+/// holds tens of megabytes per job for nothing, and it measured 10% of the wall
+/// clock on Firefox.
+///
+/// Lane results come back in lane order, so nothing downstream can tell which
+/// lane finished first — a tournament's verdict has to be a function of the
+/// bytes (I12).
+fn race<T, R, F>(items: &[T], slots: &Slots, f: F) -> Result<Vec<R>>
+where
+    T: Sync,
+    R: Send,
+    F: Fn(&[T], usize) -> Result<R> + Sync,
+{
+    let extra = if items.len() > 1 {
+        slots.borrow(items.len() - 1)
+    } else {
+        0
+    };
+    if extra == 0 {
+        return Ok(vec![f(items, 0)?]);
+    }
+    let per = items.len().div_ceil(extra + 1);
+    let f = &f;
+    let out: Result<Vec<R>> = std::thread::scope(|scope| {
+        let lanes: Vec<_> = items
+            .chunks(per)
+            .enumerate()
+            .skip(1)
+            .map(|(n, chunk)| scope.spawn(move || f(chunk, n * per)))
+            .collect();
+        let mut out = match items.chunks(per).next() {
+            Some(chunk) => vec![f(chunk, 0)?],
+            None => Vec::new(),
+        };
+        for lane in lanes {
+            out.push(
+                lane.join()
+                    .map_err(|_| anyhow!("a tournament lane panicked"))??,
+            );
+        }
+        Ok(out)
+    });
+    slots.give_back(extra);
+    out
+}
+
+/// Thin the field before it runs, by racing it over a sample of this very unit.
+///
+/// The max tier's four entrants cost four compressions and keep one result.
+/// Measured across 83 real units, LZMA2 alone is 61% of that CPU while winning
+/// 41% of the units, and no static rule can drop it: prose and source code are
+/// both `Class::Text` and want opposite codecs — bsc beats LZMA2 by 15-25% on
+/// enwik8, LZMA2 beats bsc by 9-39% on a source tree.
+///
+/// So the choice is made from the data rather than from the class, and from
+/// THIS unit rather than from a per-file probe — the lesson of N24, where an
+/// entrant that won every file won zero units. On the six corpora it was tuned
+/// against it prunes an entrant that would have won ZERO times, for a third of
+/// the tournament's CPU and a quarter of its critical path.
+fn qualify(
+    candidates: Vec<(Codec, u8)>,
+    data: &[u8],
+    level: i32,
+    slots: &Slots,
+) -> Vec<(Codec, u8)> {
+    if candidates.len() < 3 || data.len() < QUALIFY_FROM {
+        return candidates;
+    }
+    let sample = spread_sample(data, data.len() / QUALIFY_FRACTION);
+    // A codec that fails on the sample is not evidence about the unit, so the
+    // field goes through untouched and the real run decides.
+    let Ok(lanes) = race(&candidates, slots, |lane: &[(Codec, u8)], _| {
+        lane.iter()
+            .map(|&(codec, param)| {
+                codec::compress(codec, level, param, &sample).map(|c| c.len() as u64)
+            })
+            .collect::<Result<Vec<u64>>>()
+    }) else {
+        return candidates;
+    };
+    let sizes: Vec<u64> = lanes.concat();
+    let Some(&best) = sizes.iter().min() else {
+        return candidates;
+    };
+    // The two PPMd7 orders cost the same and rank almost together, so at most
+    // one of them runs: the sample's preference, ties to the lower order.
+    let ppmd_pick = candidates
+        .iter()
+        .zip(&sizes)
+        .filter(|((codec, _), _)| *codec == Codec::Ppmd7)
+        .min_by_key(|((_, param), &size)| (size, *param))
+        .map(|((_, param), _)| *param);
+    // Integer arithmetic and the original order, because this decides what goes
+    // into the archive: the same unit must field the same entrants in the same
+    // sequence on every machine and at every thread count (I8), and the
+    // tournament breaks a tie in favour of whoever ran first.
+    let kept: Vec<(Codec, u8)> = candidates
+        .iter()
+        .zip(&sizes)
+        .filter(|(&(codec, param), &size)| match codec {
+            Codec::Bsc => true,
+            Codec::Ppmd7 => {
+                Some(param) == ppmd_pick && size * 100 <= best * (100 + QUALIFY_WINDOW_PPMD)
+            }
+            _ => size * 100 <= best * (100 + QUALIFY_WINDOW_LZMA),
+        })
+        .map(|(&c, _)| c)
+        .collect();
+    if kept.is_empty() {
+        candidates
+    } else {
+        kept
+    }
+}
+
+/// `n` bytes of `data` as `QUALIFY_SLICES` evenly spread runs.
+fn spread_sample(data: &[u8], n: usize) -> Vec<u8> {
+    let run = n / QUALIFY_SLICES;
+    let step = data.len() / QUALIFY_SLICES;
+    let mut out = Vec::with_capacity(n);
+    for i in 0..QUALIFY_SLICES {
+        let start = i * step;
+        out.extend_from_slice(&data[start..(start + run).min(data.len())]);
+    }
+    out
+}
+
+/// Write the bytes the tournament is about to see to `NOVA_UNIT_DUMP=<dir>`,
+/// one file per unit, named `<seq>-<kind>.bin`.
+///
+/// Post-filter on purpose: an entrant sees x86-split or preflate output, not
+/// the original file, so a rule tuned on files would be tuned on different
+/// data. With the dump, a rule can be tried against real units offline instead
+/// of by re-packing a corpus for every threshold. Diagnostics only.
+fn dump_unit(seq: u64, kind: Option<crate::analyze::Class>, data: &[u8]) {
+    let Some(dir) = std::env::var_os("NOVA_UNIT_DUMP") else {
+        return;
+    };
+    let kind = match kind {
+        Some(k) => format!("{k:?}"),
+        None => "none".to_string(),
+    };
+    let dir = std::path::PathBuf::from(dir);
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let _ = std::fs::write(dir.join(format!("{seq:04}-{kind}.bin")), data);
+}
+
 fn compress_job(
-    mut comp: Option<&mut zstd::bulk::Compressor<'_>>,
+    comp: Option<&mut zstd::bulk::Compressor<'_>>,
     job: Job,
     level: i32,
+    slots: &Slots,
 ) -> Result<Done> {
     let Job {
         seq,
         mut data,
         hash,
         candidates,
+        kind,
         filter,
         wav,
         charge,
@@ -544,7 +914,9 @@ fn compress_job(
         Ok(a) => a,
         Err(_) => {
             let data = original.take().unwrap_or(data);
-            return plain(seq, data, hash, charge, unpacked, candidates, comp, level);
+            return plain(
+                seq, data, hash, charge, unpacked, candidates, kind, comp, level, slots,
+            );
         }
     };
     let filtered = data.len() as u64;
@@ -569,7 +941,9 @@ fn compress_job(
                     .expect("a rebuilt filter keeps the original")
             }
         }
-        return plain(seq, data, hash, charge, unpacked, candidates, comp, level);
+        return plain(
+            seq, data, hash, charge, unpacked, candidates, kind, comp, level, slots,
+        );
     }
 
     // Bit-exact or nothing. A transform that builds a new representation has to
@@ -584,30 +958,70 @@ fn compress_job(
             let data = original
                 .take()
                 .expect("a rebuilt filter keeps the original");
-            return plain(seq, data, hash, charge, unpacked, candidates, comp, level);
+            return plain(
+                seq, data, hash, charge, unpacked, candidates, kind, comp, level, slots,
+            );
         }
     }
 
     // Try every candidate and keep the smallest result. With one candidate
     // this is just "compress"; with several it is the max tier's tournament,
     // which trades encode time for ratio because no static rule picks the
-    // right codec for arbitrary data.
-    let mut best: Option<(Codec, u8, Vec<u8>)> = None;
-    for (codec, param) in candidates {
-        let packed = match codec {
-            Codec::Store => break,
-            // The per-worker zstd context is reused across chunks; allocating
-            // one per chunk would dominate the cost of small chunks.
-            Codec::Zstd => match comp.as_deref_mut() {
-                Some(c) => c.compress(&data)?,
-                None => codec::compress(Codec::Zstd, level, param, &data)?,
-            },
-            other => codec::compress(other, level, param, &data)?,
+    // right codec for arbitrary data — but the field is thinned first, by
+    // running it over a sample of this very unit, and what survives runs side
+    // by side when the machine has idle workers to lend.
+    dump_unit(seq, kind, &data);
+    let candidates = qualify(candidates, &data, level, slots);
+    let stored = candidates.first().is_some_and(|&(c, _)| c == Codec::Store);
+    let mut best: Option<(usize, Vec<u8>)> = None;
+    if !stored {
+        // One lane keeps only its own smallest result: a tie goes to whoever is
+        // earlier in the FIELD, never to whoever finished first, so the archive
+        // cannot depend on scheduling.
+        let lane = |lane: &[(Codec, u8)], base: usize| -> Result<Option<(usize, Vec<u8>)>> {
+            let mut won: Option<(usize, Vec<u8>)> = None;
+            for (i, &(codec, param)) in lane.iter().enumerate() {
+                let started = std::time::Instant::now();
+                let packed = codec::compress(codec, level, param, &data)?;
+                trace_candidate(TraceCandidate {
+                    seq,
+                    kind,
+                    filter,
+                    unpacked,
+                    fed: data.len() as u64,
+                    codec,
+                    param,
+                    coded: packed.len() as u64,
+                    elapsed: started.elapsed(),
+                });
+                if won.as_ref().is_none_or(|(_, w)| packed.len() < w.len()) {
+                    won = Some((base + i, packed));
+                }
+            }
+            Ok(won)
         };
-        if best.as_ref().is_none_or(|(_, _, b)| packed.len() < b.len()) {
-            best = Some((codec, param, packed));
-        }
+        // The zstd context is per worker and reused across chunks, because
+        // allocating one per chunk would dominate the cost of a small one. It
+        // is only ever a lone candidate (the max field has no zstd), so it
+        // stays on the sequential path where the worker owns it.
+        best = match candidates.as_slice() {
+            [(Codec::Zstd, _)] => match comp {
+                Some(c) => Some((0, c.compress(&data)?)),
+                None => Some((0, codec::compress(Codec::Zstd, level, 0, &data)?)),
+            },
+            rest => race(rest, slots, lane)?.into_iter().flatten().fold(
+                None,
+                |won: Option<(usize, Vec<u8>)>, next| match won {
+                    Some(w) if w.1.len() <= next.1.len() => Some(w),
+                    _ => Some(next),
+                },
+            ),
+        };
     }
+    let best = best.map(|(i, payload)| {
+        let (codec, param) = candidates[i];
+        (codec, param, payload)
+    });
 
     // Three things could be kept, and the smallest wins as long as it beats the
     // ORIGINAL length — not the filtered one, or a filter that expands 2 MB of
@@ -672,8 +1086,10 @@ fn plain(
     charge: u64,
     unpacked: u64,
     candidates: Vec<(Codec, u8)>,
+    kind: Option<crate::analyze::Class>,
     comp: Option<&mut zstd::bulk::Compressor<'_>>,
     level: i32,
+    slots: &Slots,
 ) -> Result<Done> {
     compress_job(
         comp,
@@ -682,11 +1098,13 @@ fn plain(
             data,
             hash,
             candidates,
+            kind,
             filter: 0,
             wav: None,
             charge,
         },
         level,
+        slots,
     )
     .map(|mut d| {
         d.unpacked = unpacked;
@@ -786,4 +1204,131 @@ fn writer_loop(
         chunks,
         bytes_stored,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The max tier's field, in the order `Tier::candidates` builds it.
+    fn field() -> Vec<(Codec, u8)> {
+        vec![
+            (Codec::Lzma2, 0),
+            (Codec::Ppmd7, 10),
+            (Codec::Ppmd7, 16),
+            (Codec::Bsc, 0),
+        ]
+    }
+
+    /// Prose-shaped bytes: enough structure that the entrants disagree, which
+    /// is what gives the qualifier something to decide.
+    fn wordy(n: usize) -> Vec<u8> {
+        let words = [
+            "the", "unit", "codec", "sample", "window", "entrant", "archive", "byte",
+        ];
+        let mut seed = 0x243F_6A88_85A3_08D3u64;
+        let mut out = Vec::with_capacity(n + 16);
+        while out.len() < n {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            out.extend_from_slice(words[(seed >> 33) as usize % words.len()].as_bytes());
+            out.push(b' ');
+        }
+        out.truncate(n);
+        out
+    }
+
+    /// Whatever the sample says, bsc runs: it is 6% of the tournament's CPU and
+    /// wins 41% of real units, so it is the field's floor rather than a
+    /// candidate. And the survivors keep the field's order, because the
+    /// tournament breaks a tie in favour of whoever ran first.
+    #[test]
+    fn bsc_always_survives_and_order_is_kept() {
+        let data = wordy(6 * 1024 * 1024);
+        let kept = qualify(field(), &data, 19, &Slots::new(1));
+        assert!(kept.contains(&(Codec::Bsc, 0)), "bsc was pruned: {kept:?}");
+        assert!(kept.len() < 4, "nothing was pruned on prose: {kept:?}");
+        let ids: Vec<u8> = kept.iter().map(|(c, _)| c.id()).collect();
+        let mut sorted = ids.clone();
+        sorted.sort_unstable();
+        assert_eq!(ids, sorted, "the field was reordered: {kept:?}");
+    }
+
+    /// At most one PPMd7 order runs: the pair costs the same twice and ranks
+    /// almost together.
+    #[test]
+    fn at_most_one_ppmd_order_runs() {
+        let data = wordy(6 * 1024 * 1024);
+        let kept = qualify(field(), &data, 19, &Slots::new(1));
+        assert!(kept.iter().filter(|(c, _)| *c == Codec::Ppmd7).count() <= 1);
+    }
+
+    /// Small units keep the whole field: a tournament on a few megabytes costs
+    /// about a second, which is less than a qualifier could save.
+    #[test]
+    fn a_small_unit_is_not_qualified() {
+        let data = wordy(QUALIFY_FROM - 1);
+        assert_eq!(qualify(field(), &data, 19, &Slots::new(1)), field());
+    }
+
+    /// Lanes must not reorder anything: the tournament breaks a tie by
+    /// position in the field, so results have to come back in that order
+    /// whether they ran side by side or one after another.
+    #[test]
+    fn lanes_do_not_reorder_results() {
+        let items: Vec<usize> = (0..7).collect();
+        let f = |lane: &[usize], _base: usize| {
+            Ok(lane
+                .iter()
+                .map(|i| vec![*i as u8; i + 1])
+                .collect::<Vec<_>>())
+        };
+        let one = Slots::new(1);
+        one.seal();
+        let many = Slots::new(8);
+        many.seal();
+        let alone = race(&items, &one, f).expect("no lane fails").concat();
+        let borrowed = race(&items, &many, f).expect("no lane fails").concat();
+        assert_eq!(alone, borrowed);
+        assert!(alone.iter().enumerate().all(|(i, v)| v.len() == i + 1));
+    }
+
+    /// A slot a worker is using is not free to lend, and what is lent comes
+    /// back — including when a lane fails, or the pool would bleed out and
+    /// every later unit would run its entrants in sequence.
+    #[test]
+    fn slots_are_accounted_for() {
+        let slots = Slots::new(4);
+        slots.seal();
+        slots.submitted();
+        assert_eq!(slots.borrow(4), 3, "a running job's own slot was lent");
+        slots.give_back(3);
+        slots.finished();
+
+        let items: Vec<usize> = (0..4).collect();
+        race(&items, &slots, |_: &[usize], _| Ok(Vec::<u8>::new())).expect("no lane fails");
+        assert_eq!(slots.borrow(4), 4, "slots were not returned");
+        slots.give_back(4);
+
+        let failed = race(&items, &slots, |lane: &[usize], _| {
+            if lane.contains(&2) {
+                bail!("this lane fails")
+            } else {
+                Ok(Vec::<u8>::new())
+            }
+        });
+        assert!(failed.is_err());
+        assert_eq!(slots.borrow(4), 4, "a failing lane kept its slots");
+    }
+
+    /// I12: the same bytes must field the same entrants every time, or I8 goes
+    /// with it the moment a thread count changes.
+    #[test]
+    fn the_verdict_is_a_function_of_the_bytes() {
+        let data = wordy(5 * 1024 * 1024);
+        let once = qualify(field(), &data, 19, &Slots::new(1));
+        assert_eq!(once, qualify(field(), &data, 19, &Slots::new(1)));
+        assert!(!once.is_empty());
+    }
 }
