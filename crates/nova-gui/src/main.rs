@@ -239,12 +239,24 @@ fn open_archive(path: String) -> Result<ArchiveInfo, String> {
             // A file that shares its compression unit with other files, or
             // spans several, is worth flagging: extracting it decompresses
             // more than the file itself.
-            solid: !f.dir
-                && f.extents.len() != 1
-                || a.manifest
+            //
+            // Matched on the slice rather than indexed. `extents[0]` panicked
+            // on the FIRST entry of any archive that stores folders, because a
+            // directory carries no bytes and its extent list is empty -- and
+            // folders only started being stored in 0.9.0, so nothing had ever
+            // reached this line with an empty list before.
+            solid: match f.extents.as_slice() {
+                // A folder, or an empty file: no bytes, so nothing is shared.
+                [] => false,
+                // One unit, shared if it holds more than just this file.
+                [e] => a
+                    .manifest
                     .chunks
-                    .get(f.extents[0].unit as usize)
+                    .get(e.unit as usize)
                     .is_some_and(|u| u.unpacked != f.size),
+                // Several units: extracting it touches every one of them.
+                _ => true,
+            },
         })
         .collect();
     Ok(ArchiveInfo {
@@ -618,6 +630,45 @@ mod tests {
 
     fn args(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Opening an archive that stores a FOLDER used to panic, and a panic in a
+    /// Tauri command takes the whole window with it -- the reported symptom was
+    /// "it opens and dies two seconds later".
+    ///
+    /// A folder carries no bytes, so its extent list is empty, and the "is this
+    /// file sharing its unit" check indexed `extents[0]` unconditionally.
+    /// Nothing had ever hit it, because folders only started being stored in
+    /// 0.9.0. The folder is normally the first entry, so this was every archive
+    /// packed from a directory.
+    #[test]
+    fn an_archive_that_stores_a_folder_opens() {
+        let tmp = tempfile::tempdir().expect("a temp dir");
+        let tree = tmp.path().join("tree");
+        std::fs::create_dir_all(tree.join("sub")).expect("a tree");
+        std::fs::write(tree.join("sub").join("a.txt"), b"hello").expect("a file");
+        // An empty file has no extents either, for the same reason.
+        std::fs::write(tree.join("empty.bin"), b"").expect("an empty file");
+        std::fs::create_dir(tree.join("nothing-here")).expect("an empty folder");
+
+        let archive = tmp.path().join("t.nva");
+        {
+            let mut a = nova_core::Archive::create(&archive).expect("a new archive");
+            a.add_paths(&[tree], &super::pack_options("normal", Some(1), None))
+                .expect("packs");
+        }
+
+        let info = super::open_archive(archive.to_string_lossy().into_owned()).expect("opens");
+        let dirs: Vec<_> = info.entries.iter().filter(|e| e.dir).collect();
+        assert!(!dirs.is_empty(), "the folders are listed");
+        assert!(
+            dirs.iter().all(|e| !e.solid),
+            "a folder holds no bytes, so it shares no unit with anything"
+        );
+        assert!(
+            info.entries.iter().any(|e| e.path.ends_with("a.txt")),
+            "and the file inside it survived the trip"
+        );
     }
 
     /// A path that is not there is not a task. Explorer never sends one, but a

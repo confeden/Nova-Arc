@@ -23,6 +23,9 @@ tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
 tauri-plugin-opener = "2"
 
+[dev-dependencies]
+tempfile.workspace = true
+
 [features]
 # Keeps `cargo build` for the workspace from needing a frontend bundle.
 custom-protocol = ["tauri/custom-protocol"]

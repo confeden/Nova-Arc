@@ -20,10 +20,18 @@
 ; file type WITHOUT taking its association away, so whatever opens .zip today
 ; keeps opening it.
 
+; ExtendedSubCommandsKey is resolved RELATIVE TO HKEY_CLASSES_ROOT, not to the
+; hive the verb was written into. Writing "Software\Classes\NovaPrism.Pack"
+; sends the shell looking for HKCR\Software\Classes\NovaPrism.Pack, which is
+; nowhere: the menu then loses its submenu AND its command, so it renders as a
+; single flat "Nova Prism" item and clicking it gives "This file does not have
+; an app associated with it for performing this action". Windows' own entries
+; are the reference -- OfflineFilesSync points at "OfflineFilesSyncActions",
+; not at "Software\Classes\OfflineFilesSyncActions".
 !macro NOVA_MENU_ROOT KEY TITLE SUBKEY
   WriteRegStr SHCTX "Software\Classes\${KEY}\shell\NovaPrism" "MUIVerb" "${TITLE}"
   WriteRegStr SHCTX "Software\Classes\${KEY}\shell\NovaPrism" "Icon" "$INSTDIR\${MAINBINARYNAME}.exe,0"
-  WriteRegStr SHCTX "Software\Classes\${KEY}\shell\NovaPrism" "ExtendedSubCommandsKey" "Software\Classes\${SUBKEY}"
+  WriteRegStr SHCTX "Software\Classes\${KEY}\shell\NovaPrism" "ExtendedSubCommandsKey" "${SUBKEY}"
 !macroend
 
 !macro NOVA_MENU_ITEM SUBKEY ORDER LABEL ARGS
