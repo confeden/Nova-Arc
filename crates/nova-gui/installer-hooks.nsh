@@ -1,7 +1,7 @@
 ﻿; Explorer's context menu, added on install and removed on uninstall.
 ;
 ; A CASCADING menu, built entirely from the registry: one "Nova Prism" entry
-; that opens into verbs. `ExtendedSubCommandsKey` is what makes it cascade
+; that opens into verbs. An empty `SubCommands` is what makes it cascade
 ; without a COM handler — the alternative is an IExplorerCommand DLL, which is
 ; also the only way onto Windows 11's *short* menu. Here the entry lands in the
 ; short menu on Windows 10 and under "Show more options" on Windows 11, which
@@ -12,24 +12,29 @@
 ; unconditionally would need admin rights the per-user path does not have.
 ;
 ; ---------------------------------------------------------------------------
-; THE SHAPE HERE IS COPIED FROM WINDOWS' OWN WORKING CASCADE, and it took two
-; wrong attempts to get here, both of which rendered as one FLAT "Nova Prism"
-; item that answered a click with "This file does not have an app associated
-; with it for performing this action":
+; THE CASCADE FLAG IS AN EMPTY `SubCommands`, and it took three attempts to
+; land on that. The first two rendered one FLAT "Nova Prism" item; the first
+; also answered a click with "This file does not have an app associated with it
+; for performing this action":
 ;
-;   1. ExtendedSubCommandsKey = "Software\Classes\NovaPrism.Pack". The value is
-;      resolved relative to HKEY_CLASSES_ROOT, not to the hive the verb was
-;      written into, so the shell went looking in
-;      HKCR\Software\Classes\NovaPrism.Pack — nowhere.
-;   2. ExtendedSubCommandsKey = "NovaPrism.Pack", which DOES resolve. Still
-;      flat.
+;   1. ExtendedSubCommandsKey = "Software\Classes\NovaPrism.Pack". That value
+;      is resolved relative to HKEY_CLASSES_ROOT, not to the hive the verb was
+;      written into, so the shell looked in HKCR\Software\Classes\NovaPrism.Pack
+;      — nowhere. No submenu and no command: hence the error on click.
+;   2. ExtendedSubCommandsKey = "NovaPrism.Pack", then
+;      "<root>\shell\NovaPrism" with the children moved into the verb's own
+;      `shell` subkey, copying Windows' own efscore.dll entry. Both resolve.
+;      Both still flat.
 ;
-; The one cascade on a stock Windows 11 that actually works —
-; Directory\shell\UpdateEncryptionSettings, from efscore.dll — does it like
-; this: the value points at the VERB'S OWN KEY, and the children live in that
-; key's own `shell` subkey. No separate shared key, no indirection. Copied
-; verbatim in shape; the cost is that each root carries its own copy of the
-; child verbs, which is four extra keys and no ambiguity.
+; Microsoft documents TWO separate mechanisms, and mixing them is the trap:
+; `ExtendedSubCommandsKey` names a different key that holds the children, while
+; an EMPTY `SubCommands` says "the children are in my own `shell` subkey". Only
+; the second one renders here. Two more requirements come with it, and both are
+; met above: the parent must have NO command, and its default value must be
+; ABSENT — not empty, absent, which is why nothing here ever writes it.
+;
+; The children living under each root means every root carries its own copy.
+; Four extra keys, and no indirection left to get wrong.
 ;
 ; TWO MENUS, because the verbs differ:
 ;   * and Directory  -> "Сжать" (anything can be compressed)
@@ -47,12 +52,19 @@
 ; winner is a working menu rather than half of one.
 ; ---------------------------------------------------------------------------
 
-; A cascading parent: no command of its own, a label, and a pointer back to
-; itself so the shell reads the children out of its own `shell` subkey.
+; A cascading parent: a label, no command of its own, no default value, and an
+; EMPTY `SubCommands`. That empty string is the whole flag — it tells the shell
+; "this verb is a cascade, read its children out of my own `shell` subkey".
+; `ExtendedSubCommandsKey` is the OTHER mechanism, the one that names a
+; separate key, and on Windows 11 it did not render a submenu at any of the
+; three paths tried. Do not put it back alongside this.
 !macro NOVA_MENU_ROOT KEY
   WriteRegStr SHCTX "Software\Classes\${KEY}\shell\NovaPrism" "MUIVerb" "Nova Prism"
   WriteRegStr SHCTX "Software\Classes\${KEY}\shell\NovaPrism" "Icon" "$INSTDIR\${MAINBINARYNAME}.exe,0"
-  WriteRegStr SHCTX "Software\Classes\${KEY}\shell\NovaPrism" "ExtendedSubCommandsKey" "${KEY}\shell\NovaPrism"
+  WriteRegStr SHCTX "Software\Classes\${KEY}\shell\NovaPrism" "SubCommands" ""
+  ; An upgrade from either broken layout must not leave this behind: two
+  ; cascade mechanisms on one verb is not a documented combination.
+  DeleteRegValue SHCTX "Software\Classes\${KEY}\shell\NovaPrism" "ExtendedSubCommandsKey"
 !macroend
 
 !macro NOVA_MENU_ITEM KEY ORDER LABEL ARGS
