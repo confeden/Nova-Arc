@@ -13,7 +13,7 @@
   <img alt="Windows 10 и 11, x64" src="https://img.shields.io/badge/Windows-10%20%7C%2011%20%C2%B7%20x64-0078D6">
   <img alt="Rust" src="https://img.shields.io/badge/Rust-2021-CE422B?logo=rust&logoColor=white">
   <img alt="Лицензия GPL-3.0" src="https://img.shields.io/badge/license-GPL--3.0-blue">
-  <img alt="Версия 0.9.0, бета" src="https://img.shields.io/badge/version-0.9.0%20beta-orange">
+  <img alt="Версия 0.9.1, бета" src="https://img.shields.io/badge/version-0.9.1%20beta-orange">
 </p>
 
 ---

@@ -2636,7 +2636,7 @@ checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
 
 [[package]]
 name = "nova-bsc"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "anyhow",
  "cc",
@@ -2644,7 +2644,7 @@ dependencies = [
 
 [[package]]
 name = "nova-cli"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -2654,7 +2654,7 @@ dependencies = [
 
 [[package]]
 name = "nova-core"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "anyhow",
  "blake3",
@@ -2684,7 +2684,7 @@ dependencies = [
 
 [[package]]
 name = "nova-gui"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "anyhow",
  "nova-core",
@@ -2700,7 +2700,7 @@ dependencies = [
 
 [[package]]
 name = "nova-lzma"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "anyhow",
  "cc",
@@ -2708,7 +2708,7 @@ dependencies = [
 
 [[package]]
 name = "nova-platform"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "windows-sys 0.60.2",
 ]
